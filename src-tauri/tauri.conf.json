@@ -1,0 +1,62 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "闪记",
+  "version": "0.1.0",
+  "identifier": "com.shanji.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "闪记",
+        "url": "index.html",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 760,
+        "minHeight": 560,
+        "center": true,
+        "visible": true,
+        "backgroundColor": "#E9EDF2"
+      },
+      {
+        "label": "capture",
+        "title": "快速记录 · 闪记",
+        "url": "index.html?view=capture",
+        "width": 660,
+        "height": 236,
+        "minWidth": 520,
+        "minHeight": 220,
+        "center": true,
+        "visible": false,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "resizable": true,
+        "skipTaskbar": true,
+        "backgroundColor": "#F9FAFB",
+        "shadow": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "shortDescription": "快速记录，按时回来",
+    "longDescription": "离线优先的跨平台快速备忘与提醒工具"
+  }
+}
+

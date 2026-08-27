@@ -1,0 +1,79 @@
+# 闪记
+
+闪记是一款离线优先的跨平台快速备忘与提醒工具。当前仓库处于 MVP 实现阶段。
+
+## 设计目标
+
+- 在任意应用中通过全局快捷键立即开始输入。
+- 提交成功后可靠落盘，再隐藏快速录入窗口。
+- 无明确时间的事项使用可配置的工作日默认时间。
+- “今日必做”事项下班后继续按设置间隔提醒，直到完成或暂停。
+- 核心能力不依赖账号或网络。
+
+产品规则见 [docs/PRD.md](docs/PRD.md)，工程约束见 [AGENTS.md](AGENTS.md)。
+
+## 当前已实现
+
+- Tauri 2 主窗口、快速录入窗口、托盘、单实例和全局组合快捷键。
+- Rust + SQLite 本地事务保存、草稿恢复、分类与设置。
+- 可配置工作日和默认到期时间；已有事项需显式确认才会批量更新。
+- “今日必做”持续提醒、应用内勿扰、暂停/恢复、完成即停止。
+- 今日必做在默认时间已过时立即提醒；逾期和未完成事项可直接调整时间。
+- 后台持久化调度、休眠/重启后恢复、自动顺延和提醒幂等。
+- Svelte 管理页、快速录入、设置抽屉、IME 组合态保护和浏览器预览后端。
+- Windows NSIS 安装包与 ZIP 便携包。
+
+Windows 已完成真实编译和启动验证。macOS、Linux 共用领域与数据逻辑，但全局快捷键、托盘、通知和分发仍需在真实设备验证。
+
+## 开发环境
+
+- Node.js 20+ 与 pnpm。
+- Rust stable，包含 `rustfmt` 和 `clippy`。
+- Windows：Microsoft C++ Build Tools（使用 C++ 的桌面开发）与 WebView2。
+- macOS/Linux：按 Tauri 2 官方前置依赖安装对应系统库。
+
+Windows 若普通终端找不到 `link.exe`，请从 “Developer PowerShell for VS” 启动，或先运行 Build Tools 的 `vcvars64.bat`。
+
+## 常用命令
+
+```powershell
+pnpm install
+pnpm dev
+pnpm check
+pnpm test
+pnpm build
+pnpm tauri dev
+```
+
+后台设置页提供“10 秒后测试通知”，会创建一条真实事项并走完整 SQLite → 调度器 → 系统通知链路。开发时也可直接运行：
+
+```powershell
+src-tauri\target\release\shanji.exe --test-notification
+```
+
+Rust 检查：
+
+```powershell
+Set-Location src-tauri
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings -A linker_messages
+cargo test
+```
+
+生成 Windows NSIS 安装包和便携 ZIP：
+
+```powershell
+pnpm tauri build --bundles nsis
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1
+```
+
+产物默认位于：
+
+- `src-tauri/target/release/bundle/nsis/`
+- `artifacts/`
+
+## 本地数据
+
+普通模式遵循系统应用数据目录；Windows 当前路径为 `%APPDATA%\com.shanji.desktop\shanji.db`。
+
+便携包内含 `portable.flag`。存在该标记时，数据写入程序旁的 `data/shanji.db`。请完整移动或备份整个便携目录，不要只复制正在写入的数据库文件。

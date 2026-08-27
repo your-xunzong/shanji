@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.svelte-kit/
+src-tauri/target/
+src-tauri/gen/
+.tmp/
+*.log
+*.db
+*.db-shm
+*.db-wal
+data/
+artifacts/
+.env
+.env.*
+!.env.example
