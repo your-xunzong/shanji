@@ -9,6 +9,7 @@ use crate::{
     db::Database,
     domain::{Category, CreateItemInput, Item, Settings, UpdateSettingsInput},
     error::AppResult,
+    notification::NotificationStatus,
 };
 
 #[tauri::command]
@@ -168,7 +169,67 @@ pub fn get_system_warning(state: State<'_, AppState>) -> Option<String> {
 }
 
 #[tauri::command]
+pub fn get_notification_status(state: State<'_, AppState>) -> Result<NotificationStatus, String> {
+    notification_status(&state)
+}
+
+#[tauri::command]
+pub fn register_portable_notifications(
+    state: State<'_, AppState>,
+) -> Result<NotificationStatus, String> {
+    state
+        .notifications
+        .register_portable()
+        .map_err(|error| format!("无法启用便携版系统通知：{}", error.diagnostic))?;
+    notification_status(&state)
+}
+
+#[tauri::command]
+pub fn unregister_portable_notifications(
+    state: State<'_, AppState>,
+) -> Result<NotificationStatus, String> {
+    state
+        .notifications
+        .unregister_portable()
+        .map_err(|error| format!("无法撤销便携版系统通知：{}", error.diagnostic))?;
+    notification_status(&state)
+}
+
+fn notification_status(state: &AppState) -> Result<NotificationStatus, String> {
+    let mut status = state.notifications.status();
+    if let Some(delivery) = state
+        .database
+        .last_notification_delivery()
+        .map_err(String::from)?
+    {
+        if delivery.result == "FAILED" {
+            status.message = match delivery.error_code.as_deref() {
+                Some("identity_registration_required") => {
+                    "便携版通知身份尚未注册，请先点击“启用便携版系统通知”。".into()
+                }
+                Some("platform_submit_failed") => {
+                    "最近一次未能提交给系统；请检查 Windows“系统 > 通知”和专注模式后重试。".into()
+                }
+                _ => "最近一次系统通知提交失败，后台会自动重试；可再次运行测试通知核对。".into(),
+            };
+        }
+        status.last_result = Some(delivery.result);
+        status.last_error_code = delivery.error_code;
+        status.last_attempt_at = Some(delivery.attempted_at);
+    }
+    Ok(status)
+}
+
+#[tauri::command]
 pub fn create_notification_test_item(state: State<'_, AppState>) -> Result<Item, String> {
+    let settings = state.database.get_settings().map_err(String::from)?;
+    if !settings.notifications_enabled {
+        return Err("通知总开关已关闭，请先启用系统通知".into());
+    }
+    let status = state.notifications.status();
+    if !status.can_notify {
+        return Err(status.message);
+    }
     let now = state.clock.now_utc();
     let item = insert_notification_test_item(&state.database, now).map_err(String::from)?;
     state.scheduler.wake();

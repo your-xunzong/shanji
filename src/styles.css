@@ -1064,6 +1064,41 @@ kbd {
   gap: 12px;
 }
 
+.notification-status-card {
+  display: grid;
+  margin-top: 14px;
+  padding: 13px 14px;
+  border: 1px solid #dfb9b1;
+  border-radius: 9px;
+  background: #fff8f6;
+  gap: 11px;
+}
+
+.notification-status-card[data-ready="true"] {
+  border-color: #cbd9d0;
+  background: #f5f9f6;
+}
+
+.notification-status-card > div {
+  display: grid;
+  gap: 4px;
+}
+
+.notification-status-card strong {
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.notification-status-card small {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.notification-status-card button {
+  width: fit-content;
+}
+
 .notification-test-row p {
   margin: 0;
   color: var(--pine);

@@ -1,13 +1,20 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { isTauri } from '@tauri-apps/api/core';
   import ItemCard from '../components/ItemCard.svelte';
   import SettingsPanel from '../components/SettingsPanel.svelte';
   import { api } from '../lib/api';
-  import type { Item, ItemFilter, Settings, UpdateSettingsInput } from '../lib/types';
+  import type {
+    Item,
+    ItemFilter,
+    NotificationStatus,
+    Settings,
+    UpdateSettingsInput,
+  } from '../lib/types';
 
   let items: Item[] = [];
   let settings: Settings | null = null;
+  let notificationStatus: NotificationStatus | null = null;
   let filter: ItemFilter = 'open';
   let loading = true;
   let error = '';
@@ -15,7 +22,8 @@
   let settingsOpen = false;
   let settingsSaving = false;
   let toast = '';
-  let unlisten: (() => void) | undefined;
+  let unlistenItems: (() => void) | undefined;
+  let unlistenNotification: (() => void) | undefined;
 
   const navItems: { id: ItemFilter; label: string; marker: string }[] = [
     { id: 'open', label: '待处理', marker: '○' },
@@ -33,7 +41,10 @@
     void initialize();
     if (isTauri()) {
       void import('@tauri-apps/api/event').then(async ({ listen }) => {
-        unlisten = await listen('items_changed', () => void loadItems());
+        unlistenItems = await listen('items_changed', () => void loadItems());
+        unlistenNotification = await listen<string>('notification_opened', ({ payload }) => {
+          void revealNotificationItem(payload);
+        });
       });
     }
 
@@ -41,7 +52,8 @@
     window.addEventListener('focus', onFocus);
     return () => {
       window.removeEventListener('focus', onFocus);
-      unlisten?.();
+      unlistenItems?.();
+      unlistenNotification?.();
     };
   });
 
@@ -49,12 +61,14 @@
     loading = true;
     error = '';
     try {
-      const [loadedSettings, , warning] = await Promise.all([
+      const [loadedSettings, loadedNotificationStatus, , warning] = await Promise.all([
         api.getSettings(),
+        api.getNotificationStatus(),
         loadItems(),
         api.getSystemWarning(),
       ]);
       settings = loadedSettings;
+      notificationStatus = loadedNotificationStatus;
       if (warning) error = warning;
     } catch (cause) {
       error = readableError(cause, '无法打开本地数据。请检查数据目录后重试。');
@@ -144,6 +158,39 @@
   async function testNotification(): Promise<void> {
     await api.createNotificationTestItem();
     await loadItems();
+    setTimeout(() => void refreshNotificationStatus(), 12_000);
+  }
+
+  async function refreshNotificationStatus(): Promise<void> {
+    try {
+      notificationStatus = await api.getNotificationStatus();
+    } catch (cause) {
+      error = readableError(cause, '无法刷新系统通知状态。');
+    }
+  }
+
+  async function registerNotifications(): Promise<void> {
+    notificationStatus = await api.registerPortableNotifications();
+    showToast('便携版系统通知已启用');
+  }
+
+  async function unregisterNotifications(): Promise<void> {
+    notificationStatus = await api.unregisterPortableNotifications();
+    showToast('便携版系统通知注册已撤销');
+  }
+
+  async function revealNotificationItem(id: string): Promise<void> {
+    try {
+      filter = 'all';
+      await loadItems();
+      await tick();
+      document.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(id)}"]`)?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      });
+    } catch (cause) {
+      error = readableError(cause, '已打开闪记，但对应事项暂时无法定位。');
+    }
   }
 
   function showToast(message: string): void {
@@ -258,13 +305,16 @@
     </section>
   </main>
 
-  {#if settingsOpen && settings}
+  {#if settingsOpen && settings && notificationStatus}
     <SettingsPanel
       {settings}
       saving={settingsSaving}
       onClose={() => (settingsOpen = false)}
       onSave={saveSettings}
       onTestNotification={testNotification}
+      {notificationStatus}
+      onRegisterNotifications={registerNotifications}
+      onUnregisterNotifications={unregisterNotifications}
     />
   {/if}
 

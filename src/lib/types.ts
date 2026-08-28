@@ -56,3 +56,13 @@ export interface Category {
   color: string;
 }
 
+export interface NotificationStatus {
+  platform: string;
+  portable: boolean;
+  identityStatus: 'ready' | 'registration_required' | 'unavailable';
+  canNotify: boolean;
+  message: string;
+  lastResult: 'CLAIMED' | 'SUBMITTED' | 'FAILED' | 'DISABLED' | null;
+  lastErrorCode: string | null;
+  lastAttemptAt: string | null;
+}

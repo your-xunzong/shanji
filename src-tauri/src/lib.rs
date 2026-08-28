@@ -2,6 +2,7 @@ mod commands;
 mod db;
 mod domain;
 mod error;
+mod notification;
 mod scheduler;
 
 use std::{
@@ -13,6 +14,7 @@ use std::{
 use db::Database;
 use domain::{Clock, SystemClock};
 use error::{AppError, AppResult};
+use notification::NotificationService;
 use scheduler::SchedulerHandle;
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent,
@@ -24,6 +26,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 pub struct AppState {
     database: Arc<Database>,
     clock: Arc<dyn Clock>,
+    notifications: Arc<NotificationService>,
     scheduler: SchedulerHandle,
     shortcut_warning: Mutex<Option<String>>,
 }
@@ -51,6 +54,7 @@ pub fn run() {
         .setup(|app| {
             let notification_test_requested =
                 std::env::args().any(|argument| argument == "--test-notification");
+            let portable = portable_mode()?;
             let database_path = resolve_database_path(app.handle())?;
             let database = Arc::new(Database::open(&database_path)?);
             let settings = database.get_settings()?;
@@ -61,13 +65,32 @@ pub fn run() {
                 .map(|error| format!("全局快捷键未生效，请在后台设置中换一个组合键：{error}"));
 
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let notifications = Arc::new(NotificationService::new(
+                app.handle().clone(),
+                portable,
+                database_path
+                    .parent()
+                    .ok_or_else(|| AppError::SystemIntegration("数据目录无效".into()))?
+                    .to_path_buf(),
+            )?);
             if notification_test_requested {
+                if !settings.notifications_enabled {
+                    return Err(AppError::SystemIntegration(
+                        "通知总开关已关闭，请先在后台设置中启用".into(),
+                    )
+                    .into());
+                }
+                let status = notifications.status();
+                if !status.can_notify {
+                    return Err(AppError::SystemIntegration(status.message).into());
+                }
                 commands::insert_notification_test_item(&database, clock.now_utc())?;
             }
             let scheduler = SchedulerHandle::start(
                 app.handle().clone(),
                 Arc::clone(&database),
                 Arc::clone(&clock),
+                Arc::clone(&notifications),
             );
             if notification_test_requested {
                 scheduler.wake_after(Duration::from_secs(11));
@@ -75,6 +98,7 @@ pub fn run() {
             app.manage(AppState {
                 database,
                 clock,
+                notifications,
                 scheduler,
                 shortcut_warning: Mutex::new(shortcut_warning),
             });
@@ -109,6 +133,9 @@ pub fn run() {
             commands::show_capture,
             commands::show_main,
             commands::get_system_warning,
+            commands::get_notification_status,
+            commands::register_portable_notifications,
+            commands::unregister_portable_notifications,
             commands::create_notification_test_item,
         ]);
 
@@ -127,8 +154,8 @@ pub fn run() {
 
 fn resolve_database_path(app: &AppHandle) -> AppResult<PathBuf> {
     let executable = std::env::current_exe()?;
-    if let Some(directory) = executable.parent()
-        && directory.join("portable.flag").exists()
+    if portable_mode()?
+        && let Some(directory) = executable.parent()
     {
         return Ok(directory.join("data").join("shanji.db"));
     }
@@ -137,6 +164,13 @@ fn resolve_database_path(app: &AppHandle) -> AppResult<PathBuf> {
         .app_data_dir()
         .map_err(|error| AppError::SystemIntegration(error.to_string()))?
         .join("shanji.db"))
+}
+
+fn portable_mode() -> AppResult<bool> {
+    let executable = std::env::current_exe()?;
+    Ok(executable
+        .parent()
+        .is_some_and(|directory| directory.join("portable.flag").exists()))
 }
 
 fn create_tray(app: &AppHandle) -> AppResult<()> {

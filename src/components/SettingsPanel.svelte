@@ -1,16 +1,20 @@
 <script lang="ts">
-  import type { Settings, UpdateSettingsInput } from '../lib/types';
+  import type { NotificationStatus, Settings, UpdateSettingsInput } from '../lib/types';
 
   export let settings: Settings;
   export let saving = false;
   export let onClose: () => void;
   export let onSave: (input: UpdateSettingsInput) => void;
   export let onTestNotification: () => Promise<void>;
+  export let notificationStatus: NotificationStatus;
+  export let onRegisterNotifications: () => Promise<void>;
+  export let onUnregisterNotifications: () => Promise<void>;
 
   let form: Settings = structuredClone(settings);
   let updateExistingDefaultItems = false;
   let testingNotification = false;
   let notificationTestStatus = '';
+  let changingNotificationIdentity = false;
 
   const weekdays = [
     { value: 1, label: '一' },
@@ -47,6 +51,30 @@
     } finally {
       testingNotification = false;
     }
+  }
+
+  async function changeNotificationIdentity(register: boolean): Promise<void> {
+    if (changingNotificationIdentity) return;
+    changingNotificationIdentity = true;
+    notificationTestStatus = '';
+    try {
+      if (register) await onRegisterNotifications();
+      else await onUnregisterNotifications();
+    } catch (cause) {
+      notificationTestStatus = cause instanceof Error && cause.message
+        ? cause.message
+        : '系统通知身份设置失败，请重试。';
+    } finally {
+      changingNotificationIdentity = false;
+    }
+  }
+
+  function deliveryLabel(result: NotificationStatus['lastResult']): string {
+    if (result === 'SUBMITTED') return '最近一次已提交给系统';
+    if (result === 'FAILED') return '最近一次提交失败，后台会自动重试';
+    if (result === 'DISABLED') return '最近一次因通知开关关闭而跳过';
+    if (result === 'CLAIMED') return '最近一次正在提交';
+    return '尚无投递记录';
   }
 </script>
 
@@ -139,8 +167,32 @@
         <span><strong>系统通知</strong><small>关闭后仍可在事项列表查看逾期状态。</small></span>
         <input class="switch" type="checkbox" bind:checked={form.notificationsEnabled} />
       </label>
+      <div class="notification-status-card" data-ready={notificationStatus.canNotify}>
+        <div>
+          <strong>{notificationStatus.canNotify ? '原生系统通知已就绪' : '原生系统通知未就绪'}</strong>
+          <small>{notificationStatus.message}</small>
+          <small>{deliveryLabel(notificationStatus.lastResult)}</small>
+        </div>
+        {#if notificationStatus.portable && notificationStatus.identityStatus === 'registration_required'}
+          <button
+            class="secondary-button"
+            disabled={changingNotificationIdentity}
+            on:click={() => changeNotificationIdentity(true)}
+          >{changingNotificationIdentity ? '正在启用…' : '启用便携版系统通知'}</button>
+        {:else if notificationStatus.portable && notificationStatus.identityStatus === 'ready'}
+          <button
+            class="text-mini"
+            disabled={changingNotificationIdentity}
+            on:click={() => changeNotificationIdentity(false)}
+          >撤销便携通知注册</button>
+        {/if}
+      </div>
       <div class="notification-test-row">
-        <button class="secondary-button" disabled={testingNotification || !form.notificationsEnabled} on:click={testNotification}>
+        <button
+          class="secondary-button"
+          disabled={testingNotification || !form.notificationsEnabled || !notificationStatus.canNotify}
+          on:click={testNotification}
+        >
           {testingNotification ? '正在准备…' : '10 秒后测试通知'}
         </button>
         {#if notificationTestStatus}

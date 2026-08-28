@@ -4,6 +4,7 @@ import type {
   CreateItemInput,
   Item,
   ItemFilter,
+  NotificationStatus,
   Settings,
   UpdateSettingsInput,
 } from './types';
@@ -266,6 +267,30 @@ export const api = {
   async getSystemWarning(): Promise<string | null> {
     if (isTauri()) return call<string | null>('get_system_warning');
     return null;
+  },
+
+  async getNotificationStatus(): Promise<NotificationStatus> {
+    if (isTauri()) return call<NotificationStatus>('get_notification_status');
+    return {
+      platform: 'browser',
+      portable: false,
+      identityStatus: 'ready',
+      canNotify: true,
+      message: '浏览器预览不代表桌面系统通知状态。',
+      lastResult: null,
+      lastErrorCode: null,
+      lastAttemptAt: null,
+    };
+  },
+
+  async registerPortableNotifications(): Promise<NotificationStatus> {
+    if (isTauri()) return call<NotificationStatus>('register_portable_notifications');
+    return this.getNotificationStatus();
+  },
+
+  async unregisterPortableNotifications(): Promise<NotificationStatus> {
+    if (isTauri()) return call<NotificationStatus>('unregister_portable_notifications');
+    return this.getNotificationStatus();
   },
 
   async createNotificationTestItem(): Promise<Item> {

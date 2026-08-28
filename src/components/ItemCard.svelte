@@ -42,7 +42,12 @@
   }
 </script>
 
-<article class="item-card" class:done={item.status === 'DONE'} class:urgent={item.completionPolicy === 'MUST_COMPLETE_TODAY'}>
+<article
+  class="item-card"
+  class:done={item.status === 'DONE'}
+  class:urgent={item.completionPolicy === 'MUST_COMPLETE_TODAY'}
+  data-item-id={item.id}
+>
   <div class="time-rail" data-tone={timing.tone} aria-hidden="true">
     {#if item.nextReminderAt && !item.reminderPaused}<span class="rail-tick"></span>{/if}
   </div>

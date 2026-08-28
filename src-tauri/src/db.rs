@@ -13,6 +13,8 @@ use crate::{
 };
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
+const MIGRATION_0002: &str = include_str!("../migrations/0002_notification_delivery.sql");
+const LATEST_SCHEMA_VERSION: i64 = 2;
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -20,7 +22,18 @@ pub struct Database {
 
 #[derive(Debug, Clone)]
 pub struct DueNotification {
+    pub event_id: String,
+    pub item_id: String,
     pub title: String,
+    pub due_local_date: String,
+    pub due_local_time: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationDelivery {
+    pub result: String,
+    pub error_code: Option<String>,
+    pub attempted_at: String,
 }
 
 #[derive(Debug, Default)]
@@ -43,22 +56,35 @@ impl Database {
             "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;",
         )?;
 
-        let version: Option<i64> = connection
-            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
-                row.get(0)
-            })
-            .optional()
-            .unwrap_or(None)
-            .flatten();
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );",
+        )?;
+        let version = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
 
-        if existed && version.unwrap_or(0) < 1 {
-            let backup = path.with_extension("db.backup-before-migration");
-            fs::copy(path, backup)?;
+        if existed && version < LATEST_SCHEMA_VERSION {
+            let backup = path.with_extension("db.backup-before-v2");
+            if !backup.exists() {
+                connection.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
+            }
         }
 
-        let transaction = connection.transaction()?;
-        transaction.execute_batch(MIGRATION_0001)?;
-        transaction.commit()?;
+        if version < 1 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(MIGRATION_0001)?;
+            transaction.commit()?;
+        }
+        if version < 2 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(MIGRATION_0002)?;
+            transaction.commit()?;
+        }
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -71,6 +97,7 @@ impl Database {
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         let transaction = connection.transaction()?;
         transaction.execute_batch(MIGRATION_0001)?;
+        transaction.execute_batch(MIGRATION_0002)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -390,10 +417,40 @@ impl Database {
         result.changed |= rollover_default_items(&transaction, &settings, now)? > 0;
 
         let now_text = now.to_rfc3339();
+        let stale_before = (now - chrono::Duration::minutes(2)).to_rfc3339();
+        let stale_claims = {
+            let mut statement = transaction.prepare(
+                "SELECT e.id, e.item_id, i.title, i.due_local_date, i.due_local_time
+                 FROM reminder_events e
+                 JOIN items i ON i.id = e.item_id
+                 WHERE e.result = 'CLAIMED' AND e.sent_at <= ?1 AND i.status = 'OPEN'
+                 ORDER BY e.sent_at ASC",
+            )?;
+            let rows = statement.query_map([&stale_before], |row| {
+                Ok(DueNotification {
+                    event_id: row.get(0)?,
+                    item_id: row.get(1)?,
+                    title: row.get(2)?,
+                    due_local_date: row.get(3)?,
+                    due_local_time: row.get(4)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for notification in stale_claims {
+            transaction.execute(
+                "UPDATE reminder_events SET sent_at = ?1 WHERE id = ?2 AND result = 'CLAIMED'",
+                params![now_text, notification.event_id],
+            )?;
+            result.notifications.push(notification);
+            result.changed = true;
+        }
+
         let due_rows = {
             let mut statement = transaction.prepare(
                 "SELECT id, title, completion_policy, repeat_interval_minutes,
-                        next_reminder_at, bypass_app_quiet_hours, revision
+                        next_reminder_at, bypass_app_quiet_hours, revision,
+                        due_local_date, due_local_time
                  FROM items
                  WHERE status = 'OPEN' AND reminder_paused = 0
                    AND next_reminder_at IS NOT NULL AND next_reminder_at <= ?1
@@ -408,24 +465,32 @@ impl Database {
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)? != 0,
                     row.get::<_, u32>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
 
-        for (id, title, policy, interval, scheduled_for, bypass_quiet, revision) in due_rows {
+        for (
+            id,
+            title,
+            policy,
+            interval,
+            scheduled_for,
+            bypass_quiet,
+            revision,
+            due_local_date,
+            due_local_time,
+        ) in due_rows
+        {
             let idempotency_key = format!("{id}:{scheduled_for}:{revision}");
+            let event_id = Uuid::new_v4().to_string();
             let inserted = transaction.execute(
                 "INSERT OR IGNORE INTO reminder_events
                    (id, item_id, scheduled_for, sent_at, idempotency_key, result)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'QUEUED')",
-                params![
-                    Uuid::new_v4().to_string(),
-                    id,
-                    scheduled_for,
-                    now_text,
-                    idempotency_key
-                ],
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'CLAIMED')",
+                params![event_id, id, scheduled_for, now_text, idempotency_key],
             )?;
 
             let next_reminder = if policy == "MUST_COMPLETE_TODAY" {
@@ -447,7 +512,13 @@ impl Database {
             )?;
 
             if inserted > 0 {
-                result.notifications.push(DueNotification { title });
+                result.notifications.push(DueNotification {
+                    event_id,
+                    item_id: id,
+                    title,
+                    due_local_date,
+                    due_local_time,
+                });
             }
             result.changed = true;
         }
@@ -455,6 +526,117 @@ impl Database {
         transaction.commit()?;
         Ok(result)
     }
+
+    pub fn mark_notification_submitted(&self, event_id: &str, now: DateTime<Utc>) -> AppResult<()> {
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let item_id = claimed_event_item_id(&transaction, event_id)?;
+        let Some(item_id) = item_id else {
+            transaction.commit()?;
+            return Ok(());
+        };
+        transaction.execute(
+            "UPDATE reminder_events
+             SET result = 'SUBMITTED', submitted_at = ?1, error_code = NULL,
+                 attempt_count = attempt_count + 1
+             WHERE id = ?2 AND result = 'CLAIMED'",
+            params![now.to_rfc3339(), event_id],
+        )?;
+        transaction.execute(
+            "UPDATE items SET notification_failure_count = 0 WHERE id = ?1",
+            [item_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_notification_disabled(&self, event_id: &str, now: DateTime<Utc>) -> AppResult<()> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection.execute(
+            "UPDATE reminder_events
+             SET result = 'DISABLED', submitted_at = ?1, error_code = 'notifications_disabled'
+             WHERE id = ?2 AND result = 'CLAIMED'",
+            params![now.to_rfc3339(), event_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_notification_failed(
+        &self,
+        event_id: &str,
+        error_code: &str,
+        now: DateTime<Utc>,
+    ) -> AppResult<()> {
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let item_id = claimed_event_item_id(&transaction, event_id)?;
+        let Some(item_id) = item_id else {
+            transaction.commit()?;
+            return Ok(());
+        };
+        transaction.execute(
+            "UPDATE reminder_events
+             SET result = 'FAILED', submitted_at = ?1, error_code = ?2,
+                 attempt_count = attempt_count + 1
+             WHERE id = ?3 AND result = 'CLAIMED'",
+            params![now.to_rfc3339(), error_code, event_id],
+        )?;
+
+        let failure_count = transaction.query_row(
+            "SELECT notification_failure_count FROM items WHERE id = ?1",
+            [&item_id],
+            |row| row.get::<_, u32>(0),
+        )?;
+        if let Some(delay_minutes) = [1_i64, 5, 15].get(failure_count as usize) {
+            let retry_at = (now + chrono::Duration::minutes(*delay_minutes)).to_rfc3339();
+            transaction.execute(
+                "UPDATE items
+                 SET notification_failure_count = notification_failure_count + 1,
+                     next_reminder_at = CASE
+                         WHEN next_reminder_at IS NULL OR next_reminder_at > ?1 THEN ?1
+                         ELSE next_reminder_at
+                     END,
+                     updated_at = ?2, revision = revision + 1
+                 WHERE id = ?3 AND status = 'OPEN'",
+                params![retry_at, now.to_rfc3339(), item_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn last_notification_delivery(&self) -> AppResult<Option<NotificationDelivery>> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection
+            .query_row(
+                "SELECT result, error_code, COALESCE(submitted_at, sent_at)
+                 FROM reminder_events ORDER BY sent_at DESC, rowid DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(NotificationDelivery {
+                        result: row.get(0)?,
+                        error_code: row.get(1)?,
+                        attempted_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(AppError::from)
+    }
+}
+
+fn claimed_event_item_id(
+    transaction: &Transaction<'_>,
+    event_id: &str,
+) -> AppResult<Option<String>> {
+    transaction
+        .query_row(
+            "SELECT item_id FROM reminder_events WHERE id = ?1 AND result = 'CLAIMED'",
+            [event_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(AppError::from)
 }
 
 fn read_settings(connection: &Connection) -> AppResult<Settings> {
@@ -864,5 +1046,159 @@ mod tests {
         let second = database.process_due(at_local(2026, 8, 27, 18, 1)).unwrap();
         assert_eq!(first.notifications.len(), 1);
         assert!(second.notifications.is_empty());
+    }
+
+    #[test]
+    fn opening_v1_database_creates_backup_and_migrates_delivery_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shanji.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATION_0001).unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        let connection = database.connection.lock().expect("database mutex poisoned");
+        let version = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let delivery_columns = connection
+            .prepare("PRAGMA table_info(reminder_events)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(version, 2);
+        assert!(delivery_columns.contains(&"submitted_at".into()));
+        assert!(delivery_columns.contains(&"error_code".into()));
+        assert!(path.with_extension("db.backup-before-v2").exists());
+    }
+
+    #[test]
+    fn submitted_notification_has_auditable_terminal_state() {
+        let database = Database::in_memory().unwrap();
+        let due = at_local(2026, 8, 27, 18, 0);
+        let item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "系统通知测试".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(due.to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                },
+                at_local(2026, 8, 27, 17, 0),
+            )
+            .unwrap();
+
+        let now = at_local(2026, 8, 27, 18, 1);
+        let notification = database.process_due(now).unwrap().notifications.remove(0);
+        assert_eq!(notification.item_id, item.id);
+        assert_eq!(notification.due_local_time, "18:00");
+        database
+            .mark_notification_submitted(&notification.event_id, now)
+            .unwrap();
+
+        let delivery = database.last_notification_delivery().unwrap().unwrap();
+        assert_eq!(delivery.result, "SUBMITTED");
+        assert_eq!(delivery.error_code, None);
+    }
+
+    #[test]
+    fn failed_notification_retries_with_bounded_backoff() {
+        let database = Database::in_memory().unwrap();
+        let due = at_local(2026, 8, 27, 18, 0);
+        let item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "重试系统通知".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(due.to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                },
+                at_local(2026, 8, 27, 17, 0),
+            )
+            .unwrap();
+
+        let first_at = at_local(2026, 8, 27, 18, 1);
+        let first = database
+            .process_due(first_at)
+            .unwrap()
+            .notifications
+            .remove(0);
+        database
+            .mark_notification_failed(&first.event_id, "platform_submit_failed", first_at)
+            .unwrap();
+        assert_eq!(
+            database.get_item(&item.id).unwrap().next_reminder_at,
+            Some((first_at + chrono::Duration::minutes(1)).to_rfc3339())
+        );
+
+        let second_at = first_at + chrono::Duration::minutes(1);
+        let second = database
+            .process_due(second_at)
+            .unwrap()
+            .notifications
+            .remove(0);
+        database
+            .mark_notification_failed(&second.event_id, "platform_submit_failed", second_at)
+            .unwrap();
+        assert_eq!(
+            database.get_item(&item.id).unwrap().next_reminder_at,
+            Some((second_at + chrono::Duration::minutes(5)).to_rfc3339())
+        );
+
+        let delivery = database.last_notification_delivery().unwrap().unwrap();
+        assert_eq!(delivery.result, "FAILED");
+        assert_eq!(
+            delivery.error_code.as_deref(),
+            Some("platform_submit_failed")
+        );
+    }
+
+    #[test]
+    fn stale_claim_is_recovered_once_after_interrupted_delivery() {
+        let database = Database::in_memory().unwrap();
+        let due = at_local(2026, 8, 27, 18, 0);
+        database
+            .create_item(
+                &CreateItemInput {
+                    title: "崩溃恢复提醒".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(due.to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                },
+                at_local(2026, 8, 27, 17, 0),
+            )
+            .unwrap();
+
+        let claimed_at = at_local(2026, 8, 27, 18, 1);
+        let first = database
+            .process_due(claimed_at)
+            .unwrap()
+            .notifications
+            .remove(0);
+        let recovered_at = claimed_at + chrono::Duration::minutes(2);
+        let recovered = database
+            .process_due(recovered_at)
+            .unwrap()
+            .notifications
+            .remove(0);
+        assert_eq!(recovered.event_id, first.event_id);
+        assert!(
+            database
+                .process_due(recovered_at)
+                .unwrap()
+                .notifications
+                .is_empty()
+        );
     }
 }

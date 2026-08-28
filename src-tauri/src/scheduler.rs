@@ -5,9 +5,8 @@ use std::{
 };
 
 use tauri::{AppHandle, Emitter};
-use tauri_plugin_notification::NotificationExt;
 
-use crate::{db::Database, domain::Clock};
+use crate::{db::Database, domain::Clock, notification::NotificationService};
 
 #[derive(Debug, Clone, Copy)]
 enum SchedulerSignal {
@@ -22,7 +21,12 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
-    pub fn start(app: AppHandle, database: Arc<Database>, clock: Arc<dyn Clock>) -> Self {
+    pub fn start(
+        app: AppHandle,
+        database: Arc<Database>,
+        clock: Arc<dyn Clock>,
+        notifications: Arc<NotificationService>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel();
         thread::Builder::new()
             .name("shanji-reminder-scheduler".into())
@@ -42,7 +46,7 @@ impl SchedulerHandle {
                     match receiver.recv_timeout(wait) {
                         Ok(SchedulerSignal::Stop) => break,
                         Ok(SchedulerSignal::Wake) => {
-                            process_once(&app, &database, clock.as_ref());
+                            process_once(&app, &database, clock.as_ref(), &notifications);
                             next_poll = Instant::now() + poll_interval;
                         }
                         Ok(SchedulerSignal::WakeAfter(delay)) => {
@@ -51,7 +55,7 @@ impl SchedulerHandle {
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             let now = Instant::now();
                             delayed_wakes.retain(|deadline| *deadline > now);
-                            process_once(&app, &database, clock.as_ref());
+                            process_once(&app, &database, clock.as_ref(), &notifications);
                             if now >= next_poll {
                                 next_poll = now + poll_interval;
                             }
@@ -80,19 +84,42 @@ impl SchedulerHandle {
     }
 }
 
-fn process_once(app: &AppHandle, database: &Database, clock: &dyn Clock) {
-    match database.process_due(clock.now_utc()) {
+fn process_once(
+    app: &AppHandle,
+    database: &Database,
+    clock: &dyn Clock,
+    notifications: &NotificationService,
+) {
+    let now = clock.now_utc();
+    match database.process_due(now) {
         Ok(result) => {
-            if result.notifications_enabled {
-                for notification in result.notifications {
-                    if let Err(error) = app
-                        .notification()
-                        .builder()
-                        .title("闪记提醒")
-                        .body(notification.title)
-                        .show()
+            for notification in result.notifications {
+                if !result.notifications_enabled {
+                    if let Err(error) =
+                        database.mark_notification_disabled(&notification.event_id, now)
                     {
-                        eprintln!("系统通知发送失败：{error}");
+                        eprintln!("通知关闭状态记录失败：{error}");
+                    }
+                    continue;
+                }
+
+                match notifications.send(&notification) {
+                    Ok(()) => {
+                        if let Err(error) =
+                            database.mark_notification_submitted(&notification.event_id, now)
+                        {
+                            eprintln!("通知提交结果记录失败：{error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("系统通知提交失败（{}）：{}", error.code, error.diagnostic);
+                        if let Err(database_error) = database.mark_notification_failed(
+                            &notification.event_id,
+                            error.code,
+                            now,
+                        ) {
+                            eprintln!("通知失败结果记录失败：{database_error}");
+                        }
                     }
                 }
             }
