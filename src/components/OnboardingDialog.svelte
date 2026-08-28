@@ -16,6 +16,7 @@
 
   let step = 0;
   let autostartEnabled = firstRun ? true : autostartStatus.enabled;
+  let defaultDueTime = settings.defaultDueTime;
   let globalShortcut = settings.globalShortcut;
   let enablePortableNotifications = false;
   let busy = false;
@@ -25,10 +26,14 @@
   const steps = [
     { label: '通知', caption: '到点，由系统提醒' },
     { label: '启动', caption: '登录后静静待命' },
+    { label: '时间', caption: '按你的节奏提醒' },
     { label: '快捷键', caption: '随时写下一句' },
   ];
+  const titles = ['提醒交给系统', '需要时，它已经在', '选好默认提醒时间', '留一个顺手的入口'];
+  const quickTimes = ['17:30', '18:00', '18:30'];
 
   $: shortcutError = validateShortcut(globalShortcut);
+  $: timeError = validateTime(defaultDueTime);
 
   onMount(() => {
     const previousFocus = document.activeElement as HTMLElement | null;
@@ -54,18 +59,26 @@
     return '';
   }
 
+  function validateTime(value: string): string {
+    if (!value) return '请选择默认提醒时间。';
+    if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value)) return '请选择有效的默认提醒时间。';
+    return '';
+  }
+
   function next(): void {
     error = '';
+    if (step === 2 && timeError) return;
     if (step < steps.length - 1) step += 1;
   }
 
   async function finish(): Promise<void> {
-    if (busy || shortcutError) return;
+    if (busy || shortcutError || timeError) return;
     busy = true;
     error = '';
     try {
       await onFinish({
         autostartEnabled,
+        defaultDueTime,
         globalShortcut: globalShortcut.trim(),
         enablePortableNotifications,
       });
@@ -139,15 +152,12 @@
         </li>
       {/each}
     </ol>
-    <p>v0.2.0 · 本地设置</p>
   </aside>
 
   <div class="onboarding-sheet">
     <header>
-      <p class="eyebrow">第一次，把回来方式定好</p>
-      <h2 id="onboarding-title">
-        {step === 0 ? '提醒交给系统' : step === 1 ? '需要时，它已经在' : '留一个顺手的入口'}
-      </h2>
+      <p class="eyebrow">把提醒方式设置好</p>
+      <h2 id="onboarding-title">{titles[step]}</h2>
     </header>
 
     <div class="onboarding-body">
@@ -183,6 +193,38 @@
         {#if autostartStatus.portable}
           <p class="onboarding-note warning">便携版启动项指向当前程序路径。移动或删除整个目录后，需要重新设置。</p>
         {/if}
+      {:else if step === 2}
+        <p class="onboarding-lead">选一个适合你工作节奏的时间。已有事项不会改变。</p>
+        <div class="onboarding-time-card">
+          <label class="onboarding-time-field">
+            <span>默认提醒时间</span>
+            <input
+              type="time"
+              bind:value={defaultDueTime}
+              required
+              aria-invalid={!!timeError}
+              aria-describedby={timeError ? 'onboarding-time-error' : undefined}
+            />
+          </label>
+          <div class="onboarding-time-choices">
+            <span>常用时间</span>
+            <div>
+              {#each quickTimes as time}
+                <button
+                  type="button"
+                  class:active={defaultDueTime === time}
+                  aria-pressed={defaultDueTime === time}
+                  on:click={() => (defaultDueTime = time)}
+                >{time}</button>
+              {/each}
+            </div>
+          </div>
+        </div>
+        {#if timeError}
+          <p id="onboarding-time-error" class="onboarding-field-error" role="alert">{timeError}</p>
+        {:else}
+          <p class="reminder-time-preview">未填写时间的新事项会在 <strong>{defaultDueTime}</strong> 提醒。</p>
+        {/if}
       {:else}
         <p class="onboarding-lead">这个组合键只负责唤起闪记。应用不会记录其他按键或输入内容。</p>
         <label class="onboarding-shortcut-field">
@@ -207,9 +249,9 @@
       <div>
         {#if step > 0}<button class="secondary-button" disabled={busy} on:click={() => (step -= 1)}>上一步</button>{/if}
         {#if step < steps.length - 1}
-          <button class="primary-button" disabled={busy} on:click={next}>继续</button>
+          <button class="primary-button" disabled={busy || (step === 2 && !!timeError)} on:click={next}>继续</button>
         {:else}
-          <button class="primary-button" disabled={busy || !!shortcutError} on:click={finish}>
+          <button class="primary-button" disabled={busy || !!shortcutError || !!timeError} on:click={finish}>
             {busy ? '正在设置…' : '完成设置'}
           </button>
         {/if}

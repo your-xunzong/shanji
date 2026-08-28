@@ -83,6 +83,7 @@ export interface OnboardingStatus {
 
 export interface OnboardingFinishInput {
   autostartEnabled: boolean;
+  defaultDueTime: string;
   globalShortcut: string;
   enablePortableNotifications: boolean;
 }

@@ -1,6 +1,6 @@
 [package]
 name = "shanji"
-version = "0.2.1"
+version = "0.3.0"
 description = "离线优先的快速备忘与提醒工具"
 authors = ["Shanji contributors"]
 license = "MIT"

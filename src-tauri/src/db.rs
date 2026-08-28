@@ -941,6 +941,62 @@ mod tests {
     }
 
     #[test]
+    fn changing_default_time_for_new_items_keeps_existing_due_time() {
+        let database = Database::in_memory().unwrap();
+        let now = at_local(2026, 8, 27, 10, 0);
+        let existing = database
+            .create_item(
+                &CreateItemInput {
+                    title: "已有事项".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: None,
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                },
+                now,
+            )
+            .unwrap();
+        let current = database.get_settings().unwrap();
+        database
+            .update_settings(
+                &UpdateSettingsInput {
+                    default_due_time: "17:30".into(),
+                    workdays: current.workdays,
+                    overtime_interval_minutes: current.overtime_interval_minutes,
+                    quiet_hours_enabled: current.quiet_hours_enabled,
+                    quiet_start: current.quiet_start,
+                    quiet_end: current.quiet_end,
+                    global_shortcut: current.global_shortcut,
+                    notifications_enabled: current.notifications_enabled,
+                    autostart_enabled: current.autostart_enabled,
+                    update_existing_default_items: false,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            database.get_item(&existing.id).unwrap().due_local_time,
+            "18:00"
+        );
+        let new_item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "新事项".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: None,
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(new_item.due_local_time, "17:30");
+    }
+
+    #[test]
     fn must_complete_item_repeats_instead_of_rolling_over() {
         let database = Database::in_memory().unwrap();
         let due = at_local(2026, 8, 27, 18, 0);
@@ -1126,9 +1182,9 @@ mod tests {
     fn onboarding_version_only_moves_forward() {
         let database = Database::in_memory().unwrap();
         assert_eq!(database.onboarding_version().unwrap(), 0);
+        database.complete_onboarding(2).unwrap();
         database.complete_onboarding(1).unwrap();
-        database.complete_onboarding(0).unwrap();
-        assert_eq!(database.onboarding_version().unwrap(), 1);
+        assert_eq!(database.onboarding_version().unwrap(), 2);
     }
 
     #[test]

@@ -207,12 +207,19 @@
     if (input.enablePortableNotifications && !notificationStatus.canNotify) {
       notificationStatus = await api.registerPortableNotifications();
     }
-    settings = await api.updateSettings({
-      ...settings,
-      autostartEnabled: input.autostartEnabled,
-      globalShortcut: input.globalShortcut,
-      updateExistingDefaultItems: false,
-    });
+    try {
+      settings = await api.updateSettings({
+        ...settings,
+        defaultDueTime: input.defaultDueTime,
+        autostartEnabled: input.autostartEnabled,
+        globalShortcut: input.globalShortcut,
+        updateExistingDefaultItems: false,
+      });
+    } catch (cause) {
+      const message = readableError(cause, '');
+      if (message.includes('快捷键') || message.includes('开机启动')) throw cause;
+      throw new Error('默认提醒时间没有保存，原设置仍然有效，请重试。');
+    }
     autostartStatus = await api.getAutostartStatus();
     if (autostartStatus.available) settings.autostartEnabled = autostartStatus.enabled;
     onboardingStatus = await api.completeOnboarding();

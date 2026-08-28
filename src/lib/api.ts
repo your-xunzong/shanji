@@ -314,13 +314,13 @@ export const api = {
   async getOnboardingStatus(): Promise<OnboardingStatus> {
     if (isTauri()) return call<OnboardingStatus>('get_onboarding_status');
     const completedVersion = Number(localStorage.getItem(ONBOARDING_KEY) ?? 0);
-    return { required: completedVersion < 1, completedVersion, currentVersion: 1 };
+    return { required: completedVersion < 2, completedVersion, currentVersion: 2 };
   },
 
   async completeOnboarding(): Promise<OnboardingStatus> {
     if (isTauri()) return call<OnboardingStatus>('complete_onboarding');
-    localStorage.setItem(ONBOARDING_KEY, '1');
-    return { required: false, completedVersion: 1, currentVersion: 1 };
+    localStorage.setItem(ONBOARDING_KEY, '2');
+    return { required: false, completedVersion: 2, currentVersion: 2 };
   },
 
   async getNotificationStatus(): Promise<NotificationStatus> {
