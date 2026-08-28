@@ -2,6 +2,7 @@ mod commands;
 mod db;
 mod domain;
 mod error;
+mod export;
 mod notification;
 mod scheduler;
 
@@ -9,7 +10,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use db::{Database, apply_pending_restore};
@@ -20,7 +21,7 @@ use scheduler::SchedulerHandle;
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WebviewWindowBuilder,
     menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
@@ -39,6 +40,7 @@ pub fn run() {
             let _ = show_main_window(app);
         }))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .arg("--background")
@@ -137,6 +139,19 @@ pub fn run() {
             commands::get_settings,
             commands::update_settings,
             commands::list_categories,
+            commands::create_category,
+            commands::update_category,
+            commands::delete_category,
+            commands::move_category,
+            commands::list_tags,
+            commands::create_tag,
+            commands::update_tag,
+            commands::delete_tag,
+            commands::move_tag,
+            commands::update_item,
+            commands::set_item_deleted,
+            commands::permanently_delete_item,
+            commands::export_excel,
             commands::load_draft,
             commands::save_draft,
             commands::hide_capture,
@@ -224,6 +239,8 @@ fn create_tray(app: &AppHandle) -> AppResult<()> {
     let menu = Menu::with_items(app, &[&capture, &show, &quit])
         .map_err(|error| AppError::SystemIntegration(error.to_string()))?;
 
+    let last_click = Arc::new(Mutex::new(None::<Instant>));
+    let click_tracker = Arc::clone(&last_click);
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .menu(&menu)
         .tooltip("闪记")
@@ -235,6 +252,31 @@ fn create_tray(app: &AppHandle) -> AppResult<()> {
                 let _ = show_main_window(app);
             }
             "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(move |tray, event| match event {
+            TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => {
+                let _ = show_main_window(tray.app_handle());
+            }
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } => {
+                let now = Instant::now();
+                let mut previous = click_tracker.lock().expect("tray click mutex poisoned");
+                if previous
+                    .is_some_and(|value| now.duration_since(value) <= Duration::from_millis(450))
+                {
+                    *previous = None;
+                    let _ = show_main_window(tray.app_handle());
+                } else {
+                    *previous = Some(now);
+                }
+            }
             _ => {}
         });
     if let Some(icon) = app.default_window_icon() {

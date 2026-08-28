@@ -151,6 +151,8 @@ pub struct Item {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+    pub deleted_at: Option<String>,
+    pub tags: Vec<Tag>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,6 +165,8 @@ pub struct CreateItemInput {
     pub due_at: Option<String>,
     pub must_complete_today: bool,
     pub repeat_interval_minutes: Option<u32>,
+    #[serde(default)]
+    pub tag_ids: Vec<String>,
 }
 
 impl CreateItemInput {
@@ -193,6 +197,71 @@ pub struct Category {
     pub id: String,
     pub name: String,
     pub color: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tag {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaxonomyInput {
+    pub name: String,
+    pub color: String,
+}
+
+impl TaxonomyInput {
+    pub fn validate(&self, label: &str) -> AppResult<()> {
+        let length = self.name.trim().chars().count();
+        if !(1..=30).contains(&length) {
+            return Err(AppError::Validation(format!("{label}名称需要 1–30 个字符")));
+        }
+        if !is_hex_color(&self.color) {
+            return Err(AppError::Validation(format!("请选择有效的{label}颜色")));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateItemInput {
+    pub title: String,
+    #[serde(default)]
+    pub notes: String,
+    pub category_id: Option<String>,
+    #[serde(default)]
+    pub tag_ids: Vec<String>,
+    pub due_at: String,
+    pub must_complete_today: bool,
+    pub repeat_interval_minutes: Option<u32>,
+}
+
+impl UpdateItemInput {
+    pub fn validate(&self) -> AppResult<()> {
+        CreateItemInput {
+            title: self.title.clone(),
+            notes: self.notes.clone(),
+            category_id: self.category_id.clone(),
+            due_at: Some(self.due_at.clone()),
+            must_complete_today: self.must_complete_today,
+            repeat_interval_minutes: self.repeat_interval_minutes,
+            tag_ids: self.tag_ids.clone(),
+        }
+        .validate()
+    }
+}
+
+fn is_hex_color(value: &str) -> bool {
+    value.len() == 7
+        && value.starts_with('#')
+        && value[1..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone)]

@@ -9,8 +9,12 @@ use tauri_plugin_global_shortcut::GlobalShortcutExt;
 use crate::{
     AppState, candidate_database_paths,
     db::{DataFileSummary, DataStatus, Database},
-    domain::{Category, CreateItemInput, Item, Settings, UpdateSettingsInput},
+    domain::{
+        Category, CreateItemInput, Item, Settings, Tag, TaxonomyInput, UpdateItemInput,
+        UpdateSettingsInput,
+    },
     error::AppResult,
+    export::{ExportFilterInput, export_items, filter_items},
     notification::NotificationStatus,
 };
 
@@ -263,6 +267,140 @@ pub fn list_categories(state: State<'_, AppState>) -> Result<Vec<Category>, Stri
 }
 
 #[tauri::command]
+pub fn create_category(
+    input: TaxonomyInput,
+    state: State<'_, AppState>,
+) -> Result<Category, String> {
+    state.database.create_category(&input).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn update_category(
+    id: String,
+    input: TaxonomyInput,
+    state: State<'_, AppState>,
+) -> Result<Category, String> {
+    state
+        .database
+        .update_category(&id, &input)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn delete_category(
+    id: String,
+    reassign_to: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .database
+        .delete_category(&id, reassign_to.as_deref())
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn move_category(
+    id: String,
+    direction: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .database
+        .move_category(&id, &direction)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn list_tags(state: State<'_, AppState>) -> Result<Vec<Tag>, String> {
+    state.database.list_tags().map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn create_tag(input: TaxonomyInput, state: State<'_, AppState>) -> Result<Tag, String> {
+    state.database.create_tag(&input).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn update_tag(
+    id: String,
+    input: TaxonomyInput,
+    state: State<'_, AppState>,
+) -> Result<Tag, String> {
+    state.database.update_tag(&id, &input).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn delete_tag(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.database.delete_tag(&id).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn move_tag(id: String, direction: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.database.move_tag(&id, &direction).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn update_item(
+    id: String,
+    input: UpdateItemInput,
+    state: State<'_, AppState>,
+) -> Result<Item, String> {
+    let item = state
+        .database
+        .update_item(&id, &input, state.clock.now_utc())
+        .map_err(String::from)?;
+    state.scheduler.wake();
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn set_item_deleted(
+    id: String,
+    deleted: bool,
+    state: State<'_, AppState>,
+) -> Result<Item, String> {
+    let item = state
+        .database
+        .set_item_deleted(&id, deleted, state.clock.now_utc())
+        .map_err(String::from)?;
+    state.scheduler.wake();
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn permanently_delete_item(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .database
+        .permanently_delete_item(&id)
+        .map_err(Into::into)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportResult {
+    pub path: String,
+    pub item_count: usize,
+}
+
+#[tauri::command]
+pub fn export_excel(
+    path: String,
+    filter: ExportFilterInput,
+    state: State<'_, AppState>,
+) -> Result<ExportResult, String> {
+    let items = state
+        .database
+        .list_items("all", state.clock.now_utc())
+        .map_err(String::from)?;
+    let items = filter_items(items, &filter).map_err(String::from)?;
+    export_items(std::path::Path::new(&path), &items).map_err(String::from)?;
+    Ok(ExportResult {
+        path,
+        item_count: items.len(),
+    })
+}
+
+#[tauri::command]
 pub fn load_draft(state: State<'_, AppState>) -> Result<String, String> {
     state.database.load_draft().map_err(Into::into)
 }
@@ -434,6 +572,7 @@ pub(crate) fn insert_notification_test_item(
             due_at: Some((now + Duration::seconds(10)).to_rfc3339()),
             must_complete_today: false,
             repeat_interval_minutes: None,
+            tag_ids: Vec::new(),
         },
         now,
     )

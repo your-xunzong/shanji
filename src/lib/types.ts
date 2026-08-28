@@ -1,7 +1,7 @@
 export type ItemStatus = 'OPEN' | 'DONE' | 'ARCHIVED' | 'DELETED';
 export type DueSource = 'EXPLICIT' | 'DEFAULT_EOD' | 'ROLLED_OVER';
 export type CompletionPolicy = 'NORMAL' | 'MUST_COMPLETE_TODAY';
-export type ItemFilter = 'open' | 'today' | 'overdue' | 'done' | 'all';
+export type ItemFilter = 'open' | 'today' | 'overdue' | 'done' | 'deleted' | 'all';
 
 export interface Item {
   id: string;
@@ -24,6 +24,8 @@ export interface Item {
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
+  deletedAt: string | null;
+  tags: Tag[];
 }
 
 export interface Settings {
@@ -45,6 +47,17 @@ export interface CreateItemInput {
   dueAt?: string | null;
   mustCompleteToday: boolean;
   repeatIntervalMinutes?: number | null;
+  tagIds?: string[];
+}
+
+export interface UpdateItemInput {
+  title: string;
+  notes: string;
+  categoryId: string | null;
+  tagIds: string[];
+  dueAt: string;
+  mustCompleteToday: boolean;
+  repeatIntervalMinutes: number | null;
 }
 
 export interface UpdateSettingsInput extends Settings {
@@ -53,6 +66,17 @@ export interface UpdateSettingsInput extends Settings {
 
 export interface Category {
   id: string;
+  name: string;
+  color: string;
+}
+
+export interface Tag {
+  id: string;
+  name: string;
+  color: string;
+}
+
+export interface TaxonomyInput {
   name: string;
   color: string;
 }
@@ -99,4 +123,17 @@ export interface DataStatus {
   current: DataFileSummary;
   latestBackup: DataFileSummary | null;
   recoveryCandidates: DataFileSummary[];
+}
+
+export interface ExportResult {
+  path: string;
+  itemCount: number;
+}
+
+export interface ExportFilterInput {
+  status: 'all' | 'open' | 'done';
+  categoryId: string | null;
+  tagId: string | null;
+  createdFrom: string | null;
+  createdTo: string | null;
 }

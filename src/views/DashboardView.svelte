@@ -4,6 +4,8 @@
   import ItemCard from '../components/ItemCard.svelte';
   import OnboardingDialog from '../components/OnboardingDialog.svelte';
   import SettingsPanel from '../components/SettingsPanel.svelte';
+  import OrganizerPanel from '../components/OrganizerPanel.svelte';
+  import ExportPanel from '../components/ExportPanel.svelte';
   import { api } from '../lib/api';
   import type {
     Item,
@@ -15,6 +17,11 @@
     Settings,
     UpdateSettingsInput,
     DataStatus,
+    Category,
+    Tag,
+    TaxonomyInput,
+    UpdateItemInput,
+    ExportFilterInput,
   } from '../lib/types';
 
   let items: Item[] = [];
@@ -31,6 +38,13 @@
   let settingsSaving = false;
   let toast = '';
   let dataStatus: DataStatus | null = null;
+  let categories: Category[] = [];
+  let tags: Tag[] = [];
+  let organizerOpen = false;
+  let exporting = false;
+  let exportOpen = false;
+  let undoDeletedItem: Item | null = null;
+  let toastTimer: ReturnType<typeof setTimeout> | undefined;
   let unlistenItems: (() => void) | undefined;
   let unlistenNotification: (() => void) | undefined;
 
@@ -39,6 +53,7 @@
     { id: 'today', label: '今天', marker: '⌁' },
     { id: 'overdue', label: '已逾期', marker: '!' },
     { id: 'done', label: '已完成', marker: '✓' },
+    { id: 'deleted', label: '回收站', marker: '×' },
     { id: 'all', label: '全部事项', marker: '·' },
   ];
 
@@ -63,6 +78,7 @@
       window.removeEventListener('focus', onFocus);
       unlistenItems?.();
       unlistenNotification?.();
+      if (toastTimer) clearTimeout(toastTimer);
     };
   });
 
@@ -77,6 +93,8 @@
         loadedOnboardingStatus,
         ,
         warning,
+        loadedCategories,
+        loadedTags,
       ] = await Promise.all([
         api.getSettings(),
         api.getNotificationStatus(),
@@ -84,6 +102,8 @@
         api.getOnboardingStatus(),
         loadItems(),
         api.getSystemWarning(),
+        api.listCategories(),
+        api.listTags(),
       ]);
       if (loadedAutostartStatus.available) {
         loadedSettings.autostartEnabled = loadedAutostartStatus.enabled;
@@ -93,6 +113,8 @@
       autostartStatus = loadedAutostartStatus;
       onboardingStatus = loadedOnboardingStatus;
       onboardingOpen = loadedOnboardingStatus.required;
+      categories = loadedCategories;
+      tags = loadedTags;
       if (warning) error = warning;
     } catch (cause) {
       error = readableError(cause, '无法打开本地数据。请检查数据目录后重试。');
@@ -162,6 +184,140 @@
       throw cause;
     } finally {
       busyItemId = '';
+    }
+  }
+
+  async function updateItem(item: Item, input: UpdateItemInput): Promise<void> {
+    busyItemId = item.id;
+    error = '';
+    try {
+      await api.updateItem(item.id, input);
+      await loadItems();
+      showToast('事项修改已保存');
+    } catch (cause) {
+      error = readableError(cause, '修改没有保存，事项保持原样。');
+      throw cause;
+    } finally {
+      busyItemId = '';
+    }
+  }
+
+  async function deleteItem(item: Item, deleted: boolean): Promise<void> {
+    if (deleted && !window.confirm(`将“${item.title}”移到回收站吗？提醒会立即停止。`)) return;
+    busyItemId = item.id;
+    try {
+      await api.setItemDeleted(item.id, deleted);
+      await loadItems();
+      if (deleted) {
+        undoDeletedItem = item;
+        showToast('已移到回收站，提醒已停止', 6000);
+      } else {
+        undoDeletedItem = null;
+        showToast('事项已恢复');
+      }
+    } catch (cause) {
+      error = readableError(cause, '操作没有保存，事项保持原样。');
+    } finally {
+      busyItemId = '';
+    }
+  }
+
+  async function undoDelete(): Promise<void> {
+    if (!undoDeletedItem) return;
+    const item = undoDeletedItem;
+    busyItemId = item.id;
+    error = '';
+    try {
+      await api.setItemDeleted(item.id, false);
+      undoDeletedItem = null;
+      await loadItems();
+      showToast('已撤销删除，事项和提醒已恢复');
+    } catch (cause) {
+      error = readableError(cause, '暂时无法撤销，请到回收站恢复事项。');
+    } finally {
+      busyItemId = '';
+    }
+  }
+
+  async function permanentlyDeleteItem(item: Item): Promise<void> {
+    if (!window.confirm(`永久删除“${item.title}”吗？此操作无法撤销。`)) return;
+    busyItemId = item.id;
+    try {
+      await api.permanentlyDeleteItem(item.id);
+      await loadItems();
+      showToast('事项已永久删除');
+    } catch (cause) {
+      error = readableError(cause, '事项没有删除，请重试。');
+    } finally {
+      busyItemId = '';
+    }
+  }
+
+  async function refreshTaxonomies(): Promise<void> {
+    [categories, tags] = await Promise.all([api.listCategories(), api.listTags()]);
+    await loadItems();
+  }
+
+  async function createCategory(input: TaxonomyInput): Promise<void> {
+    await api.createCategory(input);
+    await refreshTaxonomies();
+  }
+
+  async function updateCategory(id: string, input: TaxonomyInput): Promise<void> {
+    await api.updateCategory(id, input);
+    await refreshTaxonomies();
+  }
+
+  async function deleteCategory(id: string, reassignTo: string | null): Promise<void> {
+    await api.deleteCategory(id, reassignTo);
+    await refreshTaxonomies();
+  }
+
+  async function moveCategory(id: string, direction: 'up' | 'down'): Promise<void> {
+    await api.moveCategory(id, direction);
+    await refreshTaxonomies();
+  }
+
+  async function createTag(input: TaxonomyInput): Promise<void> {
+    await api.createTag(input);
+    await refreshTaxonomies();
+  }
+
+  async function updateTag(id: string, input: TaxonomyInput): Promise<void> {
+    await api.updateTag(id, input);
+    await refreshTaxonomies();
+  }
+
+  async function deleteTag(id: string): Promise<void> {
+    await api.deleteTag(id);
+    await refreshTaxonomies();
+  }
+
+  async function moveTag(id: string, direction: 'up' | 'down'): Promise<void> {
+    await api.moveTag(id, direction);
+    await refreshTaxonomies();
+  }
+
+  async function exportExcel(filter: ExportFilterInput): Promise<void> {
+    if (exporting) return;
+    exporting = true;
+    error = '';
+    try {
+      const defaultName = `闪记事项-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      let path = defaultName;
+      if (isTauri()) {
+        const { save } = await import('@tauri-apps/plugin-dialog');
+        const selected = await save({ defaultPath: defaultName, filters: [{ name: 'Excel 报表', extensions: ['xlsx'] }] });
+        if (!selected) return;
+        path = selected.endsWith('.xlsx') ? selected : `${selected}.xlsx`;
+      }
+      const result = await api.exportExcel(path, filter);
+      exportOpen = false;
+      showToast(`已导出 ${result.itemCount} 项：${result.path}`, 5000);
+    } catch (cause) {
+      error = readableError(cause, 'Excel 报表没有生成，请重新选择保存位置。');
+    } finally {
+      exporting = false;
     }
   }
 
@@ -293,11 +449,15 @@
     }
   }
 
-  function showToast(message: string): void {
+  function showToast(message: string, duration = 2600): void {
+    if (toastTimer) clearTimeout(toastTimer);
     toast = message;
-    setTimeout(() => {
-      if (toast === message) toast = '';
-    }, 2600);
+    toastTimer = setTimeout(() => {
+      if (toast === message) {
+        toast = '';
+        undoDeletedItem = null;
+      }
+    }, duration);
   }
 
   const dateLabel = new Intl.DateTimeFormat('zh-CN', {
@@ -342,6 +502,9 @@
       <span class="nav-marker">⌘</span>
       <span>后台设置</span>
     </button>
+    <button class="nav-item settings-entry" on:click={() => (organizerOpen = true)}>
+      <span class="nav-marker">◇</span><span>类型与标签</span>
+    </button>
 
     <div class="shortcut-note">
       <kbd>{navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}</kbd>
@@ -361,6 +524,7 @@
         {#if urgentCount > 0}
           <span class="urgent-summary"><span></span>{urgentCount} 项今日必做</span>
         {/if}
+        <button class="secondary-button export-button" disabled={exporting} on:click={() => (exportOpen = true)}>{exporting ? '正在导出…' : '导出 Excel'}</button>
         <button class="new-item-button" on:click={() => api.showCapture()}>
           <span aria-hidden="true">＋</span> 快速记录
         </button>
@@ -399,6 +563,11 @@
             onComplete={completeItem}
             onPause={pauseItem}
             onReschedule={rescheduleItem}
+            {categories}
+            {tags}
+            onUpdate={updateItem}
+            onDelete={deleteItem}
+            onPermanentDelete={permanentlyDeleteItem}
           />
         {/each}
       {/if}
@@ -425,6 +594,32 @@
     />
   {/if}
 
+  {#if organizerOpen}
+    <OrganizerPanel
+      {categories}
+      {tags}
+      onClose={() => (organizerOpen = false)}
+      onCreateCategory={createCategory}
+      onUpdateCategory={updateCategory}
+      onDeleteCategory={deleteCategory}
+      onMoveCategory={moveCategory}
+      onCreateTag={createTag}
+      onUpdateTag={updateTag}
+      onDeleteTag={deleteTag}
+      onMoveTag={moveTag}
+    />
+  {/if}
+
+  {#if exportOpen}
+    <ExportPanel
+      {categories}
+      {tags}
+      {exporting}
+      onClose={() => (exportOpen = false)}
+      onExport={exportExcel}
+    />
+  {/if}
+
   {#if onboardingOpen && settings && notificationStatus && autostartStatus && onboardingStatus}
     <OnboardingDialog
       {settings}
@@ -436,5 +631,10 @@
     />
   {/if}
 
-  {#if toast}<div class="toast" role="status">{toast}</div>{/if}
+  {#if toast}
+    <div class="toast" role="status">
+      <span>{toast}</span>
+      {#if undoDeletedItem}<button on:click={undoDelete}>撤销</button>{/if}
+    </div>
+  {/if}
 </div>

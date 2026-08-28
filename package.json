@@ -1,6 +1,6 @@
 {
   "name": "shanji",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.2",
     "svelte": "^5.56.10"
   },
   "devDependencies": {

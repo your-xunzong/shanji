@@ -11,6 +11,11 @@ import type {
   UpdateSettingsInput,
   DataFileSummary,
   DataStatus,
+  Tag,
+  TaxonomyInput,
+  UpdateItemInput,
+  ExportResult,
+  ExportFilterInput,
 } from './types';
 import { localDateKey } from './presentation';
 
@@ -18,6 +23,8 @@ const SETTINGS_KEY = 'shanji.preview.settings';
 const ITEMS_KEY = 'shanji.preview.items';
 const DRAFT_KEY = 'shanji.preview.draft';
 const ONBOARDING_KEY = 'shanji.preview.onboarding-version';
+const CATEGORIES_KEY = 'shanji.preview.categories';
+const TAGS_KEY = 'shanji.preview.tags';
 const MANAGED_STATE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800];
 
 const defaultSettings: Settings = {
@@ -37,6 +44,24 @@ const categories: Category[] = [
   { id: 'personal', name: '个人', color: '#6E8B74' },
   { id: 'later', name: '稍后', color: '#9381A8' },
 ];
+
+function readPreviewCategories(): Category[] {
+  const saved = localStorage.getItem(CATEGORIES_KEY);
+  return saved ? JSON.parse(saved) : categories;
+}
+
+function writePreviewCategories(values: Category[]): void {
+  localStorage.setItem(CATEGORIES_KEY, JSON.stringify(values));
+}
+
+function readPreviewTags(): Tag[] {
+  const saved = localStorage.getItem(TAGS_KEY);
+  return saved ? JSON.parse(saved) : [];
+}
+
+function writePreviewTags(values: Tag[]): void {
+  localStorage.setItem(TAGS_KEY, JSON.stringify(values));
+}
 
 function localIsoAt(time: string, dayOffset = 0): string {
   const [hours, minutes] = time.split(':').map(Number);
@@ -64,7 +89,13 @@ function readPreviewSettings(): Settings {
 
 function readPreviewItems(): Item[] {
   const saved = localStorage.getItem(ITEMS_KEY);
-  if (saved) return JSON.parse(saved);
+  if (saved) {
+    return (JSON.parse(saved) as Item[]).map((item) => ({
+      ...item,
+      deletedAt: item.deletedAt ?? null,
+      tags: Array.isArray(item.tags) ? item.tags : [],
+    }));
+  }
 
   const settings = readPreviewSettings();
   const now = new Date().toISOString();
@@ -90,6 +121,8 @@ function readPreviewItems(): Item[] {
       createdAt: now,
       updatedAt: now,
       completedAt: null,
+      deletedAt: null,
+      tags: [],
     },
     {
       id: crypto.randomUUID(),
@@ -112,6 +145,8 @@ function readPreviewItems(): Item[] {
       createdAt: now,
       updatedAt: now,
       completedAt: null,
+      deletedAt: null,
+      tags: [],
     },
   ];
   localStorage.setItem(ITEMS_KEY, JSON.stringify(seed));
@@ -127,6 +162,7 @@ function previewFilter(items: Item[], filter: ItemFilter): Item[] {
   return items.filter((item) => {
     if (filter === 'all') return item.status !== 'DELETED';
     if (filter === 'done') return item.status === 'DONE';
+    if (filter === 'deleted') return item.status === 'DELETED';
     if (item.status !== 'OPEN') return false;
     if (filter === 'overdue') return new Date(item.dueAt) < now;
     if (filter === 'today') {
@@ -188,7 +224,7 @@ export const api = {
       notes: input.notes ?? '',
       status: 'OPEN',
       categoryId: input.categoryId ?? null,
-      categoryName: categories.find((category) => category.id === input.categoryId)?.name ?? null,
+      categoryName: readPreviewCategories().find((category) => category.id === input.categoryId)?.name ?? null,
       dueAt,
       dueLocalDate: localDateKey(due),
       dueLocalTime: localTime(due),
@@ -205,6 +241,8 @@ export const api = {
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       completedAt: null,
+      deletedAt: null,
+      tags: readPreviewTags().filter((tag) => input.tagIds?.includes(tag.id)),
     };
     writePreviewItems([item, ...readPreviewItems()]);
     localStorage.removeItem(DRAFT_KEY);
@@ -270,7 +308,145 @@ export const api = {
 
   async listCategories(): Promise<Category[]> {
     if (isTauri()) return call<Category[]>('list_categories');
-    return categories;
+    return readPreviewCategories();
+  },
+
+  async createCategory(input: TaxonomyInput): Promise<Category> {
+    if (isTauri()) return call<Category>('create_category', { input });
+    const category = { id: crypto.randomUUID(), ...input };
+    writePreviewCategories([...readPreviewCategories(), category]);
+    return category;
+  },
+
+  async updateCategory(id: string, input: TaxonomyInput): Promise<Category> {
+    if (isTauri()) return call<Category>('update_category', { id, input });
+    const values = readPreviewCategories();
+    const category = values.find((value) => value.id === id);
+    if (!category) throw new Error('找不到要修改的类型');
+    Object.assign(category, input);
+    writePreviewCategories(values);
+    return category;
+  },
+
+  async deleteCategory(id: string, reassignTo: string | null): Promise<void> {
+    if (isTauri()) return call<void>('delete_category', { id, reassignTo });
+    const categories = readPreviewCategories();
+    const target = categories.find((value) => value.id === reassignTo);
+    const items = readPreviewItems();
+    for (const item of items) {
+      if (item.categoryId === id) {
+        item.categoryId = reassignTo;
+        item.categoryName = target?.name ?? null;
+      }
+    }
+    writePreviewItems(items);
+    writePreviewCategories(categories.filter((value) => value.id !== id));
+  },
+
+  async moveCategory(id: string, direction: 'up' | 'down'): Promise<void> {
+    if (isTauri()) return call<void>('move_category', { id, direction });
+    const values = readPreviewCategories();
+    const index = values.findIndex((value) => value.id === id);
+    const target = direction === 'up' ? index - 1 : index + 1;
+    if (index < 0 || target < 0 || target >= values.length) return;
+    [values[index], values[target]] = [values[target], values[index]];
+    writePreviewCategories(values);
+  },
+
+  async listTags(): Promise<Tag[]> {
+    if (isTauri()) return call<Tag[]>('list_tags');
+    return readPreviewTags();
+  },
+
+  async createTag(input: TaxonomyInput): Promise<Tag> {
+    if (isTauri()) return call<Tag>('create_tag', { input });
+    const tag = { id: crypto.randomUUID(), ...input };
+    writePreviewTags([...readPreviewTags(), tag]);
+    return tag;
+  },
+
+  async updateTag(id: string, input: TaxonomyInput): Promise<Tag> {
+    if (isTauri()) return call<Tag>('update_tag', { id, input });
+    const values = readPreviewTags();
+    const tag = values.find((value) => value.id === id);
+    if (!tag) throw new Error('找不到要修改的标签');
+    Object.assign(tag, input);
+    writePreviewTags(values);
+    return tag;
+  },
+
+  async deleteTag(id: string): Promise<void> {
+    if (isTauri()) return call<void>('delete_tag', { id });
+    writePreviewTags(readPreviewTags().filter((tag) => tag.id !== id));
+    writePreviewItems(readPreviewItems().map((item) => ({
+      ...item,
+      tags: item.tags.filter((tag) => tag.id !== id),
+    })));
+  },
+
+  async moveTag(id: string, direction: 'up' | 'down'): Promise<void> {
+    if (isTauri()) return call<void>('move_tag', { id, direction });
+    const values = readPreviewTags();
+    const index = values.findIndex((value) => value.id === id);
+    const target = direction === 'up' ? index - 1 : index + 1;
+    if (index < 0 || target < 0 || target >= values.length) return;
+    [values[index], values[target]] = [values[target], values[index]];
+    writePreviewTags(values);
+  },
+
+  async updateItem(id: string, input: UpdateItemInput): Promise<Item> {
+    if (isTauri()) return call<Item>('update_item', { id, input });
+    const items = readPreviewItems();
+    const item = items.find((value) => value.id === id);
+    if (!item) throw new Error('找不到事项');
+    const due = new Date(input.dueAt);
+    item.title = input.title.trim();
+    item.notes = input.notes;
+    item.categoryId = input.categoryId;
+    item.categoryName = readPreviewCategories().find((value) => value.id === input.categoryId)?.name ?? null;
+    item.tags = readPreviewTags().filter((tag) => input.tagIds.includes(tag.id));
+    item.dueAt = due.toISOString();
+    item.dueLocalDate = localDateKey(due);
+    item.dueLocalTime = localTime(due);
+    item.dueSource = 'EXPLICIT';
+    item.rolloverPolicy = 'NONE';
+    item.completionPolicy = input.mustCompleteToday ? 'MUST_COMPLETE_TODAY' : 'NORMAL';
+    item.repeatIntervalMinutes = input.mustCompleteToday ? input.repeatIntervalMinutes ?? 30 : null;
+    item.nextReminderAt = item.status === 'OPEN' ? due.toISOString() : null;
+    item.updatedAt = new Date().toISOString();
+    writePreviewItems(items);
+    return item;
+  },
+
+  async setItemDeleted(id: string, deleted: boolean): Promise<Item> {
+    if (isTauri()) return call<Item>('set_item_deleted', { id, deleted });
+    const items = readPreviewItems();
+    const item = items.find((value) => value.id === id);
+    if (!item) throw new Error('找不到事项');
+    item.status = deleted ? 'DELETED' : 'OPEN';
+    item.deletedAt = deleted ? new Date().toISOString() : null;
+    item.nextReminderAt = deleted ? null : item.dueAt;
+    writePreviewItems(items);
+    return item;
+  },
+
+  async permanentlyDeleteItem(id: string): Promise<void> {
+    if (isTauri()) return call<void>('permanently_delete_item', { id });
+    writePreviewItems(readPreviewItems().filter((item) => item.id !== id));
+  },
+
+  async exportExcel(path: string, filter: ExportFilterInput): Promise<ExportResult> {
+    if (isTauri()) return call<ExportResult>('export_excel', { path, filter });
+    const items = readPreviewItems().filter((item) => {
+      const created = new Date(item.createdAt).getTime();
+      return (filter.status === 'all' || item.status === filter.status.toUpperCase())
+        && (!filter.categoryId || (filter.categoryId === '__inbox__' ? !item.categoryId : item.categoryId === filter.categoryId))
+        && (!filter.tagId || item.tags.some((tag) => tag.id === filter.tagId))
+        && (!filter.createdFrom || created >= new Date(filter.createdFrom).getTime())
+        && (!filter.createdTo || created <= new Date(filter.createdTo).getTime())
+        && item.status !== 'DELETED';
+    });
+    return { path, itemCount: items.length };
   },
 
   async loadDraft(): Promise<string> {
@@ -374,6 +550,8 @@ export const api = {
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       completedAt: null,
+      deletedAt: null,
+      tags: [],
     };
     writePreviewItems([item, ...readPreviewItems()]);
     return item;
@@ -386,7 +564,7 @@ export const api = {
       current: {
         path: '浏览器预览数据',
         itemCount: items.length,
-        schemaVersion: 3,
+        schemaVersion: 4,
         updatedAt: new Date().toISOString(),
       },
       latestBackup: null,
@@ -399,7 +577,7 @@ export const api = {
     return {
       path: '浏览器预览不创建文件备份',
       itemCount: readPreviewItems().length,
-      schemaVersion: 3,
+      schemaVersion: 4,
       updatedAt: new Date().toISOString(),
     };
   },

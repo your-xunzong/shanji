@@ -8,7 +8,7 @@
     localInputToIso,
     mustCompletePreview,
   } from '../lib/presentation';
-  import type { Category, Settings } from '../lib/types';
+  import type { Category, Settings, Tag } from '../lib/types';
 
   let content = '';
   let mustCompleteToday = false;
@@ -17,6 +17,9 @@
   let timePickerOpen = false;
   let settings: Settings | null = null;
   let categories: Category[] = [];
+  let tags: Tag[] = [];
+  let tagIds: string[] = [];
+  let tagPickerOpen = false;
   let saving = false;
   let saved = false;
   let error = '';
@@ -46,13 +49,15 @@
 
   async function refreshContext(): Promise<void> {
     try {
-      const [loadedSettings, loadedCategories, draft] = await Promise.all([
+      const [loadedSettings, loadedCategories, loadedTags, draft] = await Promise.all([
         api.getSettings(),
         api.listCategories(),
+        api.listTags(),
         api.loadDraft(),
       ]);
       settings = loadedSettings;
       categories = loadedCategories;
+      tags = loadedTags;
       if (!content) content = draft;
     } catch (cause) {
       error = readableError(cause, '无法读取本地设置，仍可输入内容。');
@@ -125,11 +130,13 @@
         repeatIntervalMinutes: mustCompleteToday
           ? settings?.overtimeIntervalMinutes ?? 30
           : null,
+        tagIds,
       });
       content = '';
       mustCompleteToday = false;
       categoryId = null;
       dueAt = '';
+      tagIds = [];
       saved = true;
       await new Promise((resolve) => setTimeout(resolve, 160));
       await api.hideCapture();
@@ -159,6 +166,20 @@
       event.preventDefault();
       void submit();
     }
+  }
+
+  function toggleTag(id: string): void {
+    tagIds = tagIds.includes(id) ? tagIds.filter((value) => value !== id) : [...tagIds, id];
+  }
+
+  function toggleTimePicker(): void {
+    timePickerOpen = !timePickerOpen;
+    if (timePickerOpen) tagPickerOpen = false;
+  }
+
+  function toggleTagPicker(): void {
+    tagPickerOpen = !tagPickerOpen;
+    if (tagPickerOpen) timePickerOpen = false;
   }
 </script>
 
@@ -198,7 +219,7 @@
       class:active={Boolean(dueAt)}
       aria-expanded={timePickerOpen}
       aria-controls="capture-time-picker"
-      on:click={() => (timePickerOpen = !timePickerOpen)}
+      on:click={toggleTimePicker}
     >
       <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" /><path d="M10 6v4l3 2" /></svg>
       <span>{dueLabel}</span>
@@ -232,6 +253,21 @@
         {/each}
       </select>
     </label>
+
+    {#if tags.length > 0}
+      <button type="button" class="chip capture-tag-button" class:active={tagIds.length > 0} aria-expanded={tagPickerOpen} on:click={toggleTagPicker}>
+        <span aria-hidden="true">#</span>{tagIds.length > 0 ? `${tagIds.length} 个标签` : '标签'}
+      </button>
+      {#if tagPickerOpen}
+        <div class="capture-tag-picker">
+          <strong>选择标签</strong>
+          {#each tags as tag}
+            <label style={`--tag-color:${tag.color}`}><input type="checkbox" checked={tagIds.includes(tag.id)} on:change={() => toggleTag(tag.id)} /><span></span>{tag.name}</label>
+          {/each}
+          <button class="primary-mini" on:click={() => (tagPickerOpen = false)}>选好了</button>
+        </div>
+      {/if}
+    {/if}
 
     <label class="must-chip" class:active={mustCompleteToday}>
       <input type="checkbox" bind:checked={mustCompleteToday} />

@@ -5,7 +5,7 @@
   "windows": ["main", "capture"],
   "permissions": [
     "core:default",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "dialog:allow-save"
   ]
 }
-

@@ -12,8 +12,9 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        Category, CreateItemInput, Item, Settings, UpdateSettingsInput, due_for_local_date,
-        due_from_explicit, must_complete_due, next_default_due, next_repeat_at, parse_time,
+        Category, CreateItemInput, Item, Settings, Tag, TaxonomyInput, UpdateItemInput,
+        UpdateSettingsInput, due_for_local_date, due_from_explicit, must_complete_due,
+        next_default_due, next_repeat_at, parse_time,
     },
     error::{AppError, AppResult},
 };
@@ -21,7 +22,8 @@ use crate::{
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_notification_delivery.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_autostart_onboarding.sql");
-const LATEST_SCHEMA_VERSION: i64 = 3;
+const MIGRATION_0004: &str = include_str!("../migrations/0004_types_tags_recycle.sql");
+const LATEST_SCHEMA_VERSION: i64 = 4;
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -142,6 +144,11 @@ impl Database {
             transaction.execute_batch(MIGRATION_0003)?;
             transaction.commit()?;
         }
+        if version < 4 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(MIGRATION_0004)?;
+            transaction.commit()?;
+        }
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -157,6 +164,7 @@ impl Database {
         transaction.execute_batch(MIGRATION_0001)?;
         transaction.execute_batch(MIGRATION_0002)?;
         transaction.execute_batch(MIGRATION_0003)?;
+        transaction.execute_batch(MIGRATION_0004)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -281,6 +289,7 @@ impl Database {
         let mut connection = self.connection.lock().expect("database mutex poisoned");
         let transaction = connection.transaction()?;
         let settings = read_settings(&transaction)?;
+        validate_taxonomy_links(&transaction, input.category_id.as_deref(), &input.tag_ids)?;
         let due = match &input.due_at {
             Some(value) => due_from_explicit(value)?,
             None if input.must_complete_today => must_complete_due(now, &settings)?,
@@ -332,6 +341,7 @@ impl Database {
                 timestamp,
             ],
         )?;
+        replace_item_tags(&transaction, &id, &input.tag_ids)?;
         insert_item_event(&transaction, &id, "CREATED", "{}", &timestamp)?;
         transaction.execute("DELETE FROM drafts WHERE id = 1", [])?;
         transaction.commit()?;
@@ -355,6 +365,7 @@ impl Database {
             ),
             "overdue" => ("i.status = 'OPEN' AND i.due_at < ?1", Some(&now_text)),
             "done" => ("i.status = 'DONE'", None),
+            "deleted" => ("i.status = 'DELETED'", None),
             "all" => ("i.status != 'DELETED'", None),
             _ => return Err(AppError::Validation("未知的事项筛选条件".into())),
         };
@@ -368,14 +379,21 @@ impl Database {
         } else {
             statement.query_map([], row_to_item)?
         };
-        mapped
+        let mut items = mapped
             .collect::<Result<Vec<_>, _>>()
-            .map_err(AppError::from)
+            .map_err(AppError::from)?;
+        drop(statement);
+        for item in &mut items {
+            item.tags = load_item_tags(&connection, &item.id)?;
+        }
+        Ok(items)
     }
 
     pub fn get_item(&self, id: &str) -> AppResult<Item> {
         let connection = self.connection.lock().expect("database mutex poisoned");
-        get_item_from(&connection, id)
+        let mut item = get_item_from(&connection, id)?;
+        item.tags = load_item_tags(&connection, id)?;
+        Ok(item)
     }
 
     pub fn set_item_completed(
@@ -510,6 +528,240 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
     }
 
+    pub fn create_category(&self, input: &TaxonomyInput) -> AppResult<Category> {
+        input.validate("类型")?;
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let id = Uuid::new_v4().to_string();
+        connection.execute(
+            "INSERT INTO categories (id, name, color, position)
+             VALUES (?1, ?2, ?3, COALESCE((SELECT MAX(position) + 10 FROM categories), 10))",
+            params![id, input.name.trim(), input.color],
+        )?;
+        Ok(Category {
+            id,
+            name: input.name.trim().to_string(),
+            color: input.color.clone(),
+        })
+    }
+
+    pub fn update_category(&self, id: &str, input: &TaxonomyInput) -> AppResult<Category> {
+        input.validate("类型")?;
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE categories SET name = ?1, color = ?2 WHERE id = ?3 AND archived = 0",
+            params![input.name.trim(), input.color, id],
+        )?;
+        if changed == 0 {
+            return Err(AppError::Validation("找不到要修改的类型".into()));
+        }
+        Ok(Category {
+            id: id.to_string(),
+            name: input.name.trim().to_string(),
+            color: input.color.clone(),
+        })
+    }
+
+    pub fn delete_category(&self, id: &str, reassign_to: Option<&str>) -> AppResult<()> {
+        if reassign_to == Some(id) {
+            return Err(AppError::Validation("请选择另一个类型作为迁移目标".into()));
+        }
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        ensure_category_exists(&transaction, id)?;
+        if let Some(target) = reassign_to {
+            ensure_category_exists(&transaction, target)?;
+        }
+        transaction.execute(
+            "UPDATE items SET category_id = ?1, revision = revision + 1 WHERE category_id = ?2",
+            params![reassign_to, id],
+        )?;
+        transaction.execute("DELETE FROM categories WHERE id = ?1", [id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn move_category(&self, id: &str, direction: &str) -> AppResult<()> {
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        move_ordered_row(&mut connection, "categories", id, direction, "类型")
+    }
+
+    pub fn list_tags(&self) -> AppResult<Vec<Tag>> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        load_tags(&connection)
+    }
+
+    pub fn create_tag(&self, input: &TaxonomyInput) -> AppResult<Tag> {
+        input.validate("标签")?;
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let id = Uuid::new_v4().to_string();
+        connection.execute(
+            "INSERT INTO tags (id, name, color, position)
+             VALUES (?1, ?2, ?3, COALESCE((SELECT MAX(position) + 10 FROM tags), 10))",
+            params![id, input.name.trim(), input.color],
+        )?;
+        Ok(Tag {
+            id,
+            name: input.name.trim().to_string(),
+            color: input.color.clone(),
+        })
+    }
+
+    pub fn update_tag(&self, id: &str, input: &TaxonomyInput) -> AppResult<Tag> {
+        input.validate("标签")?;
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE tags SET name = ?1, color = ?2 WHERE id = ?3 AND archived = 0",
+            params![input.name.trim(), input.color, id],
+        )?;
+        if changed == 0 {
+            return Err(AppError::Validation("找不到要修改的标签".into()));
+        }
+        Ok(Tag {
+            id: id.to_string(),
+            name: input.name.trim().to_string(),
+            color: input.color.clone(),
+        })
+    }
+
+    pub fn delete_tag(&self, id: &str) -> AppResult<()> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let changed = connection.execute("DELETE FROM tags WHERE id = ?1", [id])?;
+        if changed == 0 {
+            return Err(AppError::Validation("找不到要删除的标签".into()));
+        }
+        Ok(())
+    }
+
+    pub fn move_tag(&self, id: &str, direction: &str) -> AppResult<()> {
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        move_ordered_row(&mut connection, "tags", id, direction, "标签")
+    }
+
+    pub fn update_item(
+        &self,
+        id: &str,
+        input: &UpdateItemInput,
+        now: DateTime<Utc>,
+    ) -> AppResult<Item> {
+        input.validate()?;
+        let due = due_from_explicit(&input.due_at)?;
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let existing = get_item_from(&transaction, id)?;
+        if existing.status == "DELETED" {
+            return Err(AppError::Validation("请先从回收站恢复事项再编辑".into()));
+        }
+        validate_taxonomy_links(&transaction, input.category_id.as_deref(), &input.tag_ids)?;
+        let settings = read_settings(&transaction)?;
+        let timestamp = now.to_rfc3339();
+        let due_at = due.utc.to_rfc3339();
+        let completion_policy = if input.must_complete_today {
+            "MUST_COMPLETE_TODAY"
+        } else {
+            "NORMAL"
+        };
+        let repeat_interval = input.must_complete_today.then_some(
+            input
+                .repeat_interval_minutes
+                .unwrap_or(settings.overtime_interval_minutes),
+        );
+        let next_reminder = if existing.status == "OPEN" && !existing.reminder_paused {
+            Some(if due.utc <= now {
+                timestamp.clone()
+            } else {
+                due_at.clone()
+            })
+        } else {
+            None
+        };
+        transaction.execute(
+            "UPDATE items SET title = ?1, notes = ?2, category_id = ?3, due_at = ?4,
+                due_local_date = ?5, due_local_time = ?6, due_source = 'EXPLICIT',
+                rollover_policy = 'NONE', completion_policy = ?7, repeat_interval_minutes = ?8,
+                next_reminder_at = ?9, reminder_paused = 0, updated_at = ?10,
+                revision = revision + 1 WHERE id = ?11",
+            params![
+                input.title.trim(),
+                input.notes,
+                input.category_id,
+                due_at,
+                due.local_date.format("%Y-%m-%d").to_string(),
+                due.local_time.format("%H:%M").to_string(),
+                completion_policy,
+                repeat_interval,
+                next_reminder,
+                timestamp,
+                id,
+            ],
+        )?;
+        replace_item_tags(&transaction, id, &input.tag_ids)?;
+        insert_item_event(&transaction, id, "EDITED", "{}", &timestamp)?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_item(id)
+    }
+
+    pub fn set_item_deleted(&self, id: &str, deleted: bool, now: DateTime<Utc>) -> AppResult<Item> {
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let existing = get_item_from(&transaction, id)?;
+        let timestamp = now.to_rfc3339();
+        let deleted_from_status = transaction.query_row(
+            "SELECT deleted_from_status FROM items WHERE id = ?1",
+            [id],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        let restored_status = deleted_from_status.as_deref().unwrap_or("OPEN");
+        let status = if deleted { "DELETED" } else { restored_status };
+        let next_reminder = if deleted || status != "OPEN" {
+            None
+        } else if existing.due_at <= timestamp {
+            Some(timestamp.clone())
+        } else {
+            Some(existing.due_at)
+        };
+        transaction.execute(
+            "UPDATE items SET status = ?1, deleted_at = ?2,
+                next_reminder_at = ?3, reminder_paused = 0, updated_at = ?4,
+                deleted_from_status = ?5, revision = revision + 1 WHERE id = ?6",
+            params![
+                status,
+                deleted.then_some(timestamp.clone()),
+                next_reminder,
+                timestamp,
+                if deleted { Some(existing.status) } else { None },
+                id
+            ],
+        )?;
+        insert_item_event(
+            &transaction,
+            id,
+            if deleted { "DELETED" } else { "RESTORED" },
+            "{}",
+            &now.to_rfc3339(),
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_item(id)
+    }
+
+    pub fn permanently_delete_item(&self, id: &str) -> AppResult<()> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let status = connection
+            .query_row("SELECT status FROM items WHERE id = ?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .ok_or(AppError::ItemNotFound)?;
+        if status != "DELETED" {
+            return Err(AppError::Validation(
+                "只有回收站中的事项可以永久删除".into(),
+            ));
+        }
+        connection.execute("DELETE FROM items WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     pub fn load_draft(&self) -> AppResult<String> {
         let connection = self.connection.lock().expect("database mutex poisoned");
         Ok(connection
@@ -538,6 +790,12 @@ impl Database {
             notifications_enabled: settings.notifications_enabled,
             ..ProcessResult::default()
         };
+
+        let recycle_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
+        result.changed |= transaction.execute(
+            "DELETE FROM items WHERE status = 'DELETED' AND deleted_at IS NOT NULL AND deleted_at <= ?1",
+            [&recycle_cutoff],
+        )? > 0;
 
         result.changed |= repair_future_must_complete_items(&transaction, now)? > 0;
         result.changed |= rollover_default_items(&transaction, &settings, now)? > 0;
@@ -828,7 +1086,8 @@ fn item_select() -> &'static str {
             i.due_at, i.due_local_date, i.due_local_time, i.due_source,
             i.rollover_policy, i.rollover_count, i.completion_policy,
             i.repeat_interval_minutes, i.next_reminder_at, i.reminder_paused,
-            i.bypass_app_quiet_hours, i.created_at, i.updated_at, i.completed_at
+            i.bypass_app_quiet_hours, i.created_at, i.updated_at, i.completed_at,
+            i.deleted_at
      FROM items i LEFT JOIN categories c ON c.id = i.category_id"
 }
 
@@ -854,6 +1113,8 @@ fn row_to_item(row: &Row<'_>) -> rusqlite::Result<Item> {
         created_at: row.get(17)?,
         updated_at: row.get(18)?,
         completed_at: row.get(19)?,
+        deleted_at: row.get(20)?,
+        tags: Vec::new(),
     })
 }
 
@@ -863,6 +1124,130 @@ fn get_item_from(connection: &Connection, id: &str) -> AppResult<Item> {
         .query_row(&sql, [id], row_to_item)
         .optional()?
         .ok_or(AppError::ItemNotFound)
+}
+
+fn load_tags(connection: &Connection) -> AppResult<Vec<Tag>> {
+    let mut statement = connection
+        .prepare("SELECT id, name, color FROM tags WHERE archived = 0 ORDER BY position, name")?;
+    let rows = statement.query_map([], |row| {
+        Ok(Tag {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            color: row.get(2)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn move_ordered_row(
+    connection: &mut Connection,
+    table: &str,
+    id: &str,
+    direction: &str,
+    label: &str,
+) -> AppResult<()> {
+    let (operator, ordering) = match direction {
+        "up" => ("<", "DESC"),
+        "down" => (">", "ASC"),
+        _ => return Err(AppError::Validation("排序方向无效".into())),
+    };
+    let transaction = connection.transaction()?;
+    let current = transaction
+        .query_row(
+            &format!("SELECT position FROM {table} WHERE id = ?1 AND archived = 0"),
+            [id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::Validation(format!("找不到要排序的{label}")))?;
+    let neighbor = transaction
+        .query_row(
+            &format!(
+                "SELECT id, position FROM {table} WHERE archived = 0 AND position {operator} ?1 ORDER BY position {ordering}, name {ordering} LIMIT 1"
+            ),
+            [current],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if let Some((neighbor_id, neighbor_position)) = neighbor {
+        transaction.execute(
+            &format!("UPDATE {table} SET position = ?1 WHERE id = ?2"),
+            params![neighbor_position, id],
+        )?;
+        transaction.execute(
+            &format!("UPDATE {table} SET position = ?1 WHERE id = ?2"),
+            params![current, neighbor_id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn load_item_tags(connection: &Connection, item_id: &str) -> AppResult<Vec<Tag>> {
+    let mut statement = connection.prepare(
+        "SELECT t.id, t.name, t.color
+         FROM tags t JOIN item_tags it ON it.tag_id = t.id
+         WHERE it.item_id = ?1 AND t.archived = 0 ORDER BY t.position, t.name",
+    )?;
+    let rows = statement.query_map([item_id], |row| {
+        Ok(Tag {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            color: row.get(2)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn ensure_category_exists(connection: &Connection, id: &str) -> AppResult<()> {
+    let exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM categories WHERE id = ?1 AND archived = 0)",
+        [id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        return Err(AppError::Validation("所选类型已不存在，请重新选择".into()));
+    }
+    Ok(())
+}
+
+fn validate_taxonomy_links(
+    connection: &Connection,
+    category_id: Option<&str>,
+    tag_ids: &[String],
+) -> AppResult<()> {
+    if let Some(category_id) = category_id {
+        ensure_category_exists(connection, category_id)?;
+    }
+    for tag_id in tag_ids {
+        let exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1 AND archived = 0)",
+            [tag_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(AppError::Validation("所选标签已不存在，请重新选择".into()));
+        }
+    }
+    Ok(())
+}
+
+fn replace_item_tags(
+    transaction: &Transaction<'_>,
+    item_id: &str,
+    tag_ids: &[String],
+) -> AppResult<()> {
+    transaction.execute("DELETE FROM item_tags WHERE item_id = ?1", [item_id])?;
+    let mut unique = tag_ids.to_vec();
+    unique.sort();
+    unique.dedup();
+    for tag_id in unique {
+        transaction.execute(
+            "INSERT INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
+            params![item_id, tag_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn insert_item_event(
@@ -1146,6 +1531,7 @@ mod tests {
                     due_at: None,
                     must_complete_today: false,
                     repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
                 },
                 at_local(2026, 8, 27, 10, 0),
             )
@@ -1173,6 +1559,7 @@ mod tests {
                     due_at: None,
                     must_complete_today: false,
                     repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
                 },
                 now,
             )
@@ -1209,6 +1596,7 @@ mod tests {
                     due_at: None,
                     must_complete_today: false,
                     repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
                 },
                 now,
             )
@@ -1229,6 +1617,7 @@ mod tests {
                     due_at: Some(due.to_rfc3339()),
                     must_complete_today: true,
                     repeat_interval_minutes: Some(30),
+                    tag_ids: Vec::new(),
                 },
                 at_local(2026, 8, 27, 17, 0),
             )
@@ -1255,6 +1644,7 @@ mod tests {
                     due_at: None,
                     must_complete_today: true,
                     repeat_interval_minutes: Some(15),
+                    tag_ids: Vec::new(),
                 },
                 now,
             )
@@ -1285,6 +1675,7 @@ mod tests {
                     due_at: None,
                     must_complete_today: true,
                     repeat_interval_minutes: Some(15),
+                    tag_ids: Vec::new(),
                 },
                 at_local(2026, 8, 27, 10, 0),
             )
@@ -1322,6 +1713,7 @@ mod tests {
                     due_at: Some(at_local(2026, 8, 27, 15, 0).to_rfc3339()),
                     must_complete_today: false,
                     repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
                 },
                 at_local(2026, 8, 27, 14, 0),
             )
@@ -1350,6 +1742,7 @@ mod tests {
                     due_at: Some(due.to_rfc3339()),
                     must_complete_today: false,
                     repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
                 },
                 at_local(2026, 8, 27, 17, 0),
             )
@@ -1390,12 +1783,171 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert!(delivery_columns.contains(&"submitted_at".into()));
         assert!(delivery_columns.contains(&"error_code".into()));
         assert!(settings_columns.contains(&"autostart_enabled".into()));
         assert!(settings_columns.contains(&"onboarding_version".into()));
+        let tag_table_exists = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'item_tags')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        let item_columns = connection
+            .prepare("PRAGMA table_info(items)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(tag_table_exists);
+        assert!(item_columns.contains(&"deleted_at".into()));
         assert!(path.with_extension("db.backup-before-v3").exists());
+    }
+
+    #[test]
+    fn types_and_tags_can_be_reordered() {
+        let database = Database::in_memory().unwrap();
+        database.move_category("personal", "up").unwrap();
+        assert_eq!(database.list_categories().unwrap()[0].id, "personal");
+
+        let first = database
+            .create_tag(&TaxonomyInput {
+                name: "客户".into(),
+                color: "#B06C49".into(),
+            })
+            .unwrap();
+        let second = database
+            .create_tag(&TaxonomyInput {
+                name: "内部".into(),
+                color: "#627D98".into(),
+            })
+            .unwrap();
+        database.move_tag(&second.id, "up").unwrap();
+        let tags = database.list_tags().unwrap();
+        assert_eq!(tags[0].id, second.id);
+        assert_eq!(tags[1].id, first.id);
+    }
+
+    #[test]
+    fn existing_item_can_change_type_and_tags_without_changing_status() {
+        let database = Database::in_memory().unwrap();
+        let now = at_local(2026, 8, 28, 17, 0);
+        let tag = database
+            .create_tag(&TaxonomyInput {
+                name: "客户".into(),
+                color: "#B06C49".into(),
+            })
+            .unwrap();
+        let item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "确认客户反馈".into(),
+                    notes: String::new(),
+                    category_id: Some("work".into()),
+                    due_at: Some(at_local(2026, 8, 28, 18, 0).to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
+                },
+                now,
+            )
+            .unwrap();
+
+        let updated = database
+            .update_item(
+                &item.id,
+                &UpdateItemInput {
+                    title: item.title.clone(),
+                    notes: "已电话确认".into(),
+                    category_id: Some("personal".into()),
+                    tag_ids: vec![tag.id.clone()],
+                    due_at: item.due_at.clone(),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(updated.status, "OPEN");
+        assert_eq!(updated.category_id.as_deref(), Some("personal"));
+        assert_eq!(updated.tags.len(), 1);
+        assert_eq!(updated.tags[0].name, "客户");
+
+        database.delete_tag(&tag.id).unwrap();
+        assert!(database.get_item(&item.id).unwrap().tags.is_empty());
+        database.delete_category("personal", None).unwrap();
+        assert!(database.get_item(&item.id).unwrap().category_id.is_none());
+    }
+
+    #[test]
+    fn recycle_bin_stops_reminders_and_requires_restore_before_permanent_delete() {
+        let database = Database::in_memory().unwrap();
+        let now = at_local(2026, 8, 28, 17, 0);
+        let item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "回收站测试".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(at_local(2026, 8, 28, 18, 0).to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
+                },
+                now,
+            )
+            .unwrap();
+
+        assert!(database.permanently_delete_item(&item.id).is_err());
+        let deleted = database.set_item_deleted(&item.id, true, now).unwrap();
+        assert_eq!(deleted.status, "DELETED");
+        assert!(deleted.next_reminder_at.is_none());
+        assert!(deleted.deleted_at.is_some());
+        let restored = database.set_item_deleted(&item.id, false, now).unwrap();
+        assert_eq!(restored.status, "OPEN");
+        assert!(restored.next_reminder_at.is_some());
+        database.set_item_completed(&item.id, true, now).unwrap();
+        database.set_item_deleted(&item.id, true, now).unwrap();
+        let restored_done = database.set_item_deleted(&item.id, false, now).unwrap();
+        assert_eq!(restored_done.status, "DONE");
+        assert!(restored_done.next_reminder_at.is_none());
+        database.set_item_deleted(&item.id, true, now).unwrap();
+        database.permanently_delete_item(&item.id).unwrap();
+        assert!(matches!(
+            database.get_item(&item.id),
+            Err(AppError::ItemNotFound)
+        ));
+    }
+
+    #[test]
+    fn recycle_bin_removes_items_after_thirty_days() {
+        let database = Database::in_memory().unwrap();
+        let created = at_local(2026, 7, 1, 10, 0);
+        let item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "过期回收项".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(at_local(2026, 7, 1, 18, 0).to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
+                },
+                created,
+            )
+            .unwrap();
+        database.set_item_deleted(&item.id, true, created).unwrap();
+        database
+            .process_due(created + chrono::Duration::days(31))
+            .unwrap();
+        assert!(matches!(
+            database.get_item(&item.id),
+            Err(AppError::ItemNotFound)
+        ));
     }
 
     #[test]
@@ -1412,6 +1964,7 @@ mod tests {
                     due_at: Some(at_local(2026, 8, 28, 18, 0).to_rfc3339()),
                     must_complete_today: false,
                     repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
                 },
                 at_local(2026, 8, 28, 17, 0),
             )
@@ -1439,6 +1992,7 @@ mod tests {
                     due_at: Some(at_local(2026, 8, 28, 18, 0).to_rfc3339()),
                     must_complete_today: false,
                     repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
                 },
                 now,
             )
@@ -1453,6 +2007,7 @@ mod tests {
                     due_at: Some(at_local(2026, 8, 29, 18, 0).to_rfc3339()),
                     must_complete_today: false,
                     repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
                 },
                 now,
             )
@@ -1503,6 +2058,7 @@ mod tests {
                     due_at: Some(due.to_rfc3339()),
                     must_complete_today: false,
                     repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
                 },
                 at_local(2026, 8, 27, 17, 0),
             )
@@ -1534,6 +2090,7 @@ mod tests {
                     due_at: Some(due.to_rfc3339()),
                     must_complete_today: false,
                     repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
                 },
                 at_local(2026, 8, 27, 17, 0),
             )
@@ -1588,6 +2145,7 @@ mod tests {
                     due_at: Some(due.to_rfc3339()),
                     must_complete_today: false,
                     repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
                 },
                 at_local(2026, 8, 27, 17, 0),
             )

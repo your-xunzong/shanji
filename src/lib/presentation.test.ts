@@ -29,6 +29,8 @@ const baseItem: Item = {
   createdAt: '2026-08-27T01:00:00.000Z',
   updatedAt: '2026-08-27T01:00:00.000Z',
   completedAt: null,
+  deletedAt: null,
+  tags: [],
 };
 
 describe('itemTiming', () => {
