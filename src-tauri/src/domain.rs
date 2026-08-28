@@ -3,6 +3,8 @@ use chrono::{
     TimeZone, Utc,
 };
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+use tauri_plugin_global_shortcut::{Modifiers, Shortcut};
 
 use crate::error::{AppError, AppResult};
 
@@ -30,6 +32,7 @@ pub struct Settings {
     pub quiet_end: String,
     pub global_shortcut: String,
     pub notifications_enabled: bool,
+    pub autostart_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,6 +46,7 @@ pub struct UpdateSettingsInput {
     pub quiet_end: String,
     pub global_shortcut: String,
     pub notifications_enabled: bool,
+    pub autostart_enabled: bool,
     pub update_existing_default_items: bool,
 }
 
@@ -60,9 +64,7 @@ impl UpdateSettingsInput {
                 "今日必做提醒间隔必须在 5–240 分钟之间".into(),
             ));
         }
-        if self.global_shortcut.trim().is_empty() {
-            return Err(AppError::Validation("全局快捷键不能为空".into()));
-        }
+        validate_global_shortcut(&self.global_shortcut)?;
         Ok(())
     }
 
@@ -79,8 +81,51 @@ impl UpdateSettingsInput {
             quiet_end: self.quiet_end.clone(),
             global_shortcut: self.global_shortcut.trim().to_string(),
             notifications_enabled: self.notifications_enabled,
+            autostart_enabled: self.autostart_enabled,
         }
     }
+}
+
+pub fn validate_global_shortcut(value: &str) -> AppResult<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AppError::Validation(
+            "快捷键不能为空，请输入类似 Ctrl+Shift+Space 的组合。".into(),
+        ));
+    }
+
+    let modifier_names = [
+        "alt",
+        "option",
+        "ctrl",
+        "control",
+        "shift",
+        "command",
+        "cmd",
+        "super",
+        "meta",
+        "commandorcontrol",
+    ];
+    let tokens = value.split('+').map(str::trim).collect::<Vec<_>>();
+    if !tokens.is_empty()
+        && tokens
+            .iter()
+            .all(|token| modifier_names.contains(&token.to_ascii_lowercase().as_str()))
+    {
+        return Err(AppError::Validation(
+            "快捷键必须包含一个普通按键，例如 Space、M 或 F8。".into(),
+        ));
+    }
+
+    let shortcut = Shortcut::from_str(value).map_err(|_| {
+        AppError::Validation("快捷键格式无效，请输入类似 Ctrl+Shift+Space 的组合。".into())
+    })?;
+    if shortcut.mods == Modifiers::empty() {
+        return Err(AppError::Validation(
+            "快捷键必须同时包含修饰键和一个普通按键。".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -299,6 +344,7 @@ mod tests {
             quiet_end: "07:30".into(),
             global_shortcut: "CommandOrControl+Shift+Space".into(),
             notifications_enabled: true,
+            autostart_enabled: false,
         }
     }
 
@@ -353,5 +399,20 @@ mod tests {
             next_local.time(),
             NaiveTime::from_hms_opt(7, 30, 0).unwrap()
         );
+    }
+
+    #[test]
+    fn shortcut_validation_returns_actionable_errors() {
+        assert_eq!(
+            validate_global_shortcut("").unwrap_err().to_string(),
+            "快捷键不能为空，请输入类似 Ctrl+Shift+Space 的组合。"
+        );
+        assert_eq!(
+            validate_global_shortcut("Ctrl+Shift")
+                .unwrap_err()
+                .to_string(),
+            "快捷键必须包含一个普通按键，例如 Space、M 或 F8。"
+        );
+        assert!(validate_global_shortcut("Ctrl+Shift+Space").is_ok());
     }
 }

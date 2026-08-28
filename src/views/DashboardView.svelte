@@ -2,12 +2,16 @@
   import { onMount, tick } from 'svelte';
   import { isTauri } from '@tauri-apps/api/core';
   import ItemCard from '../components/ItemCard.svelte';
+  import OnboardingDialog from '../components/OnboardingDialog.svelte';
   import SettingsPanel from '../components/SettingsPanel.svelte';
   import { api } from '../lib/api';
   import type {
     Item,
     ItemFilter,
+    AutostartStatus,
     NotificationStatus,
+    OnboardingFinishInput,
+    OnboardingStatus,
     Settings,
     UpdateSettingsInput,
   } from '../lib/types';
@@ -15,11 +19,14 @@
   let items: Item[] = [];
   let settings: Settings | null = null;
   let notificationStatus: NotificationStatus | null = null;
+  let autostartStatus: AutostartStatus | null = null;
+  let onboardingStatus: OnboardingStatus | null = null;
   let filter: ItemFilter = 'open';
   let loading = true;
   let error = '';
   let busyItemId = '';
   let settingsOpen = false;
+  let onboardingOpen = false;
   let settingsSaving = false;
   let toast = '';
   let unlistenItems: (() => void) | undefined;
@@ -61,14 +68,29 @@
     loading = true;
     error = '';
     try {
-      const [loadedSettings, loadedNotificationStatus, , warning] = await Promise.all([
+      const [
+        loadedSettings,
+        loadedNotificationStatus,
+        loadedAutostartStatus,
+        loadedOnboardingStatus,
+        ,
+        warning,
+      ] = await Promise.all([
         api.getSettings(),
         api.getNotificationStatus(),
+        api.getAutostartStatus(),
+        api.getOnboardingStatus(),
         loadItems(),
         api.getSystemWarning(),
       ]);
+      if (loadedAutostartStatus.available) {
+        loadedSettings.autostartEnabled = loadedAutostartStatus.enabled;
+      }
       settings = loadedSettings;
       notificationStatus = loadedNotificationStatus;
+      autostartStatus = loadedAutostartStatus;
+      onboardingStatus = loadedOnboardingStatus;
+      onboardingOpen = loadedOnboardingStatus.required;
       if (warning) error = warning;
     } catch (cause) {
       error = readableError(cause, '无法打开本地数据。请检查数据目录后重试。');
@@ -78,6 +100,7 @@
   }
 
   function readableError(cause: unknown, fallback: string): string {
+    if (typeof cause === 'string' && cause) return cause;
     return cause instanceof Error && cause.message ? cause.message : fallback;
   }
 
@@ -145,14 +168,61 @@
     error = '';
     try {
       settings = await api.updateSettings(input);
+      autostartStatus = await api.getAutostartStatus();
+      if (autostartStatus.available) settings.autostartEnabled = autostartStatus.enabled;
       settingsOpen = false;
       await loadItems();
       showToast('设置已保存');
     } catch (cause) {
-      error = readableError(cause, '设置没有保存，请检查输入后重试。');
+      throw new Error(readableError(cause, '设置没有保存，请检查输入后重试。'));
     } finally {
       settingsSaving = false;
     }
+  }
+
+  async function openSettings(): Promise<void> {
+    try {
+      const [latestAutostart, latestNotifications] = await Promise.all([
+        api.getAutostartStatus(),
+        api.getNotificationStatus(),
+      ]);
+      autostartStatus = latestAutostart;
+      notificationStatus = latestNotifications;
+      if (settings && latestAutostart.available) {
+        settings = { ...settings, autostartEnabled: latestAutostart.enabled };
+      }
+      settingsOpen = true;
+    } catch (cause) {
+      error = readableError(cause, '无法读取系统设置状态。');
+    }
+  }
+
+  function reopenOnboarding(): void {
+    settingsOpen = false;
+    onboardingOpen = true;
+  }
+
+  async function finishOnboarding(input: OnboardingFinishInput): Promise<void> {
+    if (!settings || !notificationStatus) return;
+    if (input.enablePortableNotifications && !notificationStatus.canNotify) {
+      notificationStatus = await api.registerPortableNotifications();
+    }
+    settings = await api.updateSettings({
+      ...settings,
+      autostartEnabled: input.autostartEnabled,
+      globalShortcut: input.globalShortcut,
+      updateExistingDefaultItems: false,
+    });
+    autostartStatus = await api.getAutostartStatus();
+    if (autostartStatus.available) settings.autostartEnabled = autostartStatus.enabled;
+    onboardingStatus = await api.completeOnboarding();
+    onboardingOpen = false;
+    showToast('首次设置已完成');
+  }
+
+  async function skipOnboarding(): Promise<void> {
+    if (onboardingStatus?.required) onboardingStatus = await api.completeOnboarding();
+    onboardingOpen = false;
   }
 
   async function testNotification(): Promise<void> {
@@ -238,7 +308,7 @@
     </nav>
 
     <div class="sidebar-rule"></div>
-    <button class="nav-item settings-entry" on:click={() => (settingsOpen = true)}>
+    <button class="nav-item settings-entry" on:click={() => void openSettings()}>
       <span class="nav-marker">⌘</span>
       <span>后台设置</span>
     </button>
@@ -305,7 +375,7 @@
     </section>
   </main>
 
-  {#if settingsOpen && settings && notificationStatus}
+  {#if settingsOpen && settings && notificationStatus && autostartStatus}
     <SettingsPanel
       {settings}
       saving={settingsSaving}
@@ -315,6 +385,19 @@
       {notificationStatus}
       onRegisterNotifications={registerNotifications}
       onUnregisterNotifications={unregisterNotifications}
+      {autostartStatus}
+      onOpenOnboarding={reopenOnboarding}
+    />
+  {/if}
+
+  {#if onboardingOpen && settings && notificationStatus && autostartStatus && onboardingStatus}
+    <OnboardingDialog
+      {settings}
+      {notificationStatus}
+      {autostartStatus}
+      firstRun={onboardingStatus.required}
+      onFinish={finishOnboarding}
+      onSkip={skipOnboarding}
     />
   {/if}
 

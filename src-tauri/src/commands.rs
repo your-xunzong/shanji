@@ -1,7 +1,9 @@
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
+use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 use crate::{
@@ -11,6 +13,25 @@ use crate::{
     error::AppResult,
     notification::NotificationStatus,
 };
+
+const CURRENT_ONBOARDING_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutostartStatus {
+    pub enabled: bool,
+    pub available: bool,
+    pub portable: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardingStatus {
+    pub required: bool,
+    pub completed_version: u32,
+    pub current_version: u32,
+}
 
 #[tauri::command]
 pub fn list_items(filter: String, state: State<'_, AppState>) -> Result<Vec<Item>, String> {
@@ -86,18 +107,37 @@ pub fn update_settings(
     input.validate().map_err(String::from)?;
     let previous = state.database.get_settings().map_err(String::from)?;
     let next = input.settings();
+    let shortcut_changed = previous.global_shortcut != next.global_shortcut;
+    let autostart_changed = previous.autostart_enabled != next.autostart_enabled;
+    let autostart_before = if autostart_changed {
+        Some(read_autostart(&app)?)
+    } else {
+        None
+    };
 
-    if previous.global_shortcut != next.global_shortcut {
+    if shortcut_changed {
         let shortcuts = app.global_shortcut();
         if shortcuts.is_registered(previous.global_shortcut.as_str()) {
             shortcuts
                 .unregister(previous.global_shortcut.as_str())
-                .map_err(|error| format!("无法释放旧快捷键：{error}"))?;
+                .map_err(|_| "无法释放原快捷键；设置没有更改，请重启闪记后再试。".to_string())?;
         }
-        if let Err(error) = shortcuts.register(next.global_shortcut.as_str()) {
+        if shortcuts.register(next.global_shortcut.as_str()).is_err() {
             let _ = shortcuts.register(previous.global_shortcut.as_str());
-            return Err(format!("新快捷键不可用，已恢复原设置：{error}"));
+            return Err(format!(
+                "快捷键“{}”已被其他程序占用或被系统保留，请换一个组合；原快捷键仍然有效。",
+                next.global_shortcut
+            ));
         }
+    }
+
+    if let Some(before) = autostart_before
+        && before != next.autostart_enabled
+        && let Err(error) = set_autostart(&app, next.autostart_enabled)
+    {
+        let _ = set_autostart(&app, before);
+        restore_shortcut(&app, &previous.global_shortcut, &next.global_shortcut);
+        return Err(error);
     }
 
     match state
@@ -113,14 +153,108 @@ pub fn update_settings(
             Ok(settings)
         }
         Err(error) => {
-            if previous.global_shortcut != next.global_shortcut {
-                let shortcuts = app.global_shortcut();
-                let _ = shortcuts.unregister(next.global_shortcut.as_str());
-                let _ = shortcuts.register(previous.global_shortcut.as_str());
+            if let Some(before) = autostart_before
+                && let Err(restore_error) = set_autostart(&app, before)
+            {
+                eprintln!("开机启动回滚失败：{restore_error}");
             }
+            restore_shortcut(&app, &previous.global_shortcut, &next.global_shortcut);
             Err(error.into())
         }
     }
+}
+
+fn restore_shortcut(app: &AppHandle, previous: &str, attempted: &str) {
+    if previous == attempted {
+        return;
+    }
+    let shortcuts = app.global_shortcut();
+    if shortcuts.is_registered(attempted) {
+        let _ = shortcuts.unregister(attempted);
+    }
+    if !shortcuts.is_registered(previous)
+        && let Err(error) = shortcuts.register(previous)
+    {
+        eprintln!("原快捷键恢复失败：{error}");
+    }
+}
+
+fn read_autostart(app: &AppHandle) -> Result<bool, String> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|error| format!("无法读取系统开机启动状态：{error}"))
+}
+
+fn set_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let manager = app.autolaunch();
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    result.map_err(|error| {
+        if enabled {
+            format!("无法启用开机启动：{error}。原设置保持不变。")
+        } else {
+            format!("无法关闭开机启动：{error}。原设置保持不变。")
+        }
+    })?;
+    let actual = read_autostart(app)?;
+    if actual != enabled {
+        return Err("系统没有接受开机启动变更，原设置保持不变。".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_autostart_status(app: AppHandle, state: State<'_, AppState>) -> AutostartStatus {
+    match read_autostart(&app) {
+        Ok(enabled) => AutostartStatus {
+            enabled,
+            available: true,
+            portable: state.portable,
+            message: if state.portable {
+                "便携版启动项指向当前程序路径；移动或删除目录后将失效。".into()
+            } else if enabled {
+                "闪记将在登录后以后台模式启动。".into()
+            } else {
+                "开机启动当前未启用。".into()
+            },
+        },
+        Err(error) => AutostartStatus {
+            enabled: state
+                .database
+                .get_settings()
+                .map(|settings| settings.autostart_enabled)
+                .unwrap_or(false),
+            available: false,
+            portable: state.portable,
+            message: error,
+        },
+    }
+}
+
+#[tauri::command]
+pub fn get_onboarding_status(state: State<'_, AppState>) -> Result<OnboardingStatus, String> {
+    let completed_version = state.database.onboarding_version().map_err(String::from)?;
+    Ok(OnboardingStatus {
+        required: completed_version < CURRENT_ONBOARDING_VERSION,
+        completed_version,
+        current_version: CURRENT_ONBOARDING_VERSION,
+    })
+}
+
+#[tauri::command]
+pub fn complete_onboarding(state: State<'_, AppState>) -> Result<OnboardingStatus, String> {
+    state
+        .database
+        .complete_onboarding(CURRENT_ONBOARDING_VERSION)
+        .map_err(String::from)?;
+    Ok(OnboardingStatus {
+        required: false,
+        completed_version: CURRENT_ONBOARDING_VERSION,
+        current_version: CURRENT_ONBOARDING_VERSION,
+    })
 }
 
 #[tauri::command]

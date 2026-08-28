@@ -14,7 +14,8 @@ use crate::{
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_notification_delivery.sql");
-const LATEST_SCHEMA_VERSION: i64 = 2;
+const MIGRATION_0003: &str = include_str!("../migrations/0003_autostart_onboarding.sql");
+const LATEST_SCHEMA_VERSION: i64 = 3;
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -69,7 +70,7 @@ impl Database {
         )?;
 
         if existed && version < LATEST_SCHEMA_VERSION {
-            let backup = path.with_extension("db.backup-before-v2");
+            let backup = path.with_extension("db.backup-before-v3");
             if !backup.exists() {
                 connection.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
             }
@@ -85,6 +86,11 @@ impl Database {
             transaction.execute_batch(MIGRATION_0002)?;
             transaction.commit()?;
         }
+        if version < 3 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(MIGRATION_0003)?;
+            transaction.commit()?;
+        }
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -98,6 +104,7 @@ impl Database {
         let transaction = connection.transaction()?;
         transaction.execute_batch(MIGRATION_0001)?;
         transaction.execute_batch(MIGRATION_0002)?;
+        transaction.execute_batch(MIGRATION_0003)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -128,7 +135,8 @@ impl Database {
                 quiet_start = ?5,
                 quiet_end = ?6,
                 global_shortcut = ?7,
-                notifications_enabled = ?8
+                notifications_enabled = ?8,
+                autostart_enabled = ?9
              WHERE id = 1",
             params![
                 settings.default_due_time,
@@ -139,6 +147,7 @@ impl Database {
                 settings.quiet_end,
                 settings.global_shortcut,
                 bool_to_int(settings.notifications_enabled),
+                bool_to_int(settings.autostart_enabled),
             ],
         )?;
 
@@ -623,6 +632,31 @@ impl Database {
             .optional()
             .map_err(AppError::from)
     }
+
+    pub fn onboarding_version(&self) -> AppResult<u32> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection
+            .query_row(
+                "SELECT onboarding_version FROM app_settings WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(AppError::from)
+    }
+
+    pub fn complete_onboarding(&self, version: u32) -> AppResult<()> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection.execute(
+            "UPDATE app_settings
+             SET onboarding_version = CASE
+                 WHEN onboarding_version < ?1 THEN ?1
+                 ELSE onboarding_version
+             END
+             WHERE id = 1",
+            [version],
+        )?;
+        Ok(())
+    }
 }
 
 fn claimed_event_item_id(
@@ -643,7 +677,8 @@ fn read_settings(connection: &Connection) -> AppResult<Settings> {
     connection
         .query_row(
             "SELECT default_due_time, workdays, overtime_interval_minutes,
-                    quiet_hours_enabled, quiet_start, quiet_end, global_shortcut, notifications_enabled
+                    quiet_hours_enabled, quiet_start, quiet_end, global_shortcut,
+                    notifications_enabled, autostart_enabled
              FROM app_settings WHERE id = 1",
             [],
             |row| {
@@ -664,6 +699,7 @@ fn read_settings(connection: &Connection) -> AppResult<Settings> {
                     quiet_end: row.get(5)?,
                     global_shortcut: row.get(6)?,
                     notifications_enabled: row.get::<_, i64>(7)? != 0,
+                    autostart_enabled: row.get::<_, i64>(8)? != 0,
                 })
             },
         )
@@ -1049,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_v1_database_creates_backup_and_migrates_delivery_columns() {
+    fn opening_v1_database_creates_backup_and_runs_all_migrations() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("shanji.db");
         let connection = Connection::open(&path).unwrap();
@@ -1070,11 +1106,29 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
+        let settings_columns = connection
+            .prepare("PRAGMA table_info(app_settings)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert!(delivery_columns.contains(&"submitted_at".into()));
         assert!(delivery_columns.contains(&"error_code".into()));
-        assert!(path.with_extension("db.backup-before-v2").exists());
+        assert!(settings_columns.contains(&"autostart_enabled".into()));
+        assert!(settings_columns.contains(&"onboarding_version".into()));
+        assert!(path.with_extension("db.backup-before-v3").exists());
+    }
+
+    #[test]
+    fn onboarding_version_only_moves_forward() {
+        let database = Database::in_memory().unwrap();
+        assert_eq!(database.onboarding_version().unwrap(), 0);
+        database.complete_onboarding(1).unwrap();
+        database.complete_onboarding(0).unwrap();
+        assert_eq!(database.onboarding_version().unwrap(), 1);
     }
 
     #[test]

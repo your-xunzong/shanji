@@ -2,9 +2,11 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import type {
   Category,
   CreateItemInput,
+  AutostartStatus,
   Item,
   ItemFilter,
   NotificationStatus,
+  OnboardingStatus,
   Settings,
   UpdateSettingsInput,
 } from './types';
@@ -13,6 +15,7 @@ import { localDateKey } from './presentation';
 const SETTINGS_KEY = 'shanji.preview.settings';
 const ITEMS_KEY = 'shanji.preview.items';
 const DRAFT_KEY = 'shanji.preview.draft';
+const ONBOARDING_KEY = 'shanji.preview.onboarding-version';
 
 const defaultSettings: Settings = {
   defaultDueTime: '18:00',
@@ -23,6 +26,7 @@ const defaultSettings: Settings = {
   quietEnd: '07:30',
   globalShortcut: 'CommandOrControl+Shift+Space',
   notificationsEnabled: true,
+  autostartEnabled: false,
 };
 
 const categories: Category[] = [
@@ -131,7 +135,12 @@ function previewFilter(items: Item[], filter: ItemFilter): Item[] {
 }
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  return invoke<T>(command, args);
+  try {
+    return await invoke<T>(command, args);
+  } catch (cause) {
+    if (typeof cause === 'string') throw new Error(cause);
+    throw cause;
+  }
 }
 
 export const api = {
@@ -267,6 +276,31 @@ export const api = {
   async getSystemWarning(): Promise<string | null> {
     if (isTauri()) return call<string | null>('get_system_warning');
     return null;
+  },
+
+  async getAutostartStatus(): Promise<AutostartStatus> {
+    if (isTauri()) return call<AutostartStatus>('get_autostart_status');
+    const settings = readPreviewSettings();
+    return {
+      enabled: settings.autostartEnabled,
+      available: true,
+      portable: false,
+      message: settings.autostartEnabled
+        ? '浏览器预览中的开机启动已启用。'
+        : '浏览器预览中的开机启动未启用。',
+    };
+  },
+
+  async getOnboardingStatus(): Promise<OnboardingStatus> {
+    if (isTauri()) return call<OnboardingStatus>('get_onboarding_status');
+    const completedVersion = Number(localStorage.getItem(ONBOARDING_KEY) ?? 0);
+    return { required: completedVersion < 1, completedVersion, currentVersion: 1 };
+  },
+
+  async completeOnboarding(): Promise<OnboardingStatus> {
+    if (isTauri()) return call<OnboardingStatus>('complete_onboarding');
+    localStorage.setItem(ONBOARDING_KEY, '1');
+    return { required: false, completedVersion: 1, currentVersion: 1 };
   },
 
   async getNotificationStatus(): Promise<NotificationStatus> {

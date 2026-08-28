@@ -27,6 +27,7 @@ pub struct AppState {
     database: Arc<Database>,
     clock: Arc<dyn Clock>,
     notifications: Arc<NotificationService>,
+    portable: bool,
     scheduler: SchedulerHandle,
     shortcut_warning: Mutex<Option<String>>,
 }
@@ -99,6 +100,7 @@ pub fn run() {
                 database,
                 clock,
                 notifications,
+                portable,
                 scheduler,
                 shortcut_warning: Mutex::new(shortcut_warning),
             });
@@ -133,6 +135,9 @@ pub fn run() {
             commands::show_capture,
             commands::show_main,
             commands::get_system_warning,
+            commands::get_autostart_status,
+            commands::get_onboarding_status,
+            commands::complete_onboarding,
             commands::get_notification_status,
             commands::register_portable_notifications,
             commands::unregister_portable_notifications,

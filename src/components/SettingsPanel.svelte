@@ -1,20 +1,28 @@
 <script lang="ts">
-  import type { NotificationStatus, Settings, UpdateSettingsInput } from '../lib/types';
+  import type {
+    AutostartStatus,
+    NotificationStatus,
+    Settings,
+    UpdateSettingsInput,
+  } from '../lib/types';
 
   export let settings: Settings;
   export let saving = false;
   export let onClose: () => void;
-  export let onSave: (input: UpdateSettingsInput) => void;
+  export let onSave: (input: UpdateSettingsInput) => Promise<void>;
   export let onTestNotification: () => Promise<void>;
   export let notificationStatus: NotificationStatus;
   export let onRegisterNotifications: () => Promise<void>;
   export let onUnregisterNotifications: () => Promise<void>;
+  export let autostartStatus: AutostartStatus;
+  export let onOpenOnboarding: () => void;
 
   let form: Settings = structuredClone(settings);
   let updateExistingDefaultItems = false;
   let testingNotification = false;
   let notificationTestStatus = '';
   let changingNotificationIdentity = false;
+  let saveError = '';
 
   const weekdays = [
     { value: 1, label: '一' },
@@ -33,8 +41,18 @@
     form = { ...form };
   }
 
-  function save(): void {
-    onSave({ ...form, updateExistingDefaultItems });
+  async function save(): Promise<void> {
+    if (saving) return;
+    saveError = '';
+    try {
+      await onSave({ ...form, updateExistingDefaultItems });
+    } catch (cause) {
+      saveError = cause instanceof Error && cause.message
+        ? cause.message
+        : typeof cause === 'string' && cause
+          ? cause
+          : '设置没有保存，请检查输入后重试。';
+    }
   }
 
   async function testNotification(): Promise<void> {
@@ -163,6 +181,19 @@
         <span>全局快捷键</span>
         <input type="text" bind:value={form.globalShortcut} spellcheck="false" />
       </label>
+      <p class="field-help">需要至少一个修饰键和一个普通按键，例如 Ctrl+Shift+Space。</p>
+      <label class="switch-row">
+        <span>
+          <strong>开机启动</strong>
+          <small>{autostartStatus.message}</small>
+        </span>
+        <input
+          class="switch"
+          type="checkbox"
+          bind:checked={form.autostartEnabled}
+          disabled={!autostartStatus.available}
+        />
+      </label>
       <label class="switch-row">
         <span><strong>系统通知</strong><small>关闭后仍可在事项列表查看逾期状态。</small></span>
         <input class="switch" type="checkbox" bind:checked={form.notificationsEnabled} />
@@ -199,10 +230,14 @@
           <p role="status">{notificationTestStatus}</p>
         {/if}
       </div>
+      <button class="settings-guide-button" type="button" on:click={onOpenOnboarding}>
+        重新打开首次引导 <span aria-hidden="true">→</span>
+      </button>
     </section>
   </div>
 
   <footer class="settings-footer">
+    {#if saveError}<p class="settings-save-error" role="alert">{saveError}</p>{/if}
     <button class="secondary-button" on:click={onClose}>取消</button>
     <button class="primary-button" disabled={saving || form.workdays.length === 0} on:click={save}>
       {saving ? '正在保存…' : '保存设置'}

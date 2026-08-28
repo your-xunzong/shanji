@@ -35,6 +35,7 @@ export interface Settings {
   quietEnd: string;
   globalShortcut: string;
   notificationsEnabled: boolean;
+  autostartEnabled: boolean;
 }
 
 export interface CreateItemInput {
@@ -65,4 +66,23 @@ export interface NotificationStatus {
   lastResult: 'CLAIMED' | 'SUBMITTED' | 'FAILED' | 'DISABLED' | null;
   lastErrorCode: string | null;
   lastAttemptAt: string | null;
+}
+
+export interface AutostartStatus {
+  enabled: boolean;
+  available: boolean;
+  portable: boolean;
+  message: string;
+}
+
+export interface OnboardingStatus {
+  required: boolean;
+  completedVersion: number;
+  currentVersion: number;
+}
+
+export interface OnboardingFinishInput {
+  autostartEnabled: boolean;
+  globalShortcut: string;
+  enablePortableNotifications: boolean;
 }
