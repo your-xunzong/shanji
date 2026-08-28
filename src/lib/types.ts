@@ -87,3 +87,16 @@ export interface OnboardingFinishInput {
   globalShortcut: string;
   enablePortableNotifications: boolean;
 }
+
+export interface DataFileSummary {
+  path: string;
+  itemCount: number;
+  schemaVersion: number;
+  updatedAt: string | null;
+}
+
+export interface DataStatus {
+  current: DataFileSummary;
+  latestBackup: DataFileSummary | null;
+  recoveryCandidates: DataFileSummary[];
+}

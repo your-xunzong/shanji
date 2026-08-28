@@ -9,6 +9,8 @@ import type {
   OnboardingStatus,
   Settings,
   UpdateSettingsInput,
+  DataFileSummary,
+  DataStatus,
 } from './types';
 import { localDateKey } from './presentation';
 
@@ -375,5 +377,39 @@ export const api = {
     };
     writePreviewItems([item, ...readPreviewItems()]);
     return item;
+  },
+
+  async getDataStatus(): Promise<DataStatus> {
+    if (isTauri()) return call<DataStatus>('get_data_status');
+    const items = readPreviewItems();
+    return {
+      current: {
+        path: '浏览器预览数据',
+        itemCount: items.length,
+        schemaVersion: 3,
+        updatedAt: new Date().toISOString(),
+      },
+      latestBackup: null,
+      recoveryCandidates: [],
+    };
+  },
+
+  async createDataBackup(): Promise<DataFileSummary> {
+    if (isTauri()) return call<DataFileSummary>('create_data_backup');
+    return {
+      path: '浏览器预览不创建文件备份',
+      itemCount: readPreviewItems().length,
+      schemaVersion: 3,
+      updatedAt: new Date().toISOString(),
+    };
+  },
+
+  async openDataDirectory(): Promise<void> {
+    if (isTauri()) await call<void>('open_data_directory');
+  },
+
+  async restoreDatabase(candidatePath: string): Promise<void> {
+    if (isTauri()) return call<void>('restore_database', { candidatePath });
+    throw new Error('浏览器预览不能恢复桌面数据。');
   },
 };

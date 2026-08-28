@@ -1,4 +1,4 @@
-use std::time::Duration as StdDuration;
+use std::{path::PathBuf, process::Command, time::Duration as StdDuration};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -7,8 +7,8 @@ use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 use crate::{
-    AppState,
-    db::Database,
+    AppState, candidate_database_paths,
+    db::{DataFileSummary, DataStatus, Database},
     domain::{Category, CreateItemInput, Item, Settings, UpdateSettingsInput},
     error::AppResult,
     notification::NotificationStatus,
@@ -369,6 +369,57 @@ pub fn create_notification_test_item(state: State<'_, AppState>) -> Result<Item,
     state.scheduler.wake();
     state.scheduler.wake_after(StdDuration::from_secs(11));
     Ok(item)
+}
+
+#[tauri::command]
+pub fn get_data_status(app: AppHandle, state: State<'_, AppState>) -> Result<DataStatus, String> {
+    let candidates = candidate_database_paths(&app, state.database.path());
+    state.database.data_status(&candidates).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn create_data_backup(state: State<'_, AppState>) -> Result<DataFileSummary, String> {
+    state.database.create_backup().map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn open_data_directory(state: State<'_, AppState>) -> Result<(), String> {
+    let directory = state
+        .database
+        .path()
+        .parent()
+        .ok_or_else(|| "数据目录无效".to_string())?;
+
+    #[cfg(target_os = "windows")]
+    let mut command = Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+
+    command
+        .arg(directory)
+        .spawn()
+        .map_err(|_| "无法打开数据位置，请从上方路径手动打开。".to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn restore_database(
+    candidate_path: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let requested = PathBuf::from(&candidate_path);
+    let allowed = candidate_database_paths(&app, state.database.path());
+    if !allowed.iter().any(|candidate| candidate == &requested) {
+        return Err("这份数据不在闪记识别的恢复位置中，请重新刷新后选择。".into());
+    }
+    state
+        .database
+        .stage_restore(&requested)
+        .map_err(String::from)?;
+    app.restart()
 }
 
 pub(crate) fn insert_notification_test_item(

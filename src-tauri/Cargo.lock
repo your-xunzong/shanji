@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "shanji"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "rusqlite",

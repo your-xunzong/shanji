@@ -6,12 +6,13 @@ mod notification;
 mod scheduler;
 
 use std::{
+    fs,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use db::Database;
+use db::{Database, apply_pending_restore};
 use domain::{Clock, SystemClock};
 use error::{AppError, AppResult};
 use notification::NotificationService;
@@ -57,6 +58,7 @@ pub fn run() {
                 std::env::args().any(|argument| argument == "--test-notification");
             let portable = portable_mode()?;
             let database_path = resolve_database_path(app.handle())?;
+            apply_pending_restore(&database_path)?;
             let database = Arc::new(Database::open(&database_path)?);
             let settings = database.get_settings()?;
             let shortcut_warning = app
@@ -148,6 +150,10 @@ pub fn run() {
             commands::register_portable_notifications,
             commands::unregister_portable_notifications,
             commands::create_notification_test_item,
+            commands::get_data_status,
+            commands::create_data_backup,
+            commands::open_data_directory,
+            commands::restore_database,
         ]);
 
     let app = builder
@@ -182,6 +188,30 @@ fn portable_mode() -> AppResult<bool> {
     Ok(executable
         .parent()
         .is_some_and(|directory| directory.join("portable.flag").exists()))
+}
+
+pub(crate) fn candidate_database_paths(app: &AppHandle, current: &std::path::Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(app_data) = app.path().app_data_dir() {
+        candidates.push(app_data.join("shanji.db"));
+        candidates.push(app_data.join("shanji.db.backup-before-v3"));
+    }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        candidates.push(directory.join("shanji.db"));
+        candidates.push(directory.join("data").join("shanji.db"));
+    }
+    if let Some(directory) = current.parent() {
+        candidates.push(directory.join("shanji.db.backup-before-v3"));
+        if let Ok(entries) = fs::read_dir(directory.join("backups")) {
+            candidates.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+        }
+    }
+    candidates.retain(|path| path != current && path.is_file());
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 fn create_tray(app: &AppHandle) -> AppResult<()> {

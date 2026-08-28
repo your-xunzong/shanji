@@ -14,6 +14,7 @@
   let mustCompleteToday = false;
   let categoryId: string | null = null;
   let dueAt = '';
+  let timePickerOpen = false;
   let settings: Settings | null = null;
   let categories: Category[] = [];
   let saving = false;
@@ -73,6 +74,40 @@
         error = '草稿暂时无法保存。请复制文字后检查数据目录。';
       });
     }, 250);
+  }
+
+  function localDateTimeValue(date: Date, time: string): string {
+    const [hours, minutes] = time.split(':').map(Number);
+    const value = new Date(date);
+    value.setHours(hours, minutes, 0, 0);
+    const offset = value.getTimezoneOffset();
+    return new Date(value.getTime() - offset * 60_000).toISOString().slice(0, 16);
+  }
+
+  function nextWorkdayDate(from: Date): Date {
+    const workdays = settings?.workdays ?? [1, 2, 3, 4, 5];
+    const result = new Date(from);
+    for (let offset = 1; offset <= 14; offset += 1) {
+      result.setDate(result.getDate() + 1);
+      const day = result.getDay() === 0 ? 7 : result.getDay();
+      if (workdays.includes(day)) return result;
+    }
+    return result;
+  }
+
+  function chooseDefault(): void {
+    dueAt = '';
+    timePickerOpen = false;
+  }
+
+  function chooseToday(): void {
+    dueAt = localDateTimeValue(new Date(), settings?.defaultDueTime ?? '18:00');
+    timePickerOpen = false;
+  }
+
+  function chooseNextWorkday(): void {
+    dueAt = localDateTimeValue(nextWorkdayDate(new Date()), settings?.defaultDueTime ?? '18:00');
+    timePickerOpen = false;
   }
 
   async function submit(): Promise<void> {
@@ -157,11 +192,36 @@
   ></textarea>
 
   <div class="capture-controls">
-    <label class="chip field-chip" class:active={Boolean(dueAt)}>
+    <button
+      type="button"
+      class="chip field-chip"
+      class:active={Boolean(dueAt)}
+      aria-expanded={timePickerOpen}
+      aria-controls="capture-time-picker"
+      on:click={() => (timePickerOpen = !timePickerOpen)}
+    >
       <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" /><path d="M10 6v4l3 2" /></svg>
       <span>{dueLabel}</span>
-      <input class="datetime-input" type="datetime-local" bind:value={dueAt} aria-label="指定到期时间" />
-    </label>
+      <span class="chip-chevron" aria-hidden="true">⌄</span>
+    </button>
+
+    {#if timePickerOpen}
+      <div class="capture-time-picker" id="capture-time-picker">
+        <div class="time-picker-heading">
+          <div><strong>什么时候提醒</strong><small>选择后会显示最终时间</small></div>
+          <button class="icon-button" aria-label="关闭时间选择" on:click={() => (timePickerOpen = false)}>×</button>
+        </div>
+        <div class="time-preset-grid">
+          <button class:active={!dueAt} on:click={chooseDefault}>使用默认规则</button>
+          <button on:click={chooseToday}>今天 {settings?.defaultDueTime ?? '18:00'}</button>
+          <button on:click={chooseNextWorkday}>下一工作日</button>
+        </div>
+        <label class="custom-time-field">
+          <span>指定日期和时间</span>
+          <input type="datetime-local" bind:value={dueAt} on:change={() => (timePickerOpen = false)} />
+        </label>
+      </div>
+    {/if}
 
     <label class="chip select-chip">
       <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h5l1.5 2h6.5v8h-13z" /></svg>

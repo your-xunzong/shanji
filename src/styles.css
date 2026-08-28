@@ -132,6 +132,7 @@ button:disabled {
 /* Quick capture */
 .capture-shell {
   position: relative;
+  display: flex;
   width: 100vw;
   min-height: 100vh;
   overflow: hidden;
@@ -139,6 +140,7 @@ button:disabled {
   border-radius: 14px;
   background: var(--paper);
   box-shadow: var(--shadow);
+  flex-direction: column;
   transition: border-color 140ms ease, background 140ms ease;
 }
 
@@ -181,7 +183,7 @@ button:disabled {
 .capture-input {
   display: block;
   width: calc(100% - 34px);
-  min-height: 92px;
+  min-height: 120px;
   margin: 3px 17px 0;
   padding: 9px 4px;
   resize: none;
@@ -192,6 +194,7 @@ button:disabled {
   font-size: 20px;
   font-weight: 480;
   line-height: 1.55;
+  flex: 1;
 }
 
 .capture-input::placeholder {
@@ -249,12 +252,102 @@ button:disabled {
   color: #314d66;
 }
 
-.datetime-input {
+.field-chip {
+  max-width: 245px;
+}
+
+.field-chip > span:not(.chip-chevron) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chip-chevron {
+  margin-left: 2px;
+  color: #82909e;
+  font-size: 12px;
+}
+
+.capture-time-picker {
   position: absolute;
-  inset: 0;
-  width: 100%;
-  opacity: 0;
+  z-index: 5;
+  bottom: 52px;
+  left: 15px;
+  width: min(390px, calc(100vw - 30px));
+  padding: 15px;
+  border: 1px solid #bcc8d3;
+  border-radius: 11px;
+  background: #fff;
+  box-shadow: 0 18px 45px rgba(24, 38, 51, 0.2);
+}
+
+.time-picker-heading {
+  display: flex;
+  margin-bottom: 12px;
+  align-items: start;
+  justify-content: space-between;
+}
+
+.time-picker-heading strong,
+.time-picker-heading small {
+  display: block;
+}
+
+.time-picker-heading strong {
+  font-size: 12px;
+}
+
+.time-picker-heading small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.time-preset-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.time-preset-grid button {
+  min-height: 34px;
+  padding: 5px 8px;
+  border: 1px solid #d1d9e1;
+  border-radius: 7px;
+  background: #f8fafb;
+  color: #526172;
+  font-size: 9px;
+  font-weight: 620;
   cursor: pointer;
+}
+
+.time-preset-grid button:hover,
+.time-preset-grid button.active {
+  border-color: #91aa9f;
+  background: #edf5f1;
+  color: #285f53;
+}
+
+.custom-time-field {
+  display: grid;
+  margin-top: 12px;
+  color: #596878;
+  font-size: 9px;
+  font-weight: 650;
+  grid-template-columns: 105px 1fr;
+  align-items: center;
+  gap: 10px;
+}
+
+.custom-time-field input {
+  width: 100%;
+  height: 35px;
+  min-width: 0;
+  padding: 0 8px;
+  border: 1px solid #c8d2dc;
+  border-radius: 7px;
+  background: white;
+  color: var(--ink);
+  font-size: 10px;
 }
 
 .select-chip select {
@@ -1126,6 +1219,101 @@ kbd {
   font-weight: 650;
   cursor: pointer;
   justify-content: space-between;
+}
+
+.data-location-card {
+  display: grid;
+  padding: 13px 14px;
+  overflow: hidden;
+  border: 1px solid #d2dae2;
+  border-radius: 9px;
+  background: #f8fafb;
+  gap: 5px;
+}
+
+.data-location-card strong {
+  font-size: 11px;
+}
+
+.data-location-card span {
+  overflow: hidden;
+  color: #526172;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-location-card small,
+.data-backup-note {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.data-action-row {
+  display: flex;
+  margin-top: 11px;
+  align-items: center;
+  gap: 7px;
+}
+
+.data-backup-note,
+.data-action-status {
+  margin: 9px 0 0;
+}
+
+.data-action-status {
+  color: var(--pine);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.recovery-candidates {
+  display: grid;
+  margin-top: 14px;
+  padding: 12px 13px;
+  border: 1px solid #e1bcb5;
+  border-radius: 9px;
+  background: #fff7f5;
+  gap: 8px;
+}
+
+.recovery-candidates > strong {
+  color: #8f392c;
+  font-size: 10px;
+}
+
+.recovery-candidates > p {
+  margin: -3px 0 1px;
+  color: #78635f;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.recovery-candidates > div {
+  display: flex;
+  padding-top: 7px;
+  border-top: 1px solid #edd7d2;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.recovery-candidates span b,
+.recovery-candidates span small {
+  display: block;
+}
+
+.recovery-candidates span b {
+  color: #526172;
+  font-size: 10px;
+}
+
+.recovery-candidates span small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 8px;
 }
 
 .settings-save-error {

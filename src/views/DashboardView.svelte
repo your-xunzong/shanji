@@ -14,6 +14,7 @@
     OnboardingStatus,
     Settings,
     UpdateSettingsInput,
+    DataStatus,
   } from '../lib/types';
 
   let items: Item[] = [];
@@ -29,6 +30,7 @@
   let onboardingOpen = false;
   let settingsSaving = false;
   let toast = '';
+  let dataStatus: DataStatus | null = null;
   let unlistenItems: (() => void) | undefined;
   let unlistenNotification: (() => void) | undefined;
 
@@ -182,12 +184,14 @@
 
   async function openSettings(): Promise<void> {
     try {
-      const [latestAutostart, latestNotifications] = await Promise.all([
+      const [latestAutostart, latestNotifications, latestDataStatus] = await Promise.all([
         api.getAutostartStatus(),
         api.getNotificationStatus(),
+        api.getDataStatus(),
       ]);
       autostartStatus = latestAutostart;
       notificationStatus = latestNotifications;
+      dataStatus = latestDataStatus;
       if (settings && latestAutostart.available) {
         settings = { ...settings, autostartEnabled: latestAutostart.enabled };
       }
@@ -195,6 +199,25 @@
     } catch (cause) {
       error = readableError(cause, '无法读取系统设置状态。');
     }
+  }
+
+  async function refreshDataStatus(): Promise<DataStatus> {
+    dataStatus = await api.getDataStatus();
+    return dataStatus;
+  }
+
+  async function createDataBackup() {
+    const backup = await api.createDataBackup();
+    showToast('数据备份已完成');
+    return backup;
+  }
+
+  async function openDataDirectory(): Promise<void> {
+    await api.openDataDirectory();
+  }
+
+  async function restoreDatabase(path: string): Promise<void> {
+    await api.restoreDatabase(path);
   }
 
   function reopenOnboarding(): void {
@@ -394,6 +417,11 @@
       onUnregisterNotifications={unregisterNotifications}
       {autostartStatus}
       onOpenOnboarding={reopenOnboarding}
+      {dataStatus}
+      onRefreshData={refreshDataStatus}
+      onCreateBackup={createDataBackup}
+      onOpenDataDirectory={openDataDirectory}
+      onRestoreDatabase={restoreDatabase}
     />
   {/if}
 

@@ -1,7 +1,13 @@
-use std::{fs, path::Path, sync::Mutex};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::SystemTime,
+};
 
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
@@ -19,6 +25,24 @@ const LATEST_SCHEMA_VERSION: i64 = 3;
 
 pub struct Database {
     connection: Mutex<Connection>,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataFileSummary {
+    pub path: String,
+    pub item_count: u64,
+    pub schema_version: i64,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataStatus {
+    pub current: DataFileSummary,
+    pub latest_backup: Option<DataFileSummary>,
+    pub recovery_candidates: Vec<DataFileSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +66,32 @@ pub struct ProcessResult {
     pub notifications: Vec<DueNotification>,
     pub changed: bool,
     pub notifications_enabled: bool,
+}
+
+pub fn apply_pending_restore(database_path: &Path) -> AppResult<()> {
+    let staging = pending_restore_path(database_path)?;
+    if !staging.exists() {
+        return Ok(());
+    }
+    inspect_database_file(&staging)?;
+    let parent = database_path
+        .parent()
+        .ok_or_else(|| AppError::Validation("数据目录无效".into()))?;
+    fs::create_dir_all(parent)?;
+
+    if database_path.exists() {
+        let timestamp = Utc::now().format("%Y%m%d-%H%M%S-%3f");
+        let previous = parent.join(format!("shanji-before-restore-{timestamp}.db"));
+        fs::rename(database_path, previous)?;
+    }
+    for suffix in ["db-wal", "db-shm"] {
+        let sidecar = database_path.with_extension(suffix);
+        if sidecar.exists() {
+            fs::remove_file(sidecar)?;
+        }
+    }
+    fs::rename(staging, database_path)?;
+    Ok(())
 }
 
 impl Database {
@@ -70,9 +120,10 @@ impl Database {
         )?;
 
         if existed && version < LATEST_SCHEMA_VERSION {
-            let backup = path.with_extension("db.backup-before-v3");
-            if !backup.exists() {
-                connection.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
+            let backup = create_upgrade_backup(&connection, path, version)?;
+            let legacy_backup = path.with_extension("db.backup-before-v3");
+            if !legacy_backup.exists() {
+                fs::copy(&backup, legacy_backup)?;
             }
         }
 
@@ -94,6 +145,7 @@ impl Database {
 
         Ok(Self {
             connection: Mutex::new(connection),
+            path: path.to_path_buf(),
         })
     }
 
@@ -108,7 +160,72 @@ impl Database {
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
+            path: PathBuf::from(":memory:"),
         })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn data_status(&self, candidates: &[PathBuf]) -> AppResult<DataStatus> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let current = summarize_connection(&connection, &self.path)?;
+        drop(connection);
+
+        let backup_directory = backup_directory(&self.path)?;
+        let latest_backup = latest_database_file(&backup_directory)
+            .and_then(|path| inspect_database_file(&path).ok());
+        let mut recovery_candidates = candidates
+            .iter()
+            .filter(|path| path.as_path() != self.path)
+            .filter_map(|path| inspect_database_file(path).ok())
+            .filter(|summary| summary.item_count > 0)
+            .collect::<Vec<_>>();
+        recovery_candidates.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        recovery_candidates.dedup_by(|left, right| left.path == right.path);
+
+        Ok(DataStatus {
+            current,
+            latest_backup,
+            recovery_candidates,
+        })
+    }
+
+    pub fn create_backup(&self) -> AppResult<DataFileSummary> {
+        if self.path == Path::new(":memory:") {
+            return Err(AppError::Validation("内存数据库不能创建文件备份".into()));
+        }
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let version = schema_version(&connection)?;
+        let backup = create_timestamped_backup(&connection, &self.path, version, "manual")?;
+        inspect_database_file(&backup)
+    }
+
+    pub fn stage_restore(&self, candidate: &Path) -> AppResult<()> {
+        if candidate == self.path {
+            return Err(AppError::Validation("当前数据无需恢复".into()));
+        }
+        let summary = inspect_database_file(candidate)?;
+        if summary.item_count == 0 {
+            return Err(AppError::Validation("所选数据中没有可恢复的事项".into()));
+        }
+        if summary.schema_version > LATEST_SCHEMA_VERSION {
+            return Err(AppError::Validation(
+                "这份数据来自更高版本的闪记，请先升级应用后再恢复".into(),
+            ));
+        }
+
+        self.create_backup()?;
+        let staging = pending_restore_path(&self.path)?;
+        if staging.exists() {
+            fs::remove_file(&staging)?;
+        }
+        let source =
+            Connection::open_with_flags(candidate, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        source.execute("VACUUM INTO ?1", [staging.to_string_lossy().as_ref()])?;
+        inspect_database_file(&staging)?;
+        Ok(())
     }
 
     pub fn get_settings(&self) -> AppResult<Settings> {
@@ -902,6 +1019,109 @@ fn bool_to_int(value: bool) -> i64 {
     i64::from(value)
 }
 
+fn schema_version(connection: &Connection) -> AppResult<i64> {
+    connection
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn backup_directory(database_path: &Path) -> AppResult<PathBuf> {
+    let parent = database_path
+        .parent()
+        .ok_or_else(|| AppError::Validation("数据目录无效".into()))?;
+    Ok(parent.join("backups"))
+}
+
+fn pending_restore_path(database_path: &Path) -> AppResult<PathBuf> {
+    let parent = database_path
+        .parent()
+        .ok_or_else(|| AppError::Validation("数据目录无效".into()))?;
+    Ok(parent.join("shanji.restore-pending.db"))
+}
+
+fn create_upgrade_backup(
+    connection: &Connection,
+    database_path: &Path,
+    from_version: i64,
+) -> AppResult<PathBuf> {
+    create_timestamped_backup(
+        connection,
+        database_path,
+        from_version,
+        &format!("before-v{LATEST_SCHEMA_VERSION}"),
+    )
+}
+
+fn create_timestamped_backup(
+    connection: &Connection,
+    database_path: &Path,
+    schema_version: i64,
+    reason: &str,
+) -> AppResult<PathBuf> {
+    let directory = backup_directory(database_path)?;
+    fs::create_dir_all(&directory)?;
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S-%3f");
+    let path = directory.join(format!(
+        "shanji-{timestamp}-schema-{schema_version}-{reason}.db"
+    ));
+    connection.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
+    Ok(path)
+}
+
+fn summarize_connection(connection: &Connection, path: &Path) -> AppResult<DataFileSummary> {
+    let item_count = connection
+        .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))?
+        .max(0) as u64;
+    let updated_at = file_updated_at(path);
+    Ok(DataFileSummary {
+        path: path.to_string_lossy().into_owned(),
+        item_count,
+        schema_version: schema_version(connection)?,
+        updated_at,
+    })
+}
+
+fn inspect_database_file(path: &Path) -> AppResult<DataFileSummary> {
+    if !path.is_file() || fs::metadata(path)?.len() == 0 {
+        return Err(AppError::Validation("数据文件为空或不存在".into()));
+    }
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let integrity =
+        connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?;
+    if integrity != "ok" {
+        return Err(AppError::Validation("数据文件未通过完整性检查".into()));
+    }
+    summarize_connection(&connection, path)
+}
+
+fn file_updated_at(path: &Path) -> Option<String> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .and_then(|duration| {
+            DateTime::<Utc>::from_timestamp(duration.as_secs() as i64, duration.subsec_nanos())
+        })
+        .map(|timestamp| timestamp.to_rfc3339())
+}
+
+fn latest_database_file(directory: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(directory).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "db"))
+        .max_by_key(|path| {
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1176,6 +1396,89 @@ mod tests {
         assert!(settings_columns.contains(&"autostart_enabled".into()));
         assert!(settings_columns.contains(&"onboarding_version".into()));
         assert!(path.with_extension("db.backup-before-v3").exists());
+    }
+
+    #[test]
+    fn manual_backup_contains_latest_committed_item() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shanji.db");
+        let database = Database::open(&path).unwrap();
+        database
+            .create_item(
+                &CreateItemInput {
+                    title: "备份中的事项".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(at_local(2026, 8, 28, 18, 0).to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                },
+                at_local(2026, 8, 28, 17, 0),
+            )
+            .unwrap();
+
+        let backup = database.create_backup().unwrap();
+        assert_eq!(backup.item_count, 1);
+        assert!(Path::new(&backup.path).is_file());
+    }
+
+    #[test]
+    fn staged_restore_replaces_data_only_after_restart_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let current_path = directory.path().join("shanji.db");
+        let source_path = directory.path().join("old-shanji.db");
+        let now = at_local(2026, 8, 28, 17, 0);
+
+        let current = Database::open(&current_path).unwrap();
+        current
+            .create_item(
+                &CreateItemInput {
+                    title: "当前数据".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(at_local(2026, 8, 28, 18, 0).to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                },
+                now,
+            )
+            .unwrap();
+        let source = Database::open(&source_path).unwrap();
+        source
+            .create_item(
+                &CreateItemInput {
+                    title: "恢复后的数据".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(at_local(2026, 8, 29, 18, 0).to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                },
+                now,
+            )
+            .unwrap();
+        drop(source);
+
+        current.stage_restore(&source_path).unwrap();
+        assert_eq!(current.list_items("all", now).unwrap()[0].title, "当前数据");
+        drop(current);
+
+        apply_pending_restore(&current_path).unwrap();
+        let restored = Database::open(&current_path).unwrap();
+        let items = restored.list_items("all", now).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "恢复后的数据");
+        assert!(
+            directory
+                .path()
+                .read_dir()
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("shanji-before-restore-"))
+        );
     }
 
     #[test]

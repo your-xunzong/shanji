@@ -4,6 +4,8 @@
     NotificationStatus,
     Settings,
     UpdateSettingsInput,
+    DataStatus,
+    DataFileSummary,
   } from '../lib/types';
 
   export let settings: Settings;
@@ -16,6 +18,15 @@
   export let onUnregisterNotifications: () => Promise<void>;
   export let autostartStatus: AutostartStatus;
   export let onOpenOnboarding: () => void;
+  export let dataStatus: DataStatus | null = null;
+  export let onRefreshData: () => Promise<DataStatus> = async () => {
+    throw new Error('暂时无法读取数据状态。');
+  };
+  export let onCreateBackup: () => Promise<DataFileSummary> = async () => {
+    throw new Error('暂时无法创建备份。');
+  };
+  export let onOpenDataDirectory: () => Promise<void> = async () => {};
+  export let onRestoreDatabase: (path: string) => Promise<void> = async () => {};
 
   let form: Settings = structuredClone(settings);
   let updateExistingDefaultItems = false;
@@ -23,6 +34,8 @@
   let notificationTestStatus = '';
   let changingNotificationIdentity = false;
   let saveError = '';
+  let dataActionStatus = '';
+  let dataActionBusy = false;
 
   const weekdays = [
     { value: 1, label: '一' },
@@ -93,6 +106,47 @@
     if (result === 'DISABLED') return '最近一次因通知开关关闭而跳过';
     if (result === 'CLAIMED') return '最近一次正在提交';
     return '尚无投递记录';
+  }
+
+  function fileDate(value: string | null): string {
+    if (!value) return '时间未知';
+    return new Intl.DateTimeFormat('zh-CN', {
+      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    }).format(new Date(value));
+  }
+
+  async function createBackup(): Promise<void> {
+    if (dataActionBusy) return;
+    dataActionBusy = true;
+    dataActionStatus = '正在创建完整备份…';
+    try {
+      const backup = await onCreateBackup();
+      dataStatus = await onRefreshData();
+      dataActionStatus = `已备份 ${backup.itemCount} 项数据。`;
+    } catch (cause) {
+      dataActionStatus = cause instanceof Error && cause.message
+        ? cause.message
+        : '备份没有完成，现有数据未被修改。';
+    } finally {
+      dataActionBusy = false;
+    }
+  }
+
+  async function restore(candidate: DataFileSummary): Promise<void> {
+    const confirmed = window.confirm(
+      `将恢复这份数据中的 ${candidate.itemCount} 项记录。闪记会先备份当前数据，然后重新启动。是否继续？`,
+    );
+    if (!confirmed || dataActionBusy) return;
+    dataActionBusy = true;
+    dataActionStatus = '正在准备恢复并重新启动…';
+    try {
+      await onRestoreDatabase(candidate.path);
+    } catch (cause) {
+      dataActionStatus = cause instanceof Error && cause.message
+        ? cause.message
+        : '数据没有恢复，当前数据保持不变。';
+      dataActionBusy = false;
+    }
   }
 </script>
 
@@ -233,6 +287,44 @@
       <button class="settings-guide-button" type="button" on:click={onOpenOnboarding}>
         重新打开首次引导 <span aria-hidden="true">→</span>
       </button>
+    </section>
+
+    <section class="settings-section data-safety-section">
+      <div class="section-heading">
+        <h3>数据与备份</h3>
+        <p>安装更新不会覆盖这里的数据。备份包含数据库中的事项、提醒计划和设置。</p>
+      </div>
+      {#if dataStatus}
+        <div class="data-location-card">
+          <strong>{dataStatus.current.itemCount} 项本地记录</strong>
+          <span title={dataStatus.current.path}>{dataStatus.current.path}</span>
+          <small>最近更新：{fileDate(dataStatus.current.updatedAt)} · 数据结构 {dataStatus.current.schemaVersion}</small>
+        </div>
+        <div class="data-action-row">
+          <button class="secondary-button" disabled={dataActionBusy} on:click={createBackup}>
+            {dataActionBusy ? '正在处理…' : '立即备份'}
+          </button>
+          <button class="text-mini" on:click={onOpenDataDirectory}>打开数据位置</button>
+        </div>
+        {#if dataStatus.latestBackup}
+          <p class="data-backup-note">最近备份：{fileDate(dataStatus.latestBackup.updatedAt)}，共 {dataStatus.latestBackup.itemCount} 项</p>
+        {/if}
+        {#if dataStatus.recoveryCandidates.length > 0}
+          <div class="recovery-candidates">
+            <strong>找到可恢复的旧数据</strong>
+            <p>恢复前会自动备份当前数据，不会合并两份记录。</p>
+            {#each dataStatus.recoveryCandidates as candidate}
+              <div>
+                <span><b>{candidate.itemCount} 项</b><small>{fileDate(candidate.updatedAt)}</small></span>
+                <button class="text-mini" disabled={dataActionBusy} on:click={() => restore(candidate)}>恢复这份数据</button>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      {:else}
+        <p class="data-backup-note">正在读取数据位置…</p>
+      {/if}
+      {#if dataActionStatus}<p class="data-action-status" role="status">{dataActionStatus}</p>{/if}
     </section>
   </div>
 
