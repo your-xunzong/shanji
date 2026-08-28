@@ -16,6 +16,7 @@ const SETTINGS_KEY = 'shanji.preview.settings';
 const ITEMS_KEY = 'shanji.preview.items';
 const DRAFT_KEY = 'shanji.preview.draft';
 const ONBOARDING_KEY = 'shanji.preview.onboarding-version';
+const MANAGED_STATE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800];
 
 const defaultSettings: Settings = {
   defaultDueTime: '18:00',
@@ -134,12 +135,31 @@ function previewFilter(items: Item[], filter: ItemFilter): Item[] {
   });
 }
 
+function managedStateNotReady(cause: unknown): boolean {
+  const message = typeof cause === 'string'
+    ? cause
+    : cause instanceof Error
+      ? cause.message
+      : '';
+  return message.includes('state not managed for field') && message.includes('call `.manage()`');
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  try {
-    return await invoke<T>(command, args);
-  } catch (cause) {
-    if (typeof cause === 'string') throw new Error(cause);
-    throw cause;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await invoke<T>(command, args);
+    } catch (cause) {
+      if (managedStateNotReady(cause) && attempt < MANAGED_STATE_RETRY_DELAYS_MS.length) {
+        await wait(MANAGED_STATE_RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      if (typeof cause === 'string') throw new Error(cause);
+      throw cause;
+    }
   }
 }
 

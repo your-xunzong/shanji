@@ -17,7 +17,7 @@ use error::{AppError, AppResult};
 use notification::NotificationService;
 use scheduler::SchedulerHandle;
 use tauri::{
-    AppHandle, Emitter, Manager, RunEvent,
+    AppHandle, Emitter, Manager, RunEvent, WebviewWindowBuilder,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
 };
@@ -104,6 +104,12 @@ pub fn run() {
                 scheduler,
                 shortcut_warning: Mutex::new(shortcut_warning),
             });
+
+            // Tauri creates configured windows before `setup` by default. Deferring them until
+            // after managed state is registered prevents startup IPC calls from racing setup.
+            for window_config in app.config().app.windows.clone() {
+                WebviewWindowBuilder::from_config(app.handle(), &window_config)?.build()?;
+            }
 
             create_tray(app.handle())?;
 
@@ -238,4 +244,16 @@ pub(crate) fn show_main_window(app: &AppHandle) -> AppResult<()> {
         .set_focus()
         .map_err(|error| AppError::SystemIntegration(error.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn configured_windows_wait_until_managed_state_is_ready() {
+        let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let windows = &context.config().app.windows;
+
+        assert_eq!(windows.len(), 2);
+        assert!(windows.iter().all(|window| !window.create));
+    }
 }
