@@ -1,8 +1,8 @@
-use std::{path::PathBuf, process::Command, time::Duration as StdDuration};
+use std::{path::PathBuf, process::Command, sync::Arc, time::Duration as StdDuration};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
@@ -37,6 +37,15 @@ pub struct OnboardingStatus {
     pub current_version: u32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmtpStatus {
+    pub password_configured: bool,
+    pub last_result: Option<String>,
+    pub last_error_code: Option<String>,
+    pub last_attempt_at: Option<String>,
+}
+
 #[tauri::command]
 pub fn list_items(filter: String, state: State<'_, AppState>) -> Result<Vec<Item>, String> {
     state
@@ -59,13 +68,17 @@ pub fn create_item(input: CreateItemInput, state: State<'_, AppState>) -> Result
 pub fn set_item_completed(
     id: String,
     completed: bool,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Item, String> {
+    let now = state.clock.now_utc();
     let item = state
         .database
-        .set_item_completed(&id, completed, state.clock.now_utc())
+        .set_item_completed(&id, completed, now)
         .map_err(String::from)?;
     state.scheduler.wake();
+    crate::update_tray_reminder_count(&app, &state.database, now);
+    let _ = app.emit("reminder_center_changed", ());
     Ok(item)
 }
 
@@ -73,13 +86,17 @@ pub fn set_item_completed(
 pub fn set_reminder_paused(
     id: String,
     paused: bool,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Item, String> {
+    let now = state.clock.now_utc();
     let item = state
         .database
-        .set_reminder_paused(&id, paused, state.clock.now_utc())
+        .set_reminder_paused(&id, paused, now)
         .map_err(String::from)?;
     state.scheduler.wake();
+    crate::update_tray_reminder_count(&app, &state.database, now);
+    let _ = app.emit("reminder_center_changed", ());
     Ok(item)
 }
 
@@ -111,6 +128,21 @@ pub fn update_settings(
     input.validate().map_err(String::from)?;
     let previous = state.database.get_settings().map_err(String::from)?;
     let next = input.settings();
+    let submitted_password = input
+        .smtp_password
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let previous_password = if next.smtp_enabled || submitted_password.is_some() {
+        Some(state.mail.password().map_err(|error| error.user_message)?)
+    } else {
+        None
+    };
+    if next.smtp_enabled
+        && submitted_password.is_none()
+        && previous_password.as_ref().is_none_or(Option::is_none)
+    {
+        return Err("启用邮件通知前，请填写 SMTP 密码并保存。".into());
+    }
     let shortcut_changed = previous.global_shortcut != next.global_shortcut;
     let autostart_changed = previous.autostart_enabled != next.autostart_enabled;
     let autostart_before = if autostart_changed {
@@ -144,6 +176,19 @@ pub fn update_settings(
         return Err(error);
     }
 
+    let password_changed = if let Some(password) = submitted_password {
+        if let Err(error) = state.mail.store_password(password) {
+            if let Some(before) = autostart_before {
+                let _ = set_autostart(&app, before);
+            }
+            restore_shortcut(&app, &previous.global_shortcut, &next.global_shortcut);
+            return Err(error.user_message);
+        }
+        true
+    } else {
+        false
+    };
+
     match state
         .database
         .update_settings(&input, state.clock.now_utc())
@@ -157,6 +202,13 @@ pub fn update_settings(
             Ok(settings)
         }
         Err(error) => {
+            if password_changed
+                && let Err(restore_error) = state
+                    .mail
+                    .restore_password(previous_password.as_ref().and_then(Option::as_deref))
+            {
+                eprintln!("邮件密码回滚失败：{}", restore_error.diagnostic);
+            }
             if let Some(before) = autostart_before
                 && let Err(restore_error) = set_autostart(&app, before)
             {
@@ -357,13 +409,17 @@ pub fn update_item(
 pub fn set_item_deleted(
     id: String,
     deleted: bool,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Item, String> {
+    let now = state.clock.now_utc();
     let item = state
         .database
-        .set_item_deleted(&id, deleted, state.clock.now_utc())
+        .set_item_deleted(&id, deleted, now)
         .map_err(String::from)?;
     state.scheduler.wake();
+    crate::update_tray_reminder_count(&app, &state.database, now);
+    let _ = app.emit("reminder_center_changed", ());
     Ok(item)
 }
 
@@ -372,6 +428,68 @@ pub fn permanently_delete_item(id: String, state: State<'_, AppState>) -> Result
     state
         .database
         .permanently_delete_item(&id)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn list_pending_reminders(state: State<'_, AppState>) -> Result<Vec<Item>, String> {
+    state
+        .database
+        .list_pending_reminders(state.clock.now_utc())
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn acknowledge_reminder(
+    id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Item, String> {
+    let now = state.clock.now_utc();
+    let item = state
+        .database
+        .acknowledge_reminder(&id, now)
+        .map_err(String::from)?;
+    crate::update_tray_reminder_count(&app, &state.database, now);
+    let _ = app.emit("reminder_center_changed", ());
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn snooze_item(
+    id: String,
+    minutes: u32,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Item, String> {
+    let now = state.clock.now_utc();
+    let item = state
+        .database
+        .snooze_item(&id, minutes, now)
+        .map_err(String::from)?;
+    state.scheduler.wake();
+    crate::update_tray_reminder_count(&app, &state.database, now);
+    let _ = app.emit("reminder_center_changed", ());
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn list_email_route_tag_ids(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    state
+        .database
+        .list_email_route_tag_ids()
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn set_tag_email_route(
+    tag_id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .database
+        .set_tag_email_route(&tag_id, enabled)
         .map_err(Into::into)
 }
 
@@ -432,6 +550,14 @@ pub fn show_main(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn hide_reminder(app: AppHandle) -> Result<(), String> {
+    app.get_webview_window("reminder")
+        .ok_or_else(|| "置顶提醒窗口不存在".to_string())?
+        .hide()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn get_system_warning(state: State<'_, AppState>) -> Option<String> {
     state
         .shortcut_warning
@@ -443,6 +569,36 @@ pub fn get_system_warning(state: State<'_, AppState>) -> Option<String> {
 #[tauri::command]
 pub fn get_notification_status(state: State<'_, AppState>) -> Result<NotificationStatus, String> {
     notification_status(&state)
+}
+
+#[tauri::command]
+pub fn get_smtp_status(state: State<'_, AppState>) -> Result<SmtpStatus, String> {
+    let last = state.database.last_email_delivery().map_err(String::from)?;
+    Ok(SmtpStatus {
+        password_configured: state
+            .mail
+            .password_configured()
+            .map_err(|error| error.user_message)?,
+        last_result: last.as_ref().map(|value| value.result.clone()),
+        last_error_code: last.as_ref().and_then(|value| value.error_code.clone()),
+        last_attempt_at: last.map(|value| value.attempted_at),
+    })
+}
+
+#[tauri::command]
+pub fn test_smtp(state: State<'_, AppState>) -> Result<String, String> {
+    let settings = state.database.get_settings().map_err(String::from)?;
+    if !settings.smtp_enabled {
+        return Err("请先启用邮件通知并保存设置。".into());
+    }
+    state
+        .mail
+        .send_test(&settings)
+        .map_err(|error| error.user_message)?;
+    Ok(format!(
+        "测试邮件已由服务器接受，并发送到 {}。",
+        settings.smtp_to
+    ))
 }
 
 #[tauri::command]
@@ -507,6 +663,104 @@ pub fn create_notification_test_item(state: State<'_, AppState>) -> Result<Item,
     state.scheduler.wake();
     state.scheduler.wake_after(StdDuration::from_secs(11));
     Ok(item)
+}
+
+#[tauri::command]
+pub fn test_reminder_mode(
+    mode: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let now = state.clock.now_utc();
+    match mode.as_str() {
+        "standard" => {
+            create_notification_test_item(state)?;
+            Ok("测试事项已创建，约 10 秒后显示标准系统通知。".into())
+        }
+        "persistent" => {
+            let item = insert_notification_test_item(&state.database, now).map_err(String::from)?;
+            state
+                .database
+                .set_reminder_paused(&item.id, true, now)
+                .map_err(String::from)?;
+            let notification = crate::db::DueNotification {
+                event_id: format!("test-persistent-{}", item.id),
+                item_id: item.id,
+                title: item.title,
+                due_local_date: item.due_local_date,
+                due_local_time: item.due_local_time,
+                completion_policy: "MUST_COMPLETE_TODAY".into(),
+                tag_ids: Vec::new(),
+            };
+            let service = Arc::clone(&state.notifications);
+            std::thread::spawn(move || {
+                std::thread::sleep(StdDuration::from_secs(2));
+                let _ = service.send(&notification, true);
+            });
+            Ok("约 2 秒后显示原生持续提醒；若系统不支持会自动使用标准通知。".into())
+        }
+        "overlay" => {
+            let item = insert_notification_test_item(&state.database, now).map_err(String::from)?;
+            state
+                .database
+                .set_reminder_paused(&item.id, true, now)
+                .map_err(String::from)?;
+            let notification = crate::db::DueNotification {
+                event_id: format!("test-overlay-{}", item.id),
+                item_id: item.id,
+                title: item.title,
+                due_local_date: item.due_local_date,
+                due_local_time: item.due_local_time,
+                completion_policy: item.completion_policy,
+                tag_ids: Vec::new(),
+            };
+            crate::show_overlay_reminder(&app, &notification).map_err(String::from)?;
+            Ok("置顶提醒窗已显示；关闭窗口不会把事项标记完成。".into())
+        }
+        "repeat" => {
+            let item = state
+                .database
+                .create_item(
+                    &CreateItemInput {
+                        title: "重复提醒测试：请完成或暂停我".into(),
+                        notes: "这是一条本地测试事项。".into(),
+                        category_id: None,
+                        due_at: Some((now + Duration::seconds(10)).to_rfc3339()),
+                        must_complete_today: true,
+                        repeat_interval_minutes: Some(15),
+                        tag_ids: Vec::new(),
+                    },
+                    now,
+                )
+                .map_err(String::from)?;
+            state.scheduler.wake_after(StdDuration::from_secs(11));
+            Ok(format!(
+                "已创建重复提醒测试事项“{}”，约 10 秒后首次提醒。",
+                item.title
+            ))
+        }
+        "center" => {
+            state
+                .database
+                .create_item(
+                    &CreateItemInput {
+                        title: "提醒中心测试：确认已看到".into(),
+                        notes: "完成、稍后提醒或确认已看到都可从提醒中心处理。".into(),
+                        category_id: None,
+                        due_at: Some((now - Duration::seconds(1)).to_rfc3339()),
+                        must_complete_today: false,
+                        repeat_interval_minutes: None,
+                        tag_ids: Vec::new(),
+                    },
+                    now,
+                )
+                .map_err(String::from)?;
+            state.scheduler.wake();
+            state.scheduler.wake_after(StdDuration::from_secs(1));
+            Ok("提醒中心测试事项已创建，请打开左侧“提醒中心”查看。".into())
+        }
+        _ => Err("未知的提醒测试方式".into()),
+    }
 }
 
 #[tauri::command]

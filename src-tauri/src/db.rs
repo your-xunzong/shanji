@@ -23,7 +23,8 @@ const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_notification_delivery.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_autostart_onboarding.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_types_tags_recycle.sql");
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const MIGRATION_0005: &str = include_str!("../migrations/0005_reminder_channels.sql");
+const LATEST_SCHEMA_VERSION: i64 = 5;
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -47,13 +48,16 @@ pub struct DataStatus {
     pub recovery_candidates: Vec<DataFileSummary>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DueNotification {
     pub event_id: String,
     pub item_id: String,
     pub title: String,
     pub due_local_date: String,
     pub due_local_time: String,
+    pub completion_policy: String,
+    pub tag_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +65,12 @@ pub struct NotificationDelivery {
     pub result: String,
     pub error_code: Option<String>,
     pub attempted_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmailDeliveryJob {
+    pub delivery_id: String,
+    pub notification: DueNotification,
 }
 
 #[derive(Debug, Default)]
@@ -149,6 +159,11 @@ impl Database {
             transaction.execute_batch(MIGRATION_0004)?;
             transaction.commit()?;
         }
+        if version < 5 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(MIGRATION_0005)?;
+            transaction.commit()?;
+        }
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -165,6 +180,7 @@ impl Database {
         transaction.execute_batch(MIGRATION_0002)?;
         transaction.execute_batch(MIGRATION_0003)?;
         transaction.execute_batch(MIGRATION_0004)?;
+        transaction.execute_batch(MIGRATION_0005)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -261,7 +277,19 @@ impl Database {
                 quiet_end = ?6,
                 global_shortcut = ?7,
                 notifications_enabled = ?8,
-                autostart_enabled = ?9
+                autostart_enabled = ?9,
+                persistent_notifications_enabled = ?10,
+                overlay_reminders_enabled = ?11,
+                repeat_unacknowledged_enabled = ?12,
+                unacknowledged_repeat_minutes = ?13,
+                smtp_enabled = ?14,
+                smtp_host = ?15,
+                smtp_port = ?16,
+                smtp_security = ?17,
+                smtp_from = ?18,
+                smtp_to = ?19,
+                smtp_username = ?20,
+                smtp_repeat_must_complete = ?21
              WHERE id = 1",
             params![
                 settings.default_due_time,
@@ -273,6 +301,18 @@ impl Database {
                 settings.global_shortcut,
                 bool_to_int(settings.notifications_enabled),
                 bool_to_int(settings.autostart_enabled),
+                bool_to_int(settings.persistent_notifications_enabled),
+                bool_to_int(settings.overlay_reminders_enabled),
+                bool_to_int(settings.repeat_unacknowledged_enabled),
+                settings.unacknowledged_repeat_minutes,
+                bool_to_int(settings.smtp_enabled),
+                settings.smtp_host,
+                settings.smtp_port,
+                settings.smtp_security,
+                settings.smtp_from,
+                settings.smtp_to,
+                settings.smtp_username,
+                bool_to_int(settings.smtp_repeat_must_complete),
             ],
         )?;
 
@@ -762,6 +802,277 @@ impl Database {
         Ok(())
     }
 
+    pub fn list_pending_reminders(&self, now: DateTime<Utc>) -> AppResult<Vec<Item>> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let ids = {
+            let mut statement = connection.prepare(
+                "SELECT i.id FROM items i
+                 WHERE i.status = 'OPEN' AND i.reminder_paused = 0
+                   AND i.reminder_acknowledged_at IS NULL
+                   AND EXISTS (
+                     SELECT 1 FROM reminder_events e
+                     WHERE e.item_id = i.id AND e.scheduled_for <= ?1
+                       AND e.result IN ('SUBMITTED', 'FAILED', 'DISABLED', 'CLAIMED')
+                   )
+                 ORDER BY i.due_at, i.created_at",
+            )?;
+            statement
+                .query_map([now.to_rfc3339()], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut items = Vec::with_capacity(ids.len());
+        for id in ids {
+            let mut item = get_item_from(&connection, &id)?;
+            item.tags = load_item_tags(&connection, &id)?;
+            items.push(item);
+        }
+        Ok(items)
+    }
+
+    pub fn acknowledge_reminder(&self, id: &str, now: DateTime<Utc>) -> AppResult<Item> {
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let item = get_item_from(&transaction, id)?;
+        if item.status != "OPEN" {
+            return Err(AppError::Validation("这个事项已经不需要确认提醒".into()));
+        }
+        let timestamp = now.to_rfc3339();
+        transaction.execute(
+            "UPDATE items SET reminder_acknowledged_at = ?1,
+                next_reminder_at = CASE
+                  WHEN completion_policy = 'NORMAL' THEN NULL
+                  ELSE next_reminder_at
+                END,
+                updated_at = ?1 WHERE id = ?2",
+            params![timestamp, id],
+        )?;
+        insert_item_event(&transaction, id, "REMINDER_ACKNOWLEDGED", "{}", &timestamp)?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_item(id)
+    }
+
+    pub fn snooze_item(&self, id: &str, minutes: u32, now: DateTime<Utc>) -> AppResult<Item> {
+        if !(5..=240).contains(&minutes) {
+            return Err(AppError::Validation(
+                "稍后提醒时间必须在 5–240 分钟之间".into(),
+            ));
+        }
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let item = get_item_from(&transaction, id)?;
+        if item.status != "OPEN" {
+            return Err(AppError::Validation("这个事项已经不需要稍后提醒".into()));
+        }
+        let timestamp = now.to_rfc3339();
+        let next = (now + chrono::Duration::minutes(i64::from(minutes))).to_rfc3339();
+        transaction.execute(
+            "UPDATE items SET next_reminder_at = ?1, reminder_acknowledged_at = ?2,
+                reminder_paused = 0, updated_at = ?2, revision = revision + 1 WHERE id = ?3",
+            params![next, timestamp, id],
+        )?;
+        let data = serde_json::json!({ "minutes": minutes }).to_string();
+        insert_item_event(&transaction, id, "REMINDER_SNOOZED", &data, &timestamp)?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_item(id)
+    }
+
+    pub fn list_email_route_tag_ids(&self) -> AppResult<Vec<String>> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT tag_id FROM tag_notification_routes WHERE channel = 'email' AND enabled = 1 ORDER BY tag_id",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AppError::from)
+    }
+
+    pub fn set_tag_email_route(&self, tag_id: &str, enabled: bool) -> AppResult<()> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        validate_taxonomy_links(&connection, None, &[tag_id.to_string()])?;
+        if enabled {
+            connection.execute(
+                "INSERT INTO tag_notification_routes (tag_id, channel, enabled) VALUES (?1, 'email', 1)
+                 ON CONFLICT(tag_id, channel) DO UPDATE SET enabled = 1",
+                [tag_id],
+            )?;
+        } else {
+            connection.execute(
+                "DELETE FROM tag_notification_routes WHERE tag_id = ?1 AND channel = 'email'",
+                [tag_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn record_overlay_delivery(
+        &self,
+        notification: &DueNotification,
+        now: DateTime<Utc>,
+    ) -> AppResult<()> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection.execute(
+            "INSERT OR IGNORE INTO channel_deliveries
+               (id, reminder_event_id, item_id, channel, idempotency_key, attempted_at,
+                submitted_at, result, attempt_count)
+             VALUES (?1, ?2, ?3, 'overlay', ?4, ?5, ?5, 'SUBMITTED', 1)",
+            params![
+                Uuid::new_v4().to_string(),
+                notification.event_id,
+                notification.item_id,
+                format!("{}:overlay", notification.event_id),
+                now.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_email_delivery(
+        &self,
+        notification: &DueNotification,
+        repeat_must_complete: bool,
+        now: DateTime<Utc>,
+    ) -> AppResult<Option<EmailDeliveryJob>> {
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let routed = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM item_tags it
+               JOIN tag_notification_routes r ON r.tag_id = it.tag_id
+               WHERE it.item_id = ?1 AND r.channel = 'email' AND r.enabled = 1
+             )",
+            [&notification.item_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !routed {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        if notification.completion_policy != "MUST_COMPLETE_TODAY" || !repeat_must_complete {
+            let already_scheduled = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM channel_deliveries WHERE item_id = ?1 AND channel = 'email')",
+                [&notification.item_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if already_scheduled {
+                transaction.commit()?;
+                return Ok(None);
+            }
+        }
+        let delivery_id = Uuid::new_v4().to_string();
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO channel_deliveries
+               (id, reminder_event_id, item_id, channel, idempotency_key, attempted_at,
+                result, attempt_count, next_attempt_at)
+             VALUES (?1, ?2, ?3, 'email', ?4, ?5, 'CLAIMED', 0, ?5)",
+            params![
+                delivery_id,
+                notification.event_id,
+                notification.item_id,
+                format!("{}:email", notification.event_id),
+                now.to_rfc3339(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok((inserted > 0).then_some(EmailDeliveryJob {
+            delivery_id,
+            notification: notification.clone(),
+        }))
+    }
+
+    pub fn claim_due_email_retries(&self, now: DateTime<Utc>) -> AppResult<Vec<EmailDeliveryJob>> {
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT d.id, d.reminder_event_id, i.id, i.title, i.due_local_date,
+                        i.due_local_time, i.completion_policy
+                 FROM channel_deliveries d
+                 JOIN items i ON i.id = d.item_id
+                 WHERE d.channel = 'email' AND d.result = 'FAILED'
+                   AND d.attempt_count < 3 AND d.next_attempt_at <= ?1 AND i.status = 'OPEN'
+                   AND EXISTS(
+                     SELECT 1 FROM item_tags it
+                     JOIN tag_notification_routes r ON r.tag_id = it.tag_id
+                     WHERE it.item_id = i.id AND r.channel = 'email' AND r.enabled = 1
+                   )
+                 ORDER BY d.next_attempt_at LIMIT 3",
+            )?;
+            statement
+                .query_map([now.to_rfc3339()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        DueNotification {
+                            event_id: row.get(1)?,
+                            item_id: row.get(2)?,
+                            title: row.get(3)?,
+                            due_local_date: row.get(4)?,
+                            due_local_time: row.get(5)?,
+                            completion_policy: row.get(6)?,
+                            tag_ids: Vec::new(),
+                        },
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut jobs = Vec::with_capacity(rows.len());
+        for (delivery_id, mut notification) in rows {
+            notification.tag_ids = load_item_tags(&transaction, &notification.item_id)?
+                .into_iter()
+                .map(|tag| tag.id)
+                .collect();
+            transaction.execute(
+                "UPDATE channel_deliveries SET result = 'CLAIMED', attempted_at = ?1 WHERE id = ?2 AND result = 'FAILED'",
+                params![now.to_rfc3339(), delivery_id],
+            )?;
+            jobs.push(EmailDeliveryJob {
+                delivery_id,
+                notification,
+            });
+        }
+        transaction.commit()?;
+        Ok(jobs)
+    }
+
+    pub fn mark_email_delivery_submitted(&self, id: &str, now: DateTime<Utc>) -> AppResult<()> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection.execute(
+            "UPDATE channel_deliveries SET result = 'SUBMITTED', submitted_at = ?1,
+                error_code = NULL, attempt_count = attempt_count + 1, next_attempt_at = NULL
+             WHERE id = ?2 AND result = 'CLAIMED'",
+            params![now.to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_email_delivery_failed(
+        &self,
+        id: &str,
+        error_code: &str,
+        now: DateTime<Utc>,
+    ) -> AppResult<()> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let attempts = connection.query_row(
+            "SELECT attempt_count FROM channel_deliveries WHERE id = ?1",
+            [id],
+            |row| row.get::<_, u32>(0),
+        )? + 1;
+        let next_attempt = match attempts {
+            1 => Some(now + chrono::Duration::minutes(1)),
+            2 => Some(now + chrono::Duration::minutes(5)),
+            _ => None,
+        }
+        .map(|value| value.to_rfc3339());
+        connection.execute(
+            "UPDATE channel_deliveries SET result = 'FAILED', error_code = ?1,
+                attempt_count = ?2, next_attempt_at = ?3 WHERE id = ?4 AND result = 'CLAIMED'",
+            params![error_code, attempts, next_attempt, id],
+        )?;
+        Ok(())
+    }
+
     pub fn load_draft(&self) -> AppResult<String> {
         let connection = self.connection.lock().expect("database mutex poisoned");
         Ok(connection
@@ -804,7 +1115,8 @@ impl Database {
         let stale_before = (now - chrono::Duration::minutes(2)).to_rfc3339();
         let stale_claims = {
             let mut statement = transaction.prepare(
-                "SELECT e.id, e.item_id, i.title, i.due_local_date, i.due_local_time
+                "SELECT e.id, e.item_id, i.title, i.due_local_date, i.due_local_time,
+                        i.completion_policy
                  FROM reminder_events e
                  JOIN items i ON i.id = e.item_id
                  WHERE e.result = 'CLAIMED' AND e.sent_at <= ?1 AND i.status = 'OPEN'
@@ -817,11 +1129,17 @@ impl Database {
                     title: row.get(2)?,
                     due_local_date: row.get(3)?,
                     due_local_time: row.get(4)?,
+                    completion_policy: row.get(5)?,
+                    tag_ids: Vec::new(),
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        for notification in stale_claims {
+        for mut notification in stale_claims {
+            notification.tag_ids = load_item_tags(&transaction, &notification.item_id)?
+                .into_iter()
+                .map(|tag| tag.id)
+                .collect();
             transaction.execute(
                 "UPDATE reminder_events SET sent_at = ?1 WHERE id = ?2 AND result = 'CLAIMED'",
                 params![now_text, notification.event_id],
@@ -887,21 +1205,38 @@ impl Database {
                     )?
                     .to_rfc3339(),
                 )
+            } else if settings.repeat_unacknowledged_enabled {
+                Some(
+                    next_repeat_at(
+                        now,
+                        settings.unacknowledged_repeat_minutes,
+                        &settings,
+                        bypass_quiet,
+                    )?
+                    .to_rfc3339(),
+                )
             } else {
                 None
             };
             transaction.execute(
-                "UPDATE items SET next_reminder_at = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE items SET next_reminder_at = ?1, reminder_acknowledged_at = NULL,
+                    updated_at = ?2 WHERE id = ?3",
                 params![next_reminder, now_text, id],
             )?;
 
             if inserted > 0 {
+                let tag_ids = load_item_tags(&transaction, &id)?
+                    .into_iter()
+                    .map(|tag| tag.id)
+                    .collect();
                 result.notifications.push(DueNotification {
                     event_id,
                     item_id: id,
                     title,
                     due_local_date,
                     due_local_time,
+                    completion_policy: policy,
+                    tag_ids,
                 });
             }
             result.changed = true;
@@ -911,7 +1246,17 @@ impl Database {
         Ok(result)
     }
 
+    #[cfg(test)]
     pub fn mark_notification_submitted(&self, event_id: &str, now: DateTime<Utc>) -> AppResult<()> {
+        self.mark_notification_submitted_with_note(event_id, now, None)
+    }
+
+    pub fn mark_notification_submitted_with_note(
+        &self,
+        event_id: &str,
+        now: DateTime<Utc>,
+        note: Option<&str>,
+    ) -> AppResult<()> {
         let mut connection = self.connection.lock().expect("database mutex poisoned");
         let transaction = connection.transaction()?;
         let item_id = claimed_event_item_id(&transaction, event_id)?;
@@ -921,10 +1266,10 @@ impl Database {
         };
         transaction.execute(
             "UPDATE reminder_events
-             SET result = 'SUBMITTED', submitted_at = ?1, error_code = NULL,
+             SET result = 'SUBMITTED', submitted_at = ?1, error_code = ?2,
                  attempt_count = attempt_count + 1
-             WHERE id = ?2 AND result = 'CLAIMED'",
-            params![now.to_rfc3339(), event_id],
+             WHERE id = ?3 AND result = 'CLAIMED'",
+            params![now.to_rfc3339(), note, event_id],
         )?;
         transaction.execute(
             "UPDATE items SET notification_failure_count = 0 WHERE id = ?1",
@@ -1008,6 +1353,27 @@ impl Database {
             .map_err(AppError::from)
     }
 
+    pub fn last_email_delivery(&self) -> AppResult<Option<NotificationDelivery>> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection
+            .query_row(
+                "SELECT result, error_code, attempted_at
+                 FROM channel_deliveries
+                 WHERE channel = 'email'
+                 ORDER BY attempted_at DESC, rowid DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(NotificationDelivery {
+                        result: row.get(0)?,
+                        error_code: row.get(1)?,
+                        attempted_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(AppError::from)
+    }
+
     pub fn onboarding_version(&self) -> AppResult<u32> {
         let connection = self.connection.lock().expect("database mutex poisoned");
         connection
@@ -1053,7 +1419,11 @@ fn read_settings(connection: &Connection) -> AppResult<Settings> {
         .query_row(
             "SELECT default_due_time, workdays, overtime_interval_minutes,
                     quiet_hours_enabled, quiet_start, quiet_end, global_shortcut,
-                    notifications_enabled, autostart_enabled
+                    notifications_enabled, autostart_enabled,
+                    persistent_notifications_enabled, overlay_reminders_enabled,
+                    repeat_unacknowledged_enabled, unacknowledged_repeat_minutes,
+                    smtp_enabled, smtp_host, smtp_port, smtp_security,
+                    smtp_from, smtp_to, smtp_username, smtp_repeat_must_complete
              FROM app_settings WHERE id = 1",
             [],
             |row| {
@@ -1075,6 +1445,18 @@ fn read_settings(connection: &Connection) -> AppResult<Settings> {
                     global_shortcut: row.get(6)?,
                     notifications_enabled: row.get::<_, i64>(7)? != 0,
                     autostart_enabled: row.get::<_, i64>(8)? != 0,
+                    persistent_notifications_enabled: row.get::<_, i64>(9)? != 0,
+                    overlay_reminders_enabled: row.get::<_, i64>(10)? != 0,
+                    repeat_unacknowledged_enabled: row.get::<_, i64>(11)? != 0,
+                    unacknowledged_repeat_minutes: row.get(12)?,
+                    smtp_enabled: row.get::<_, i64>(13)? != 0,
+                    smtp_host: row.get(14)?,
+                    smtp_port: row.get(15)?,
+                    smtp_security: row.get(16)?,
+                    smtp_from: row.get(17)?,
+                    smtp_to: row.get(18)?,
+                    smtp_username: row.get(19)?,
+                    smtp_repeat_must_complete: row.get::<_, i64>(20)? != 0,
                 })
             },
         )
@@ -1578,6 +1960,19 @@ mod tests {
                     notifications_enabled: current.notifications_enabled,
                     autostart_enabled: current.autostart_enabled,
                     update_existing_default_items: false,
+                    persistent_notifications_enabled: current.persistent_notifications_enabled,
+                    overlay_reminders_enabled: current.overlay_reminders_enabled,
+                    repeat_unacknowledged_enabled: current.repeat_unacknowledged_enabled,
+                    unacknowledged_repeat_minutes: current.unacknowledged_repeat_minutes,
+                    smtp_enabled: current.smtp_enabled,
+                    smtp_host: current.smtp_host,
+                    smtp_port: current.smtp_port,
+                    smtp_security: current.smtp_security,
+                    smtp_from: current.smtp_from,
+                    smtp_to: current.smtp_to,
+                    smtp_username: current.smtp_username,
+                    smtp_repeat_must_complete: current.smtp_repeat_must_complete,
+                    smtp_password: None,
                 },
                 now,
             )
@@ -1783,7 +2178,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert!(delivery_columns.contains(&"submitted_at".into()));
         assert!(delivery_columns.contains(&"error_code".into()));
         assert!(settings_columns.contains(&"autostart_enabled".into()));
@@ -1804,6 +2199,17 @@ mod tests {
             .unwrap();
         assert!(tag_table_exists);
         assert!(item_columns.contains(&"deleted_at".into()));
+        assert!(item_columns.contains(&"reminder_acknowledged_at".into()));
+        assert!(settings_columns.contains(&"smtp_enabled".into()));
+        assert!(!settings_columns.contains(&"smtp_password".into()));
+        let channel_table_exists = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'channel_deliveries')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(channel_table_exists);
         assert!(path.with_extension("db.backup-before-v3").exists());
     }
 
@@ -2171,5 +2577,263 @@ mod tests {
                 .notifications
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reminder_center_requires_an_explicit_action_and_ack_stops_normal_repeats() {
+        let database = Database::in_memory().unwrap();
+        let due = at_local(2026, 8, 27, 18, 0);
+        let item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "等待明确确认".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(due.to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
+                },
+                due - chrono::Duration::hours(1),
+            )
+            .unwrap();
+        {
+            let connection = database.connection.lock().expect("database mutex poisoned");
+            connection
+                .execute(
+                    "UPDATE app_settings SET repeat_unacknowledged_enabled = 1,
+                        unacknowledged_repeat_minutes = 15, quiet_hours_enabled = 0 WHERE id = 1",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let first_at = due + chrono::Duration::minutes(1);
+        let notification = database
+            .process_due(first_at)
+            .unwrap()
+            .notifications
+            .remove(0);
+        database
+            .mark_notification_submitted(&notification.event_id, first_at)
+            .unwrap();
+        assert_eq!(database.list_pending_reminders(first_at).unwrap().len(), 1);
+        assert!(
+            database
+                .get_item(&item.id)
+                .unwrap()
+                .next_reminder_at
+                .is_some()
+        );
+
+        database.acknowledge_reminder(&item.id, first_at).unwrap();
+        assert!(
+            database
+                .list_pending_reminders(first_at)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            database
+                .get_item(&item.id)
+                .unwrap()
+                .next_reminder_at
+                .is_none()
+        );
+        assert!(
+            database
+                .process_due(first_at + chrono::Duration::minutes(20))
+                .unwrap()
+                .notifications
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reminder_center_snooze_completion_and_pause_remove_the_current_entry() {
+        let database = Database::in_memory().unwrap();
+        let due = at_local(2026, 8, 27, 18, 0);
+        let item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "提醒中心操作".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(due.to_rfc3339()),
+                    must_complete_today: true,
+                    repeat_interval_minutes: Some(30),
+                    tag_ids: Vec::new(),
+                },
+                due - chrono::Duration::hours(1),
+            )
+            .unwrap();
+        let now = due + chrono::Duration::minutes(1);
+        database.process_due(now).unwrap();
+        assert_eq!(database.list_pending_reminders(now).unwrap().len(), 1);
+
+        let snoozed = database.snooze_item(&item.id, 15, now).unwrap();
+        assert_eq!(
+            snoozed.next_reminder_at,
+            Some((now + chrono::Duration::minutes(15)).to_rfc3339())
+        );
+        assert!(database.list_pending_reminders(now).unwrap().is_empty());
+
+        database
+            .process_due(now + chrono::Duration::minutes(15))
+            .unwrap();
+        assert_eq!(
+            database
+                .list_pending_reminders(now + chrono::Duration::minutes(15))
+                .unwrap()
+                .len(),
+            1
+        );
+        database.set_reminder_paused(&item.id, true, now).unwrap();
+        assert!(database.list_pending_reminders(now).unwrap().is_empty());
+        database.set_reminder_paused(&item.id, false, now).unwrap();
+        database.set_item_completed(&item.id, true, now).unwrap();
+        assert!(database.list_pending_reminders(now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn email_routes_are_tag_scoped_idempotent_and_use_bounded_retries() {
+        let database = Database::in_memory().unwrap();
+        let tag = database
+            .create_tag(&TaxonomyInput {
+                name: "外部通知".into(),
+                color: "#B06C49".into(),
+            })
+            .unwrap();
+        let due = at_local(2026, 8, 27, 18, 0);
+        database
+            .create_item(
+                &CreateItemInput {
+                    title: "邮件路由测试".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(due.to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: vec![tag.id.clone()],
+                },
+                due - chrono::Duration::hours(1),
+            )
+            .unwrap();
+        let now = due + chrono::Duration::minutes(1);
+        let notification = database.process_due(now).unwrap().notifications.remove(0);
+
+        assert!(
+            database
+                .claim_email_delivery(&notification, false, now)
+                .unwrap()
+                .is_none()
+        );
+        database.set_tag_email_route(&tag.id, true).unwrap();
+        let job = database
+            .claim_email_delivery(&notification, false, now)
+            .unwrap()
+            .unwrap();
+        assert!(
+            database
+                .claim_email_delivery(&notification, false, now)
+                .unwrap()
+                .is_none()
+        );
+
+        database
+            .mark_email_delivery_failed(&job.delivery_id, "smtp_delivery_failed", now)
+            .unwrap();
+        assert!(
+            database
+                .claim_due_email_retries(now + chrono::Duration::seconds(59))
+                .unwrap()
+                .is_empty()
+        );
+        let retry_one = database
+            .claim_due_email_retries(now + chrono::Duration::minutes(1))
+            .unwrap()
+            .remove(0);
+        database
+            .mark_email_delivery_failed(
+                &retry_one.delivery_id,
+                "smtp_delivery_failed",
+                now + chrono::Duration::minutes(1),
+            )
+            .unwrap();
+        let retry_two = database
+            .claim_due_email_retries(now + chrono::Duration::minutes(6))
+            .unwrap()
+            .remove(0);
+        database
+            .mark_email_delivery_failed(
+                &retry_two.delivery_id,
+                "smtp_delivery_failed",
+                now + chrono::Duration::minutes(6),
+            )
+            .unwrap();
+        assert!(
+            database
+                .claim_due_email_retries(now + chrono::Duration::hours(1))
+                .unwrap()
+                .is_empty()
+        );
+        let delivery = database.last_email_delivery().unwrap().unwrap();
+        assert_eq!(delivery.result, "FAILED");
+        assert_eq!(delivery.error_code.as_deref(), Some("smtp_delivery_failed"));
+    }
+
+    #[test]
+    fn smtp_password_is_never_a_database_column() {
+        let database = Database::in_memory().unwrap();
+        let columns = database
+            .connection
+            .lock()
+            .expect("database mutex poisoned")
+            .prepare("PRAGMA table_info(app_settings)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column.contains("password")));
+    }
+
+    #[test]
+    fn overlay_delivery_is_recorded_once_per_reminder_event() {
+        let database = Database::in_memory().unwrap();
+        let due = at_local(2026, 8, 27, 18, 0);
+        database
+            .create_item(
+                &CreateItemInput {
+                    title: "置顶提醒测试".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(due.to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
+                },
+                due - chrono::Duration::hours(1),
+            )
+            .unwrap();
+        let now = due + chrono::Duration::minutes(1);
+        let notification = database.process_due(now).unwrap().notifications.remove(0);
+        database
+            .record_overlay_delivery(&notification, now)
+            .unwrap();
+        database
+            .record_overlay_delivery(&notification, now)
+            .unwrap();
+        let count = database
+            .connection
+            .lock()
+            .expect("database mutex poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM channel_deliveries WHERE channel = 'overlay'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

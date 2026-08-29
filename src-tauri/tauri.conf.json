@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "闪记",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "identifier": "com.shanji.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -41,6 +41,24 @@
         "skipTaskbar": true,
         "backgroundColor": "#F9FAFB",
         "shadow": true
+      },
+      {
+        "create": false,
+        "label": "reminder",
+        "title": "提醒 · 闪记",
+        "url": "index.html?view=reminder",
+        "width": 390,
+        "height": 230,
+        "minWidth": 350,
+        "minHeight": 210,
+        "visible": false,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "resizable": false,
+        "skipTaskbar": true,
+        "backgroundColor": "#F9FAFB",
+        "shadow": true,
+        "focus": false
       }
     ],
     "security": {

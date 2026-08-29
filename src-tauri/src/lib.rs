@@ -3,6 +3,7 @@ mod db;
 mod domain;
 mod error;
 mod export;
+mod mail;
 mod notification;
 mod scheduler;
 
@@ -16,6 +17,7 @@ use std::{
 use db::{Database, apply_pending_restore};
 use domain::{Clock, SystemClock};
 use error::{AppError, AppResult};
+use mail::MailService;
 use notification::NotificationService;
 use scheduler::SchedulerHandle;
 use tauri::{
@@ -29,9 +31,11 @@ pub struct AppState {
     database: Arc<Database>,
     clock: Arc<dyn Clock>,
     notifications: Arc<NotificationService>,
+    mail: Arc<MailService>,
     portable: bool,
     scheduler: SchedulerHandle,
     shortcut_warning: Mutex<Option<String>>,
+    pending_reminder_menu: Mutex<Option<MenuItem<tauri::Wry>>>,
 }
 
 pub fn run() {
@@ -78,6 +82,7 @@ pub fn run() {
                     .ok_or_else(|| AppError::SystemIntegration("数据目录无效".into()))?
                     .to_path_buf(),
             )?);
+            let mail = Arc::new(MailService::new());
             if notification_test_requested {
                 if !settings.notifications_enabled {
                     return Err(AppError::SystemIntegration(
@@ -96,6 +101,7 @@ pub fn run() {
                 Arc::clone(&database),
                 Arc::clone(&clock),
                 Arc::clone(&notifications),
+                Arc::clone(&mail),
             );
             if notification_test_requested {
                 scheduler.wake_after(Duration::from_secs(11));
@@ -104,9 +110,11 @@ pub fn run() {
                 database,
                 clock,
                 notifications,
+                mail,
                 portable,
                 scheduler,
                 shortcut_warning: Mutex::new(shortcut_warning),
+                pending_reminder_menu: Mutex::new(None),
             });
 
             // Tauri creates configured windows before `setup` by default. Deferring them until
@@ -115,7 +123,14 @@ pub fn run() {
                 WebviewWindowBuilder::from_config(app.handle(), &window_config)?.build()?;
             }
 
-            create_tray(app.handle())?;
+            let pending_menu = create_tray(app.handle())?;
+            if let Some(state) = app.try_state::<AppState>() {
+                *state
+                    .pending_reminder_menu
+                    .lock()
+                    .expect("tray menu mutex poisoned") = Some(pending_menu);
+                update_tray_reminder_count(app.handle(), &state.database, state.clock.now_utc());
+            }
 
             if std::env::args().any(|argument| argument == "--background") {
                 if let Some(main) = app.get_webview_window("main") {
@@ -151,20 +166,29 @@ pub fn run() {
             commands::update_item,
             commands::set_item_deleted,
             commands::permanently_delete_item,
+            commands::list_pending_reminders,
+            commands::acknowledge_reminder,
+            commands::snooze_item,
+            commands::list_email_route_tag_ids,
+            commands::set_tag_email_route,
             commands::export_excel,
             commands::load_draft,
             commands::save_draft,
             commands::hide_capture,
             commands::show_capture,
             commands::show_main,
+            commands::hide_reminder,
             commands::get_system_warning,
             commands::get_autostart_status,
             commands::get_onboarding_status,
             commands::complete_onboarding,
             commands::get_notification_status,
+            commands::get_smtp_status,
+            commands::test_smtp,
             commands::register_portable_notifications,
             commands::unregister_portable_notifications,
             commands::create_notification_test_item,
+            commands::test_reminder_mode,
             commands::get_data_status,
             commands::create_data_backup,
             commands::open_data_directory,
@@ -229,14 +253,16 @@ pub(crate) fn candidate_database_paths(app: &AppHandle, current: &std::path::Pat
     candidates
 }
 
-fn create_tray(app: &AppHandle) -> AppResult<()> {
+fn create_tray(app: &AppHandle) -> AppResult<MenuItem<tauri::Wry>> {
     let capture = MenuItem::with_id(app, "capture", "快速记录", true, None::<&str>)
         .map_err(|error| AppError::SystemIntegration(error.to_string()))?;
     let show = MenuItem::with_id(app, "show", "打开闪记", true, None::<&str>)
         .map_err(|error| AppError::SystemIntegration(error.to_string()))?;
+    let reminders = MenuItem::with_id(app, "reminders", "待确认提醒（0）", true, None::<&str>)
+        .map_err(|error| AppError::SystemIntegration(error.to_string()))?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)
         .map_err(|error| AppError::SystemIntegration(error.to_string()))?;
-    let menu = Menu::with_items(app, &[&capture, &show, &quit])
+    let menu = Menu::with_items(app, &[&capture, &show, &reminders, &quit])
         .map_err(|error| AppError::SystemIntegration(error.to_string()))?;
 
     let last_click = Arc::new(Mutex::new(None::<Instant>));
@@ -250,6 +276,10 @@ fn create_tray(app: &AppHandle) -> AppResult<()> {
             }
             "show" => {
                 let _ = show_main_window(app);
+            }
+            "reminders" => {
+                let _ = show_main_window(app);
+                let _ = app.emit("open_reminder_center", ());
             }
             "quit" => app.exit(0),
             _ => {}
@@ -284,6 +314,59 @@ fn create_tray(app: &AppHandle) -> AppResult<()> {
     }
     builder
         .build(app)
+        .map_err(|error| AppError::SystemIntegration(error.to_string()))?;
+    Ok(reminders)
+}
+
+pub(crate) fn update_tray_reminder_count(
+    app: &AppHandle,
+    database: &Database,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let Ok(count) = database
+        .list_pending_reminders(now)
+        .map(|items| items.len())
+    else {
+        return;
+    };
+    if let Some(state) = app.try_state::<AppState>()
+        && let Some(item) = state
+            .pending_reminder_menu
+            .lock()
+            .expect("tray menu mutex poisoned")
+            .as_ref()
+    {
+        let _ = item.set_text(format!("待确认提醒（{count}）"));
+    }
+}
+
+pub(crate) fn show_overlay_reminder(
+    app: &AppHandle,
+    notification: &db::DueNotification,
+) -> AppResult<()> {
+    let window = app
+        .get_webview_window("reminder")
+        .ok_or_else(|| AppError::SystemIntegration("置顶提醒窗口不存在".into()))?;
+    if let Some(monitor) = window
+        .current_monitor()
+        .map_err(|error| AppError::SystemIntegration(error.to_string()))?
+    {
+        let monitor_size = monitor.size();
+        let monitor_position = monitor.position();
+        let window_size = window
+            .outer_size()
+            .map_err(|error| AppError::SystemIntegration(error.to_string()))?;
+        let x = monitor_position.x
+            + i32::try_from(monitor_size.width.saturating_sub(window_size.width + 24)).unwrap_or(0);
+        let y = monitor_position.y
+            + i32::try_from(monitor_size.height.saturating_sub(window_size.height + 56))
+                .unwrap_or(0);
+        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+    }
+    window
+        .show()
+        .map_err(|error| AppError::SystemIntegration(error.to_string()))?;
+    app.emit_to("reminder", "overlay_reminder", notification.clone())
         .map_err(|error| AppError::SystemIntegration(error.to_string()))?;
     Ok(())
 }
@@ -325,7 +408,7 @@ mod tests {
         let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
         let windows = &context.config().app.windows;
 
-        assert_eq!(windows.len(), 2);
+        assert_eq!(windows.len(), 3);
         assert!(windows.iter().all(|window| !window.create));
     }
 }

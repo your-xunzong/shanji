@@ -33,6 +33,18 @@ pub struct Settings {
     pub global_shortcut: String,
     pub notifications_enabled: bool,
     pub autostart_enabled: bool,
+    pub persistent_notifications_enabled: bool,
+    pub overlay_reminders_enabled: bool,
+    pub repeat_unacknowledged_enabled: bool,
+    pub unacknowledged_repeat_minutes: u32,
+    pub smtp_enabled: bool,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_security: String,
+    pub smtp_from: String,
+    pub smtp_to: String,
+    pub smtp_username: String,
+    pub smtp_repeat_must_complete: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +60,19 @@ pub struct UpdateSettingsInput {
     pub notifications_enabled: bool,
     pub autostart_enabled: bool,
     pub update_existing_default_items: bool,
+    pub persistent_notifications_enabled: bool,
+    pub overlay_reminders_enabled: bool,
+    pub repeat_unacknowledged_enabled: bool,
+    pub unacknowledged_repeat_minutes: u32,
+    pub smtp_enabled: bool,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_security: String,
+    pub smtp_from: String,
+    pub smtp_to: String,
+    pub smtp_username: String,
+    pub smtp_repeat_must_complete: bool,
+    pub smtp_password: Option<String>,
 }
 
 impl UpdateSettingsInput {
@@ -63,6 +88,24 @@ impl UpdateSettingsInput {
             return Err(AppError::Validation(
                 "今日必做提醒间隔必须在 5–240 分钟之间".into(),
             ));
+        }
+        if !(5..=240).contains(&self.unacknowledged_repeat_minutes) {
+            return Err(AppError::Validation(
+                "未确认重复提醒间隔必须在 5–240 分钟之间".into(),
+            ));
+        }
+        if !matches!(self.smtp_security.as_str(), "tls" | "starttls") {
+            return Err(AppError::Validation("请选择安全的邮件加密方式".into()));
+        }
+        if self.smtp_enabled {
+            if self.smtp_host.trim().is_empty() {
+                return Err(AppError::Validation("请填写 SMTP 服务器地址".into()));
+            }
+            if !self.smtp_from.contains('@') || !self.smtp_to.contains('@') {
+                return Err(AppError::Validation(
+                    "请填写有效的发件人和收件人邮箱".into(),
+                ));
+            }
         }
         validate_global_shortcut(&self.global_shortcut)?;
         Ok(())
@@ -82,6 +125,18 @@ impl UpdateSettingsInput {
             global_shortcut: self.global_shortcut.trim().to_string(),
             notifications_enabled: self.notifications_enabled,
             autostart_enabled: self.autostart_enabled,
+            persistent_notifications_enabled: self.persistent_notifications_enabled,
+            overlay_reminders_enabled: self.overlay_reminders_enabled,
+            repeat_unacknowledged_enabled: self.repeat_unacknowledged_enabled,
+            unacknowledged_repeat_minutes: self.unacknowledged_repeat_minutes,
+            smtp_enabled: self.smtp_enabled,
+            smtp_host: self.smtp_host.trim().to_string(),
+            smtp_port: self.smtp_port,
+            smtp_security: self.smtp_security.clone(),
+            smtp_from: self.smtp_from.trim().to_string(),
+            smtp_to: self.smtp_to.trim().to_string(),
+            smtp_username: self.smtp_username.trim().to_string(),
+            smtp_repeat_must_complete: self.smtp_repeat_must_complete,
         }
     }
 }
@@ -414,6 +469,18 @@ mod tests {
             global_shortcut: "CommandOrControl+Shift+Space".into(),
             notifications_enabled: true,
             autostart_enabled: false,
+            persistent_notifications_enabled: true,
+            overlay_reminders_enabled: false,
+            repeat_unacknowledged_enabled: false,
+            unacknowledged_repeat_minutes: 60,
+            smtp_enabled: false,
+            smtp_host: String::new(),
+            smtp_port: 465,
+            smtp_security: "tls".into(),
+            smtp_from: String::new(),
+            smtp_to: String::new(),
+            smtp_username: String::new(),
+            smtp_repeat_must_complete: false,
         }
     }
 

@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{db::DueNotification, error::AppResult};
 
@@ -152,10 +152,23 @@ impl NotificationService {
         Ok(self.status())
     }
 
-    pub fn send(&self, notification: &DueNotification) -> Result<(), DeliveryError> {
+    pub fn send(
+        &self,
+        notification: &DueNotification,
+        persistent: bool,
+    ) -> Result<Option<&'static str>, DeliveryError> {
         #[cfg(windows)]
         {
-            self.send_windows(notification)
+            if persistent {
+                match self.send_windows(notification, true) {
+                    Ok(()) => Ok(None),
+                    Err(_) => self
+                        .send_windows(notification, false)
+                        .map(|()| Some("persistent_fell_back_to_standard")),
+                }
+            } else {
+                self.send_windows(notification, false).map(|()| None)
+            }
         }
 
         #[cfg(not(windows))]
@@ -171,6 +184,7 @@ impl NotificationService {
                     notification.title, notification.due_local_date, notification.due_local_time
                 ))
                 .show()
+                .map(|()| persistent.then_some("persistent_not_supported"))
                 .map_err(|error| DeliveryError {
                     code: "platform_submit_failed",
                     diagnostic: error.to_string(),
@@ -179,8 +193,12 @@ impl NotificationService {
     }
 
     #[cfg(windows)]
-    fn send_windows(&self, notification: &DueNotification) -> Result<(), DeliveryError> {
-        use tauri_winrt_notification::Toast;
+    fn send_windows(
+        &self,
+        notification: &DueNotification,
+        persistent: bool,
+    ) -> Result<(), DeliveryError> {
+        use tauri_winrt_notification::{Scenario, Toast};
 
         if self.portable && !self.windows_identity_registered() {
             return Err(DeliveryError {
@@ -194,23 +212,28 @@ impl NotificationService {
 
         let app = self.app.clone();
         let item_id = notification.item_id.clone();
-        Toast::new(self.windows_app_id())
+        let mut toast = Toast::new(self.windows_app_id())
             .title("闪记提醒")
             .text1(&notification.title)
             .text2(&format!(
                 "到期：{} {}",
                 notification.due_local_date, notification.due_local_time
             ))
-            .on_activated(move |_| {
-                let _ = crate::show_main_window(&app);
-                let _ = app.emit("notification_opened", item_id.clone());
+            .on_activated(move |action| {
+                handle_notification_action(&app, &item_id, action.as_deref());
                 Ok(())
-            })
-            .show()
-            .map_err(|error| DeliveryError {
-                code: "platform_submit_failed",
-                diagnostic: error.to_string(),
-            })
+            });
+        if persistent {
+            toast = toast
+                .scenario(Scenario::Reminder)
+                .add_button("完成", "complete")
+                .add_button("15 分钟后提醒", "snooze")
+                .add_button("打开闪记", "open");
+        }
+        toast.show().map_err(|error| DeliveryError {
+            code: "platform_submit_failed",
+            diagnostic: error.to_string(),
+        })
     }
 
     #[cfg(windows)]
@@ -272,6 +295,42 @@ impl NotificationService {
             WINDOWS_PORTABLE_REGISTRY_PATH
         } else {
             WINDOWS_INSTALLED_REGISTRY_PATH
+        }
+    }
+}
+
+#[cfg(windows)]
+fn handle_notification_action(app: &AppHandle, item_id: &str, action: Option<&str>) {
+    match action {
+        Some("complete") => {
+            if let Some(state) = app.try_state::<crate::AppState>() {
+                let now = state.clock.now_utc();
+                if state
+                    .database
+                    .set_item_completed(item_id, true, now)
+                    .is_ok()
+                {
+                    state.scheduler.wake();
+                    crate::update_tray_reminder_count(app, &state.database, now);
+                    let _ = app.emit("items_changed", ());
+                    let _ = app.emit("reminder_center_changed", ());
+                }
+            }
+        }
+        Some("snooze") => {
+            if let Some(state) = app.try_state::<crate::AppState>() {
+                let now = state.clock.now_utc();
+                if state.database.snooze_item(item_id, 15, now).is_ok() {
+                    state.scheduler.wake();
+                    crate::update_tray_reminder_count(app, &state.database, now);
+                    let _ = app.emit("items_changed", ());
+                    let _ = app.emit("reminder_center_changed", ());
+                }
+            }
+        }
+        _ => {
+            let _ = crate::show_main_window(app);
+            let _ = app.emit("notification_opened", item_id.to_string());
         }
     }
 }

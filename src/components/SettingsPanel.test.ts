@@ -13,6 +13,18 @@ const settings: Settings = {
   globalShortcut: 'Ctrl+Shift+Space',
   notificationsEnabled: true,
   autostartEnabled: false,
+  persistentNotificationsEnabled: true,
+  overlayRemindersEnabled: false,
+  repeatUnacknowledgedEnabled: false,
+  unacknowledgedRepeatMinutes: 60,
+  smtpEnabled: false,
+  smtpHost: '',
+  smtpPort: 465,
+  smtpSecurity: 'tls',
+  smtpFrom: '',
+  smtpTo: '',
+  smtpUsername: '',
+  smtpRepeatMustComplete: false,
 };
 
 const notificationStatus: NotificationStatus = {
@@ -44,6 +56,7 @@ describe('SettingsPanel', () => {
       onClose: vi.fn(),
       onSave: vi.fn().mockRejectedValue(new Error(message)),
       onTestNotification: vi.fn().mockResolvedValue(undefined),
+      onTestReminderMode: vi.fn().mockResolvedValue(undefined),
       onRegisterNotifications: vi.fn().mockResolvedValue(undefined),
       onUnregisterNotifications: vi.fn().mockResolvedValue(undefined),
       onOpenOnboarding: vi.fn(),
@@ -51,5 +64,32 @@ describe('SettingsPanel', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(message);
+  });
+
+  it('submits an SMTP password separately from ordinary settings', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(SettingsPanel, {
+      settings: {
+        ...settings,
+        smtpEnabled: true,
+        smtpHost: 'smtp.example.com',
+        smtpFrom: 'me@example.com',
+        smtpTo: 'me@example.com',
+      },
+      saving: false,
+      notificationStatus,
+      autostartStatus,
+      onClose: vi.fn(),
+      onSave,
+      onTestNotification: vi.fn().mockResolvedValue(undefined),
+      onTestReminderMode: vi.fn().mockResolvedValue('已准备'),
+      onRegisterNotifications: vi.fn().mockResolvedValue(undefined),
+      onUnregisterNotifications: vi.fn().mockResolvedValue(undefined),
+      onOpenOnboarding: vi.fn(),
+    });
+
+    await fireEvent.input(screen.getByLabelText('SMTP 密码'), { target: { value: 'app-secret' } });
+    await fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ smtpPassword: 'app-secret' }));
   });
 });

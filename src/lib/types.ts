@@ -38,6 +38,18 @@ export interface Settings {
   globalShortcut: string;
   notificationsEnabled: boolean;
   autostartEnabled: boolean;
+  persistentNotificationsEnabled: boolean;
+  overlayRemindersEnabled: boolean;
+  repeatUnacknowledgedEnabled: boolean;
+  unacknowledgedRepeatMinutes: number;
+  smtpEnabled: boolean;
+  smtpHost: string;
+  smtpPort: number;
+  smtpSecurity: 'tls' | 'starttls';
+  smtpFrom: string;
+  smtpTo: string;
+  smtpUsername: string;
+  smtpRepeatMustComplete: boolean;
 }
 
 export interface CreateItemInput {
@@ -62,6 +74,17 @@ export interface UpdateItemInput {
 
 export interface UpdateSettingsInput extends Settings {
   updateExistingDefaultItems: boolean;
+  smtpPassword?: string | null;
+}
+
+export interface DueNotification {
+  eventId: string;
+  itemId: string;
+  title: string;
+  dueLocalDate: string;
+  dueLocalTime: string;
+  completionPolicy: CompletionPolicy;
+  tagIds: string[];
 }
 
 export interface Category {
@@ -88,6 +111,13 @@ export interface NotificationStatus {
   canNotify: boolean;
   message: string;
   lastResult: 'CLAIMED' | 'SUBMITTED' | 'FAILED' | 'DISABLED' | null;
+  lastErrorCode: string | null;
+  lastAttemptAt: string | null;
+}
+
+export interface SmtpStatus {
+  passwordConfigured: boolean;
+  lastResult: 'CLAIMED' | 'SUBMITTED' | 'FAILED' | null;
   lastErrorCode: string | null;
   lastAttemptAt: string | null;
 }

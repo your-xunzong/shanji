@@ -6,7 +6,12 @@ use std::{
 
 use tauri::{AppHandle, Emitter};
 
-use crate::{db::Database, domain::Clock, notification::NotificationService};
+use crate::{
+    db::{Database, EmailDeliveryJob},
+    domain::{Clock, Settings},
+    mail::MailService,
+    notification::NotificationService,
+};
 
 #[derive(Debug, Clone, Copy)]
 enum SchedulerSignal {
@@ -26,6 +31,7 @@ impl SchedulerHandle {
         database: Arc<Database>,
         clock: Arc<dyn Clock>,
         notifications: Arc<NotificationService>,
+        mail: Arc<MailService>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
         thread::Builder::new()
@@ -46,7 +52,7 @@ impl SchedulerHandle {
                     match receiver.recv_timeout(wait) {
                         Ok(SchedulerSignal::Stop) => break,
                         Ok(SchedulerSignal::Wake) => {
-                            process_once(&app, &database, clock.as_ref(), &notifications);
+                            process_once(&app, &database, clock.as_ref(), &notifications, &mail);
                             next_poll = Instant::now() + poll_interval;
                         }
                         Ok(SchedulerSignal::WakeAfter(delay)) => {
@@ -55,7 +61,7 @@ impl SchedulerHandle {
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             let now = Instant::now();
                             delayed_wakes.retain(|deadline| *deadline > now);
-                            process_once(&app, &database, clock.as_ref(), &notifications);
+                            process_once(&app, &database, clock.as_ref(), &notifications, &mail);
                             if now >= next_poll {
                                 next_poll = now + poll_interval;
                             }
@@ -89,11 +95,51 @@ fn process_once(
     database: &Database,
     clock: &dyn Clock,
     notifications: &NotificationService,
+    mail: &MailService,
 ) {
     let now = clock.now_utc();
     match database.process_due(now) {
         Ok(result) => {
+            let settings = match database.get_settings() {
+                Ok(settings) => settings,
+                Err(error) => {
+                    eprintln!("提醒设置读取失败：{error}");
+                    return;
+                }
+            };
+            if settings.smtp_enabled {
+                match database.claim_due_email_retries(now) {
+                    Ok(jobs) => {
+                        for job in jobs {
+                            deliver_email(database, mail, &settings, job, now);
+                        }
+                    }
+                    Err(error) => eprintln!("邮件重试领取失败：{error}"),
+                }
+            }
             for notification in result.notifications {
+                if settings.overlay_reminders_enabled {
+                    match crate::show_overlay_reminder(app, &notification) {
+                        Ok(()) => {
+                            if let Err(error) = database.record_overlay_delivery(&notification, now)
+                            {
+                                eprintln!("置顶提醒投递记录失败：{error}");
+                            }
+                        }
+                        Err(error) => eprintln!("置顶提醒窗口暂时无法显示：{error}"),
+                    }
+                }
+                if settings.smtp_enabled {
+                    match database.claim_email_delivery(
+                        &notification,
+                        settings.smtp_repeat_must_complete,
+                        now,
+                    ) {
+                        Ok(Some(job)) => deliver_email(database, mail, &settings, job, now),
+                        Ok(None) => {}
+                        Err(error) => eprintln!("邮件提醒领取失败：{error}"),
+                    }
+                }
                 if !result.notifications_enabled {
                     if let Err(error) =
                         database.mark_notification_disabled(&notification.event_id, now)
@@ -103,11 +149,14 @@ fn process_once(
                     continue;
                 }
 
-                match notifications.send(&notification) {
-                    Ok(()) => {
-                        if let Err(error) =
-                            database.mark_notification_submitted(&notification.event_id, now)
-                        {
+                let persistent = should_use_persistent_notification(&settings, &notification);
+                match notifications.send(&notification, persistent) {
+                    Ok(note) => {
+                        if let Err(error) = database.mark_notification_submitted_with_note(
+                            &notification.event_id,
+                            now,
+                            note,
+                        ) {
                             eprintln!("通知提交结果记录失败：{error}");
                         }
                     }
@@ -125,10 +174,106 @@ fn process_once(
             }
             if result.changed {
                 let _ = app.emit("items_changed", ());
+                let _ = app.emit("reminder_center_changed", ());
+                crate::update_tray_reminder_count(app, database, now);
             }
         }
         Err(error) => {
             eprintln!("提醒调度暂时失败：{error}");
         }
+    }
+}
+
+fn should_use_persistent_notification(
+    settings: &Settings,
+    notification: &crate::db::DueNotification,
+) -> bool {
+    settings.persistent_notifications_enabled
+        && notification.completion_policy == "MUST_COMPLETE_TODAY"
+}
+
+fn deliver_email(
+    database: &Database,
+    mail: &MailService,
+    settings: &Settings,
+    job: EmailDeliveryJob,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    match mail.send_reminder(settings, &job.notification) {
+        Ok(()) => {
+            if let Err(error) = database.mark_email_delivery_submitted(&job.delivery_id, now) {
+                eprintln!("邮件投递结果记录失败：{error}");
+            }
+        }
+        Err(error) => {
+            eprintln!("邮件投递失败（{}）", error.code);
+            if let Err(database_error) =
+                database.mark_email_delivery_failed(&job.delivery_id, error.code, now)
+            {
+                eprintln!("邮件失败结果记录失败：{database_error}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DueNotification;
+
+    fn settings() -> Settings {
+        Settings {
+            default_due_time: "18:00".into(),
+            workdays: vec![1, 2, 3, 4, 5],
+            overtime_interval_minutes: 30,
+            quiet_hours_enabled: true,
+            quiet_start: "22:30".into(),
+            quiet_end: "07:30".into(),
+            global_shortcut: "CommandOrControl+Shift+Space".into(),
+            notifications_enabled: true,
+            autostart_enabled: false,
+            persistent_notifications_enabled: true,
+            overlay_reminders_enabled: false,
+            repeat_unacknowledged_enabled: false,
+            unacknowledged_repeat_minutes: 60,
+            smtp_enabled: false,
+            smtp_host: String::new(),
+            smtp_port: 465,
+            smtp_security: "tls".into(),
+            smtp_from: String::new(),
+            smtp_to: String::new(),
+            smtp_username: String::new(),
+            smtp_repeat_must_complete: false,
+        }
+    }
+
+    fn notification(policy: &str) -> DueNotification {
+        DueNotification {
+            event_id: "event".into(),
+            item_id: "item".into(),
+            title: "测试".into(),
+            due_local_date: "2026-08-29".into(),
+            due_local_time: "18:00".into(),
+            completion_policy: policy.into(),
+            tag_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn persistent_native_mode_is_reserved_for_must_complete_items() {
+        let mut settings = settings();
+        assert!(should_use_persistent_notification(
+            &settings,
+            &notification("MUST_COMPLETE_TODAY")
+        ));
+        assert!(!should_use_persistent_notification(
+            &settings,
+            &notification("NORMAL")
+        ));
+        settings.persistent_notifications_enabled = false;
+        assert!(!should_use_persistent_notification(
+            &settings,
+            &notification("MUST_COMPLETE_TODAY")
+        ));
     }
 }

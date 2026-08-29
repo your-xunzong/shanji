@@ -20,6 +20,18 @@ const settings: Settings = {
   globalShortcut: 'CommandOrControl+Shift+Space',
   notificationsEnabled: true,
   autostartEnabled: false,
+  persistentNotificationsEnabled: true,
+  overlayRemindersEnabled: false,
+  repeatUnacknowledgedEnabled: false,
+  unacknowledgedRepeatMinutes: 60,
+  smtpEnabled: false,
+  smtpHost: '',
+  smtpPort: 465,
+  smtpSecurity: 'tls',
+  smtpFrom: '',
+  smtpTo: '',
+  smtpUsername: '',
+  smtpRepeatMustComplete: false,
 };
 
 describe('Tauri startup calls', () => {

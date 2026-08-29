@@ -6,12 +6,14 @@
   import SettingsPanel from '../components/SettingsPanel.svelte';
   import OrganizerPanel from '../components/OrganizerPanel.svelte';
   import ExportPanel from '../components/ExportPanel.svelte';
+  import ReminderCenter from '../components/ReminderCenter.svelte';
   import { api } from '../lib/api';
   import type {
     Item,
     ItemFilter,
     AutostartStatus,
     NotificationStatus,
+    SmtpStatus,
     OnboardingFinishInput,
     OnboardingStatus,
     Settings,
@@ -28,6 +30,7 @@
   let settings: Settings | null = null;
   let notificationStatus: NotificationStatus | null = null;
   let autostartStatus: AutostartStatus | null = null;
+  let smtpStatus: SmtpStatus | null = null;
   let onboardingStatus: OnboardingStatus | null = null;
   let filter: ItemFilter = 'open';
   let loading = true;
@@ -47,6 +50,11 @@
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
   let unlistenItems: (() => void) | undefined;
   let unlistenNotification: (() => void) | undefined;
+  let unlistenReminderCenter: (() => void) | undefined;
+  let unlistenOpenReminderCenter: (() => void) | undefined;
+  let pendingReminders: Item[] = [];
+  let reminderCenterOpen = false;
+  let emailRouteTagIds: string[] = [];
 
   const navItems: { id: ItemFilter; label: string; marker: string }[] = [
     { id: 'open', label: '待处理', marker: '○' },
@@ -65,9 +73,17 @@
     void initialize();
     if (isTauri()) {
       void import('@tauri-apps/api/event').then(async ({ listen }) => {
-        unlistenItems = await listen('items_changed', () => void loadItems());
+        unlistenItems = await listen('items_changed', () => {
+          void loadItems();
+          void loadPendingReminders();
+        });
         unlistenNotification = await listen<string>('notification_opened', ({ payload }) => {
           void revealNotificationItem(payload);
+        });
+        unlistenReminderCenter = await listen('reminder_center_changed', () => void loadPendingReminders());
+        unlistenOpenReminderCenter = await listen('open_reminder_center', () => {
+          reminderCenterOpen = true;
+          void loadPendingReminders();
         });
       });
     }
@@ -78,6 +94,8 @@
       window.removeEventListener('focus', onFocus);
       unlistenItems?.();
       unlistenNotification?.();
+      unlistenReminderCenter?.();
+      unlistenOpenReminderCenter?.();
       if (toastTimer) clearTimeout(toastTimer);
     };
   });
@@ -95,6 +113,7 @@
         warning,
         loadedCategories,
         loadedTags,
+        loadedPendingReminders,
       ] = await Promise.all([
         api.getSettings(),
         api.getNotificationStatus(),
@@ -104,6 +123,7 @@
         api.getSystemWarning(),
         api.listCategories(),
         api.listTags(),
+        api.listPendingReminders(),
       ]);
       if (loadedAutostartStatus.available) {
         loadedSettings.autostartEnabled = loadedAutostartStatus.enabled;
@@ -115,6 +135,7 @@
       onboardingOpen = loadedOnboardingStatus.required;
       categories = loadedCategories;
       tags = loadedTags;
+      pendingReminders = loadedPendingReminders;
       if (warning) error = warning;
     } catch (cause) {
       error = readableError(cause, '无法打开本地数据。请检查数据目录后重试。');
@@ -130,6 +151,42 @@
 
   async function loadItems(): Promise<void> {
     items = await api.listItems(filter);
+  }
+
+  async function loadPendingReminders(): Promise<void> {
+    pendingReminders = await api.listPendingReminders();
+  }
+
+  async function completePendingReminder(item: Item): Promise<void> {
+    await completeItem(item, true);
+    await loadPendingReminders();
+  }
+
+  async function snoozePendingReminder(item: Item, minutes: number): Promise<void> {
+    busyItemId = item.id;
+    try {
+      await api.snoozeItem(item.id, minutes);
+      await Promise.all([loadItems(), loadPendingReminders()]);
+      showToast(`已在 ${minutes} 分钟后再次提醒`);
+    } finally {
+      busyItemId = '';
+    }
+  }
+
+  async function acknowledgePendingReminder(item: Item): Promise<void> {
+    busyItemId = item.id;
+    try {
+      await api.acknowledgeReminder(item.id);
+      await loadPendingReminders();
+      showToast('已确认看到，本次提醒已从中心移除');
+    } finally {
+      busyItemId = '';
+    }
+  }
+
+  async function openPendingReminder(item: Item): Promise<void> {
+    reminderCenterOpen = false;
+    await revealNotificationItem(item.id);
   }
 
   async function selectFilter(next: ItemFilter): Promise<void> {
@@ -340,14 +397,18 @@
 
   async function openSettings(): Promise<void> {
     try {
-      const [latestAutostart, latestNotifications, latestDataStatus] = await Promise.all([
+      const [latestAutostart, latestNotifications, latestDataStatus, latestSmtp, latestEmailRoutes] = await Promise.all([
         api.getAutostartStatus(),
         api.getNotificationStatus(),
         api.getDataStatus(),
+        api.getSmtpStatus(),
+        api.listEmailRouteTagIds(),
       ]);
       autostartStatus = latestAutostart;
       notificationStatus = latestNotifications;
       dataStatus = latestDataStatus;
+      smtpStatus = latestSmtp;
+      emailRouteTagIds = latestEmailRoutes;
       if (settings && latestAutostart.available) {
         settings = { ...settings, autostartEnabled: latestAutostart.enabled };
       }
@@ -360,6 +421,22 @@
   async function refreshDataStatus(): Promise<DataStatus> {
     dataStatus = await api.getDataStatus();
     return dataStatus;
+  }
+
+  async function refreshSmtpStatus(): Promise<SmtpStatus> {
+    smtpStatus = await api.getSmtpStatus();
+    return smtpStatus;
+  }
+
+  async function setEmailRoute(tagId: string, enabled: boolean): Promise<void> {
+    await api.setTagEmailRoute(tagId, enabled);
+    emailRouteTagIds = await api.listEmailRouteTagIds();
+  }
+
+  async function testSmtp(): Promise<string> {
+    const message = await api.testSmtp();
+    smtpStatus = await api.getSmtpStatus();
+    return message;
   }
 
   async function createDataBackup() {
@@ -415,6 +492,12 @@
     await api.createNotificationTestItem();
     await loadItems();
     setTimeout(() => void refreshNotificationStatus(), 12_000);
+  }
+
+  async function testReminderMode(mode: 'standard' | 'persistent' | 'overlay' | 'repeat' | 'center'): Promise<string> {
+    const message = await api.testReminderMode(mode);
+    await Promise.all([loadItems(), loadPendingReminders()]);
+    return message;
   }
 
   async function refreshNotificationStatus(): Promise<void> {
@@ -505,6 +588,10 @@
     <button class="nav-item settings-entry" on:click={() => (organizerOpen = true)}>
       <span class="nav-marker">◇</span><span>类型与标签</span>
     </button>
+    <button class="nav-item settings-entry" on:click={() => (reminderCenterOpen = true)}>
+      <span class="nav-marker">!</span><span>提醒中心</span>
+      {#if pendingReminders.length > 0}<span class="nav-count">{pendingReminders.length}</span>{/if}
+    </button>
 
     <div class="shortcut-note">
       <kbd>{navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}</kbd>
@@ -574,13 +661,20 @@
     </section>
   </main>
 
-  {#if settingsOpen && settings && notificationStatus && autostartStatus}
+  {#if settingsOpen && settings && notificationStatus && autostartStatus && smtpStatus}
     <SettingsPanel
       {settings}
       saving={settingsSaving}
       onClose={() => (settingsOpen = false)}
       onSave={saveSettings}
       onTestNotification={testNotification}
+      onTestReminderMode={testReminderMode}
+      {smtpStatus}
+      {tags}
+      {emailRouteTagIds}
+      onSetEmailRoute={setEmailRoute}
+      onTestSmtp={testSmtp}
+      onRefreshSmtpStatus={refreshSmtpStatus}
       {notificationStatus}
       onRegisterNotifications={registerNotifications}
       onUnregisterNotifications={unregisterNotifications}
@@ -617,6 +711,18 @@
       {exporting}
       onClose={() => (exportOpen = false)}
       onExport={exportExcel}
+    />
+  {/if}
+
+  {#if reminderCenterOpen}
+    <ReminderCenter
+      items={pendingReminders}
+      {busyItemId}
+      onClose={() => (reminderCenterOpen = false)}
+      onComplete={completePendingReminder}
+      onSnooze={snoozePendingReminder}
+      onAcknowledge={acknowledgePendingReminder}
+      onOpen={openPendingReminder}
     />
   {/if}
 

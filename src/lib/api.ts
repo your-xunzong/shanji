@@ -6,6 +6,7 @@ import type {
   Item,
   ItemFilter,
   NotificationStatus,
+  SmtpStatus,
   OnboardingStatus,
   Settings,
   UpdateSettingsInput,
@@ -25,6 +26,8 @@ const DRAFT_KEY = 'shanji.preview.draft';
 const ONBOARDING_KEY = 'shanji.preview.onboarding-version';
 const CATEGORIES_KEY = 'shanji.preview.categories';
 const TAGS_KEY = 'shanji.preview.tags';
+const REMINDER_ACKS_KEY = 'shanji.preview.reminder-acks';
+const EMAIL_ROUTES_KEY = 'shanji.preview.email-routes';
 const MANAGED_STATE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800];
 
 const defaultSettings: Settings = {
@@ -37,6 +40,18 @@ const defaultSettings: Settings = {
   globalShortcut: 'CommandOrControl+Shift+Space',
   notificationsEnabled: true,
   autostartEnabled: false,
+  persistentNotificationsEnabled: true,
+  overlayRemindersEnabled: false,
+  repeatUnacknowledgedEnabled: false,
+  unacknowledgedRepeatMinutes: 60,
+  smtpEnabled: false,
+  smtpHost: '',
+  smtpPort: 465,
+  smtpSecurity: 'tls',
+  smtpFrom: '',
+  smtpTo: '',
+  smtpUsername: '',
+  smtpRepeatMustComplete: false,
 };
 
 const categories: Category[] = [
@@ -301,7 +316,7 @@ export const api = {
 
   async updateSettings(input: UpdateSettingsInput): Promise<Settings> {
     if (isTauri()) return call<Settings>('update_settings', { input });
-    const { updateExistingDefaultItems: _, ...settings } = input;
+    const { updateExistingDefaultItems: _, smtpPassword: __, ...settings } = input;
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
     return settings;
   },
@@ -435,6 +450,51 @@ export const api = {
     writePreviewItems(readPreviewItems().filter((item) => item.id !== id));
   },
 
+  async listPendingReminders(): Promise<Item[]> {
+    if (isTauri()) return call<Item[]>('list_pending_reminders');
+    const acknowledged = new Set<string>(JSON.parse(localStorage.getItem(REMINDER_ACKS_KEY) ?? '[]'));
+    const now = Date.now();
+    return readPreviewItems().filter((item) => item.status === 'OPEN'
+      && !item.reminderPaused
+      && new Date(item.dueAt).getTime() <= now
+      && !acknowledged.has(item.id));
+  },
+
+  async acknowledgeReminder(id: string): Promise<Item> {
+    if (isTauri()) return call<Item>('acknowledge_reminder', { id });
+    const values = new Set<string>(JSON.parse(localStorage.getItem(REMINDER_ACKS_KEY) ?? '[]'));
+    values.add(id);
+    localStorage.setItem(REMINDER_ACKS_KEY, JSON.stringify([...values]));
+    const item = readPreviewItems().find((value) => value.id === id);
+    if (!item) throw new Error('找不到事项');
+    return item;
+  },
+
+  async snoozeItem(id: string, minutes: number): Promise<Item> {
+    if (isTauri()) return call<Item>('snooze_item', { id, minutes });
+    const items = readPreviewItems();
+    const item = items.find((value) => value.id === id);
+    if (!item) throw new Error('找不到事项');
+    item.nextReminderAt = new Date(Date.now() + minutes * 60_000).toISOString();
+    item.updatedAt = new Date().toISOString();
+    writePreviewItems(items);
+    await api.acknowledgeReminder(id);
+    return item;
+  },
+
+  async listEmailRouteTagIds(): Promise<string[]> {
+    if (isTauri()) return call<string[]>('list_email_route_tag_ids');
+    return JSON.parse(localStorage.getItem(EMAIL_ROUTES_KEY) ?? '[]');
+  },
+
+  async setTagEmailRoute(tagId: string, enabled: boolean): Promise<void> {
+    if (isTauri()) return call<void>('set_tag_email_route', { tagId, enabled });
+    const values = new Set<string>(JSON.parse(localStorage.getItem(EMAIL_ROUTES_KEY) ?? '[]'));
+    if (enabled) values.add(tagId);
+    else values.delete(tagId);
+    localStorage.setItem(EMAIL_ROUTES_KEY, JSON.stringify([...values]));
+  },
+
   async exportExcel(path: string, filter: ExportFilterInput): Promise<ExportResult> {
     if (isTauri()) return call<ExportResult>('export_excel', { path, filter });
     const items = readPreviewItems().filter((item) => {
@@ -469,6 +529,10 @@ export const api = {
 
   async showMain(): Promise<void> {
     if (isTauri()) await call<void>('show_main');
+  },
+
+  async hideReminder(): Promise<void> {
+    if (isTauri()) await call<void>('hide_reminder');
   },
 
   async getSystemWarning(): Promise<string | null> {
@@ -515,6 +579,23 @@ export const api = {
     };
   },
 
+  async getSmtpStatus(): Promise<SmtpStatus> {
+    if (isTauri()) return call<SmtpStatus>('get_smtp_status');
+    return {
+      passwordConfigured: false,
+      lastResult: null,
+      lastErrorCode: null,
+      lastAttemptAt: null,
+    };
+  },
+
+  async testSmtp(): Promise<string> {
+    if (isTauri()) return call<string>('test_smtp');
+    const settings = readPreviewSettings();
+    if (!settings.smtpEnabled) throw new Error('请先启用邮件通知并保存设置。');
+    return `浏览器预览不会连接邮件服务器；桌面版将发送到 ${settings.smtpTo}。`;
+  },
+
   async registerPortableNotifications(): Promise<NotificationStatus> {
     if (isTauri()) return call<NotificationStatus>('register_portable_notifications');
     return this.getNotificationStatus();
@@ -555,6 +636,12 @@ export const api = {
     };
     writePreviewItems([item, ...readPreviewItems()]);
     return item;
+  },
+
+  async testReminderMode(mode: 'standard' | 'persistent' | 'overlay' | 'repeat' | 'center'): Promise<string> {
+    if (isTauri()) return call<string>('test_reminder_mode', { mode });
+    if (mode === 'overlay') return '置顶提醒窗测试需要在桌面版中查看。';
+    return `${mode} 测试已准备。`;
   },
 
   async getDataStatus(): Promise<DataStatus> {
