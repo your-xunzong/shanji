@@ -1,10 +1,20 @@
 param(
-    [string]$Version = "0.5.0"
+    [string]$Version
 )
 
 $ErrorActionPreference = "Stop"
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+$tauriConfigPath = Join-Path $repositoryRoot "src-tauri\tauri.conf.json"
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = (Get-Content -LiteralPath $tauriConfigPath -Raw | ConvertFrom-Json).version
+}
+
+if ($Version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+    throw "Invalid application version in packaging configuration."
+}
+
 $sourceExecutable = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot "src-tauri\target\release\shanji.exe"))
 $artifactRoot = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot "artifacts"))
 $portableDirectory = [System.IO.Path]::GetFullPath((Join-Path $artifactRoot "shanji-$Version-windows-x64-portable"))

@@ -125,6 +125,7 @@
 - 安装依赖：`pnpm install`
 - 前端开发：`pnpm dev`
 - 前端类型检查：`pnpm check`
+- 版本一致性检查：`pnpm version:check`
 - 前端测试：`pnpm test`
 - 前端生产构建：`pnpm build`
 - 桌面开发：`pnpm tauri dev`

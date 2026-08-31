@@ -28,7 +28,7 @@
 - Svelte 管理页、快速录入、设置抽屉、IME 组合态保护和浏览器预览后端。
 - Windows NSIS 安装包与 ZIP 便携包。
 
-Windows 已完成真实编译和启动验证。macOS、Linux 共用领域与数据逻辑，但全局快捷键、托盘、通知和分发仍需在真实设备验证。
+Windows 已完成真实编译和启动验证。macOS、Linux 共用领域与数据逻辑，并已配置对应系统的自动打包；全局快捷键、托盘、通知和分发仍需在真实设备验证。
 
 ## 开发环境
 
@@ -45,6 +45,7 @@ Windows 若普通终端找不到 `link.exe`，请从 “Developer PowerShell for
 pnpm install
 pnpm dev
 pnpm check
+pnpm version:check
 pnpm test
 pnpm build
 pnpm tauri dev
@@ -76,6 +77,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1
 
 - `src-tauri/target/release/bundle/nsis/`
 - `artifacts/`
+
+## 跨平台测试包
+
+仓库的“跨平台测试构建”工作流会在对应系统生成：
+
+- Windows x64：NSIS 安装包、ZIP 便携包；
+- macOS：兼容 Apple Silicon 与 Intel 的通用 DMG；
+- Linux x64：AppImage、DEB。
+
+手动运行工作流只生成可下载的临时构建产物；推送 `v*` 标签时才创建草稿预发布，并附带 `SHA256SUMS.txt`。未配置 Apple Developer 和 Windows 代码签名凭据时，安装过程可能出现系统安全提示。这些包只用于测试，需在对应真实设备完成验证后再转为正式发布。
 
 ## 本地数据
 

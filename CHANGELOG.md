@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- 新增 Windows、macOS、Linux 的可复现测试构建流水线：Windows x64 生成 NSIS 与便携 ZIP，macOS 生成 Apple Silicon/Intel 通用 DMG，Linux x64 生成 AppImage 与 DEB。
+- 跨平台测试发布附带 SHA-256 校验文件，并默认保持为草稿预发布，等待真实设备验收。
+
+### Changed
+
+- 便携包脚本默认从应用配置读取版本，避免版本升级后错误沿用旧文件名。
+
+### Platform
+
+- macOS 在未配置 Apple Developer 凭据时使用临时签名，仅作为测试包；Windows 当前也未配置发布者证书。
+- macOS 和 Linux 的快捷键、托盘、通知、休眠恢复与开机启动仍需真实设备验证，通过前不得标为正式支持。
+
 ## [0.5.0] - 2026-08-29
 
 ### Added

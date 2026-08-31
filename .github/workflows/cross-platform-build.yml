@@ -1,0 +1,222 @@
+name: 跨平台测试构建
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: 代码与测试检查
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 获取源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Linux 构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl file libayatana-appindicator3-dev libsecret-1-dev \
+            librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev wget
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 核对应用版本与标签
+        run: pnpm version:check
+
+      - name: 前端检查与测试
+        run: |
+          pnpm check
+          pnpm test
+          pnpm build
+
+      - name: Rust 检查与测试
+        working-directory: src-tauri
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-features
+
+  build:
+    name: 构建 ${{ matrix.name }}
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            args: --bundles nsis
+            artifact: shanji-windows-x64
+            apple_signing_identity: ""
+          - name: macOS Universal
+            os: macos-latest
+            args: --target universal-apple-darwin --bundles dmg
+            artifact: shanji-macos-universal
+            apple_signing_identity: "-"
+          - name: Linux x64
+            os: ubuntu-22.04
+            args: --bundles appimage,deb
+            artifact: shanji-linux-x64
+            apple_signing_identity: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: 获取源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Linux 构建依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl file libayatana-appindicator3-dev libsecret-1-dev \
+            librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev wget
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装 macOS 通用目标
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 核对应用版本与标签
+        run: pnpm version:check
+
+      - name: 生成安装包
+        uses: tauri-apps/tauri-action@v0
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ matrix.apple_signing_identity }}
+        with:
+          args: ${{ matrix.args }}
+
+      - name: 生成 Windows 便携包
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/package-portable.ps1
+
+      - name: 汇集 Windows 安装包
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $taskConfig = Get-Content -LiteralPath src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $taskVersion = $taskConfig.version
+          $taskInstaller = "src-tauri/target/release/bundle/nsis/$($taskConfig.productName)_$($taskVersion)_x64-setup.exe"
+          $taskPortable = "artifacts/shanji-$($taskVersion)-windows-x64-portable.zip"
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item -LiteralPath $taskInstaller -Destination "release-assets/shanji-$($taskVersion)-windows-x64-setup.exe"
+          Copy-Item -LiteralPath $taskPortable -Destination release-assets
+
+      - name: 汇集 macOS 安装包
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          task_version="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json', 'utf8')).version")"
+          task_dmg="$(find src-tauri/target -type f -path '*/release/bundle/dmg/*.dmg' -print -quit)"
+          test -n "$task_dmg"
+          mkdir -p release-assets
+          cp "$task_dmg" "release-assets/shanji-$task_version-macos-universal.dmg"
+
+      - name: 汇集 Linux 安装包
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          task_version="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json', 'utf8')).version")"
+          task_appimage="$(find src-tauri/target -type f -path '*/release/bundle/appimage/*.AppImage' -print -quit)"
+          task_deb="$(find src-tauri/target -type f -path '*/release/bundle/deb/*.deb' -print -quit)"
+          test -n "$task_appimage"
+          test -n "$task_deb"
+          mkdir -p release-assets
+          cp "$task_appimage" "release-assets/shanji-$task_version-linux-x64.AppImage"
+          cp "$task_deb" "release-assets/shanji-$task_version-linux-x64.deb"
+
+      - name: 核对本平台安装包
+        shell: bash
+        run: |
+          test -n "$(find release-assets -maxdepth 1 -type f -print -quit)"
+          ls -lh release-assets
+
+      - name: 保存本平台安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish-test-release:
+    name: 创建草稿预发布
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: 获取源码
+        uses: actions/checkout@v4
+
+      - name: 下载全部安装包
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shanji-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: 生成 SHA-256 校验文件
+        run: |
+          cd release-assets
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS.txt
+          test -s SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 创建或更新草稿预发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --draft --prerelease \
+              --title "闪记 $GITHUB_REF_NAME（跨平台测试版）" \
+              --notes-file .github/release-notes-test.md
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --draft --prerelease \
+              --title "闪记 $GITHUB_REF_NAME（跨平台测试版）" \
+              --notes-file .github/release-notes-test.md
+          fi

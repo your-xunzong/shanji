@@ -3697,7 +3697,7 @@ dependencies = [
 
 [[package]]
 name = "shanji"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "chrono",
  "keyring",
