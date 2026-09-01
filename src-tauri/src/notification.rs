@@ -1,7 +1,9 @@
 use std::{fs, path::PathBuf};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::AppHandle;
+#[cfg(windows)]
+use tauri::{Emitter, Manager};
 
 use crate::{
     db::{ClassificationNotification, DueNotification},
@@ -42,6 +44,7 @@ pub struct NotificationStatus {
 pub struct NotificationService {
     app: AppHandle,
     portable: bool,
+    #[cfg(windows)]
     icon_path: PathBuf,
 }
 
@@ -57,6 +60,7 @@ impl NotificationService {
         let service = Self {
             app,
             portable,
+            #[cfg(windows)]
             icon_path,
         };
 

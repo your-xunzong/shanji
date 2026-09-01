@@ -68,6 +68,8 @@ pub struct DueNotification {
 #[derive(Debug, Clone)]
 pub struct ClassificationNotification {
     pub event_ids: Vec<String>,
+    // Only Windows native notification actions carry a single item target.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub item_id: Option<String>,
     pub count: usize,
 }
@@ -640,6 +642,8 @@ impl Database {
         self.get_item(id)
     }
 
+    // Invoked by Windows native notification actions; other platforms open the app instead.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn snooze_classification(
         &self,
         item_id: Option<&str>,
