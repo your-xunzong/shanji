@@ -136,10 +136,13 @@ jobs:
         run: |
           $taskConfig = Get-Content -LiteralPath src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
           $taskVersion = $taskConfig.version
-          $taskInstaller = "src-tauri/target/release/bundle/nsis/$($taskConfig.productName)_$($taskVersion)_x64-setup.exe"
+          $taskInstallers = @(Get-ChildItem -LiteralPath src-tauri/target/release/bundle/nsis -Filter '*.exe' -File)
+          if ($taskInstallers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($taskInstallers.Count)."
+          }
           $taskPortable = "artifacts/shanji-$($taskVersion)-windows-x64-portable.zip"
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          Copy-Item -LiteralPath $taskInstaller -Destination "release-assets/shanji-$($taskVersion)-windows-x64-setup.exe"
+          Copy-Item -LiteralPath $taskInstallers[0].FullName -Destination "release-assets/shanji-$($taskVersion)-windows-x64-setup.exe"
           Copy-Item -LiteralPath $taskPortable -Destination release-assets
 
       - name: 汇集 macOS 安装包
