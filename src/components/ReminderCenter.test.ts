@@ -12,6 +12,9 @@ const item: Item = {
   nextReminderAt: '2026-08-29T10:30:00.000Z', reminderPaused: false,
   bypassAppQuietHours: true, createdAt: '2026-08-29T09:00:00.000Z',
   updatedAt: '2026-08-29T10:00:00.000Z', completedAt: null, deletedAt: null,
+  eventKind: 'TODAY_MUST', reminderPlan: 'EMPHASIS', important: true, timeMode: 'SPECIFIED',
+  startAt: null, endAt: null, targetAt: null, leadValue: null, leadUnit: null,
+  cadenceValue: null, cadenceUnit: null, emphasisMaxPerDay: 8,
   tags: [],
 };
 

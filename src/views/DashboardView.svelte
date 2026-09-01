@@ -24,6 +24,7 @@
     TaxonomyInput,
     UpdateItemInput,
     ExportFilterInput,
+    AppInfo,
   } from '../lib/types';
 
   let items: Item[] = [];
@@ -43,6 +44,7 @@
   let dataStatus: DataStatus | null = null;
   let categories: Category[] = [];
   let tags: Tag[] = [];
+  let appInfo: AppInfo | null = null;
   let organizerOpen = false;
   let exporting = false;
   let exportOpen = false;
@@ -55,6 +57,9 @@
   let pendingReminders: Item[] = [];
   let reminderCenterOpen = false;
   let emailRouteTagIds: string[] = [];
+  let unlistenClassification: (() => void) | undefined;
+  let pendingTypeCount = 0;
+  let editingItemId = '';
 
   const navItems: { id: ItemFilter; label: string; marker: string }[] = [
     { id: 'open', label: '待处理', marker: '○' },
@@ -85,6 +90,9 @@
           reminderCenterOpen = true;
           void loadPendingReminders();
         });
+        unlistenClassification = await listen<string>('classification_opened', ({ payload }) => {
+          void revealClassification(payload);
+        });
       });
     }
 
@@ -96,6 +104,7 @@
       unlistenNotification?.();
       unlistenReminderCenter?.();
       unlistenOpenReminderCenter?.();
+      unlistenClassification?.();
       if (toastTimer) clearTimeout(toastTimer);
     };
   });
@@ -105,6 +114,7 @@
     error = '';
     try {
       const [
+        loadedAppInfo,
         loadedSettings,
         loadedNotificationStatus,
         loadedAutostartStatus,
@@ -115,6 +125,7 @@
         loadedTags,
         loadedPendingReminders,
       ] = await Promise.all([
+        api.getAppInfo(),
         api.getSettings(),
         api.getNotificationStatus(),
         api.getAutostartStatus(),
@@ -125,6 +136,7 @@
         api.listTags(),
         api.listPendingReminders(),
       ]);
+      appInfo = loadedAppInfo;
       if (loadedAutostartStatus.available) {
         loadedSettings.autostartEnabled = loadedAutostartStatus.enabled;
       }
@@ -150,7 +162,10 @@
   }
 
   async function loadItems(): Promise<void> {
-    items = await api.listItems(filter);
+    const loaded = await api.listItems(filter);
+    items = loaded;
+    const openItems = filter === 'open' ? loaded : await api.listItems('open');
+    pendingTypeCount = openItems.filter((item) => !item.eventKind).length;
   }
 
   async function loadPendingReminders(): Promise<void> {
@@ -202,6 +217,8 @@
   }
 
   async function completeItem(item: Item, completed: boolean): Promise<void> {
+    if (completed && (item.eventKind === 'MONTHLY' || item.eventKind === 'YEARLY')
+      && !window.confirm(`结束“${item.title}”的整个系列吗？以后将不再生成提醒。`)) return;
     busyItemId = item.id;
     error = '';
     try {
@@ -249,6 +266,7 @@
     error = '';
     try {
       await api.updateItem(item.id, input);
+      editingItemId = '';
       await loadItems();
       showToast('事项修改已保存');
     } catch (cause) {
@@ -353,6 +371,19 @@
   async function moveTag(id: string, direction: 'up' | 'down'): Promise<void> {
     await api.moveTag(id, direction);
     await refreshTaxonomies();
+  }
+
+  async function completeOccurrence(item: Item): Promise<void> {
+    busyItemId = item.id;
+    try {
+      await api.completeSeriesOccurrence(item.id);
+      await Promise.all([loadItems(), loadPendingReminders()]);
+      showToast('本次已完成，后续周期仍会继续');
+    } catch (cause) {
+      error = readableError(cause, '本次完成状态没有保存。');
+    } finally {
+      busyItemId = '';
+    }
   }
 
   async function exportExcel(filter: ExportFilterInput): Promise<void> {
@@ -532,6 +563,23 @@
     }
   }
 
+  async function revealClassification(id: string): Promise<void> {
+    try {
+      filter = 'all';
+      editingItemId = id;
+      await loadItems();
+      await tick();
+      if (id) {
+        document.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(id)}"]`)?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'center',
+        });
+      }
+    } catch (cause) {
+      error = readableError(cause, '待选择事件类型的记录暂时无法打开。');
+    }
+  }
+
   function showToast(message: string, duration = 2600): void {
     if (toastTimer) clearTimeout(toastTimer);
     toast = message;
@@ -586,7 +634,7 @@
       <span>后台设置</span>
     </button>
     <button class="nav-item settings-entry" on:click={() => (organizerOpen = true)}>
-      <span class="nav-marker">◇</span><span>类型与标签</span>
+      <span class="nav-marker">◇</span><span>整理方式</span>
     </button>
     <button class="nav-item settings-entry" on:click={() => (reminderCenterOpen = true)}>
       <span class="nav-marker">!</span><span>提醒中心</span>
@@ -625,6 +673,13 @@
       </div>
     {/if}
 
+    {#if pendingTypeCount > 0}
+      <button class="classification-banner" on:click={() => revealClassification('')}>
+        <span><strong>{pendingTypeCount} 条记录待选择事件类型</strong><small>记录已经保存，可以在后台集中整理。</small></span>
+        <b>现在处理 →</b>
+      </button>
+    {/if}
+
     <section class="item-stream" aria-live="polite" aria-busy={loading}>
       {#if loading}
         <div class="loading-list" aria-label="正在读取事项">
@@ -655,6 +710,8 @@
             onUpdate={updateItem}
             onDelete={deleteItem}
             onPermanentDelete={permanentlyDeleteItem}
+            onCompleteOccurrence={completeOccurrence}
+            openEditor={editingItemId === item.id}
           />
         {/each}
       {/if}
@@ -685,6 +742,7 @@
       onCreateBackup={createDataBackup}
       onOpenDataDirectory={openDataDirectory}
       onRestoreDatabase={restoreDatabase}
+      {appInfo}
     />
   {/if}
 

@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { Category, ExportFilterInput, Tag } from '../lib/types';
+  import { EVENT_KIND_OPTIONS } from '../lib/presentation';
+  import type { Category, EventKind, ExportFilterInput, Tag } from '../lib/types';
 
   export let categories: Category[];
   export let tags: Tag[];
@@ -8,6 +9,7 @@
   export let onExport: (filter: ExportFilterInput) => Promise<void>;
 
   let status: ExportFilterInput['status'] = 'all';
+  let eventKind: EventKind | '' = '';
   let categoryId = '';
   let tagId = '';
   let createdFrom = '';
@@ -28,6 +30,7 @@
     error = '';
     await onExport({
       status,
+      eventKind: eventKind || null,
       categoryId: categoryId || null,
       tagId: tagId || null,
       createdFrom: localBoundary(createdFrom, false),
@@ -46,12 +49,12 @@
   </header>
 
   <div class="export-content">
-    <p class="panel-intro">选择需要的事项。报表包含事项明细和类型汇总，不会修改现有数据。</p>
+    <p class="panel-intro">选择需要的事项。报表分别保留事件类型、类型和标签，不会修改现有数据。</p>
     <div class="export-grid">
       <label><span>事项状态</span><select bind:value={status}><option value="all">全部（不含回收站）</option><option value="open">待处理</option><option value="done">已完成</option></select></label>
-      <label><span>类型</span><select bind:value={categoryId}><option value="">全部类型</option><option value="__inbox__">收件箱</option>{#each categories as category}<option value={category.id}>{category.name}</option>{/each}</select></label>
+      <label><span>事件类型</span><select bind:value={eventKind}><option value="">全部事件类型</option>{#each EVENT_KIND_OPTIONS as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
+      <label><span>类型</span><select bind:value={categoryId}><option value="">全部类型</option>{#each categories as category}<option value={category.id}>{category.name}</option>{/each}</select></label>
       <label><span>标签</span><select bind:value={tagId}><option value="">全部标签</option>{#each tags as tag}<option value={tag.id}>{tag.name}</option>{/each}</select></label>
-      <div></div>
       <label><span>创建日期从</span><input type="date" bind:value={createdFrom} /></label>
       <label><span>到</span><input type="date" bind:value={createdTo} /></label>
     </div>

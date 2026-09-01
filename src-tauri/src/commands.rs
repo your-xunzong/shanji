@@ -10,8 +10,8 @@ use crate::{
     AppState, candidate_database_paths,
     db::{DataFileSummary, DataStatus, Database},
     domain::{
-        Category, CreateItemInput, Item, Settings, Tag, TaxonomyInput, UpdateItemInput,
-        UpdateSettingsInput,
+        Category, CreateItemInput, EventConfigurationInput, Item, Settings, Tag, TaxonomyInput,
+        UpdateItemInput, UpdateSettingsInput,
     },
     error::AppResult,
     export::{ExportFilterInput, export_items, filter_items},
@@ -44,6 +44,23 @@ pub struct SmtpStatus {
     pub last_result: Option<String>,
     pub last_error_code: Option<String>,
     pub last_attempt_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppInfo {
+    pub name: String,
+    pub version: String,
+    pub copyright: String,
+}
+
+#[tauri::command]
+pub fn get_app_info() -> AppInfo {
+    AppInfo {
+        name: "闪记".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        copyright: "© 2026 闪记".into(),
+    }
 }
 
 #[tauri::command]
@@ -79,6 +96,38 @@ pub fn set_item_completed(
     state.scheduler.wake();
     crate::update_tray_reminder_count(&app, &state.database, now);
     let _ = app.emit("reminder_center_changed", ());
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn classify_item_as_ordinary(
+    id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Item, String> {
+    let item = state
+        .database
+        .classify_as_ordinary(&id, state.clock.now_utc())
+        .map_err(String::from)?;
+    state.scheduler.wake();
+    let _ = app.emit("items_changed", ());
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn complete_series_occurrence(
+    id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Item, String> {
+    let now = state.clock.now_utc();
+    let item = state
+        .database
+        .complete_series_occurrence(&id, now)
+        .map_err(String::from)?;
+    crate::update_tray_reminder_count(&app, &state.database, now);
+    let _ = app.emit("reminder_center_changed", ());
+    let _ = app.emit("items_changed", ());
     Ok(item)
 }
 
@@ -690,6 +739,8 @@ pub fn test_reminder_mode(
                 due_local_date: item.due_local_date,
                 due_local_time: item.due_local_time,
                 completion_policy: "MUST_COMPLETE_TODAY".into(),
+                event_kind: Some("TODAY_MUST".into()),
+                reminder_plan: "FORCE".into(),
                 tag_ids: Vec::new(),
             };
             let service = Arc::clone(&state.notifications);
@@ -712,6 +763,8 @@ pub fn test_reminder_mode(
                 due_local_date: item.due_local_date,
                 due_local_time: item.due_local_time,
                 completion_policy: item.completion_policy,
+                event_kind: item.event_kind,
+                reminder_plan: item.reminder_plan,
                 tag_ids: Vec::new(),
             };
             crate::show_overlay_reminder(&app, &notification).map_err(String::from)?;
@@ -729,6 +782,7 @@ pub fn test_reminder_mode(
                         must_complete_today: true,
                         repeat_interval_minutes: Some(15),
                         tag_ids: Vec::new(),
+                        event: None,
                     },
                     now,
                 )
@@ -751,6 +805,7 @@ pub fn test_reminder_mode(
                         must_complete_today: false,
                         repeat_interval_minutes: None,
                         tag_ids: Vec::new(),
+                        event: None,
                     },
                     now,
                 )
@@ -827,6 +882,19 @@ pub(crate) fn insert_notification_test_item(
             must_complete_today: false,
             repeat_interval_minutes: None,
             tag_ids: Vec::new(),
+            event: Some(EventConfigurationInput {
+                kind: Some("ONE_TIME".into()),
+                reminder_plan: Some("ONCE".into()),
+                important: false,
+                start_at: None,
+                end_at: None,
+                target_at: None,
+                lead_value: None,
+                lead_unit: None,
+                cadence_value: None,
+                cadence_unit: None,
+                emphasis_max_per_day: None,
+            }),
         },
         now,
     )

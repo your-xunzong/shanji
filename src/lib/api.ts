@@ -17,6 +17,8 @@ import type {
   UpdateItemInput,
   ExportResult,
   ExportFilterInput,
+  AppInfo,
+  EventKind,
 } from './types';
 import { localDateKey } from './presentation';
 
@@ -52,6 +54,15 @@ const defaultSettings: Settings = {
   smtpTo: '',
   smtpUsername: '',
   smtpRepeatMustComplete: false,
+  eventKindDefaults: [
+    { eventKind: 'ORDINARY', reminderPlan: 'REPEAT' },
+    { eventKind: 'ONE_TIME', reminderPlan: 'ONCE' },
+    { eventKind: 'TODAY_MUST', reminderPlan: 'EMPHASIS' },
+    { eventKind: 'WARNING', reminderPlan: 'REPEAT' },
+    { eventKind: 'CONTINUOUS', reminderPlan: 'CUSTOM' },
+    { eventKind: 'MONTHLY', reminderPlan: 'ONCE' },
+    { eventKind: 'YEARLY', reminderPlan: 'ONCE' },
+  ],
 };
 
 const categories: Category[] = [
@@ -108,6 +119,22 @@ function readPreviewItems(): Item[] {
     return (JSON.parse(saved) as Item[]).map((item) => ({
       ...item,
       deletedAt: item.deletedAt ?? null,
+      eventKind: Object.hasOwn(item, 'eventKind')
+        ? item.eventKind
+        : item.completionPolicy === 'MUST_COMPLETE_TODAY'
+          ? 'TODAY_MUST'
+          : null,
+      reminderPlan: item.reminderPlan ?? (item.completionPolicy === 'MUST_COMPLETE_TODAY' ? 'EMPHASIS' : 'ONCE'),
+      important: item.important ?? false,
+      timeMode: item.timeMode ?? (item.dueSource === 'EXPLICIT' ? 'SPECIFIED' : 'DEFAULT'),
+      startAt: item.startAt ?? null,
+      endAt: item.endAt ?? null,
+      targetAt: item.targetAt ?? null,
+      leadValue: item.leadValue ?? null,
+      leadUnit: item.leadUnit ?? null,
+      cadenceValue: item.cadenceValue ?? null,
+      cadenceUnit: item.cadenceUnit ?? null,
+      emphasisMaxPerDay: item.emphasisMaxPerDay ?? 8,
       tags: Array.isArray(item.tags) ? item.tags : [],
     }));
   }
@@ -137,6 +164,18 @@ function readPreviewItems(): Item[] {
       updatedAt: now,
       completedAt: null,
       deletedAt: null,
+      eventKind: 'ORDINARY',
+      reminderPlan: 'REPEAT',
+      important: false,
+      timeMode: 'DEFAULT',
+      startAt: null,
+      endAt: null,
+      targetAt: null,
+      leadValue: null,
+      leadUnit: null,
+      cadenceValue: null,
+      cadenceUnit: null,
+      emphasisMaxPerDay: 8,
       tags: [],
     },
     {
@@ -161,6 +200,18 @@ function readPreviewItems(): Item[] {
       updatedAt: now,
       completedAt: null,
       deletedAt: null,
+      eventKind: 'TODAY_MUST',
+      reminderPlan: 'EMPHASIS',
+      important: true,
+      timeMode: 'SPECIFIED',
+      startAt: null,
+      endAt: null,
+      targetAt: null,
+      leadValue: null,
+      leadUnit: null,
+      cadenceValue: null,
+      cadenceUnit: null,
+      emphasisMaxPerDay: 8,
       tags: [],
     },
   ];
@@ -217,6 +268,11 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
 }
 
 export const api = {
+  async getAppInfo(): Promise<AppInfo> {
+    if (isTauri()) return call<AppInfo>('get_app_info');
+    return { name: '闪记', version: '0.6.0', copyright: '© 2026 闪记' };
+  },
+
   async listItems(filter: ItemFilter = 'open'): Promise<Item[]> {
     if (isTauri()) return call<Item[]>('list_items', { filter });
     return previewFilter(readPreviewItems(), filter).sort(
@@ -229,10 +285,19 @@ export const api = {
 
     const settings = readPreviewSettings();
     const now = new Date();
-    const dueAt = input.dueAt ?? (input.mustCompleteToday
+    const eventKind = input.event?.kind ?? (input.mustCompleteToday ? 'TODAY_MUST' : null);
+    const configuredTime = eventKind === 'WARNING'
+      ? input.event?.targetAt
+      : eventKind === 'CONTINUOUS'
+        ? input.event?.startAt
+        : input.dueAt;
+    const dueAt = configuredTime ?? (eventKind === 'TODAY_MUST'
       ? mustCompleteIsoAt(settings, now)
       : localIsoAt(settings.defaultDueTime, now.getHours() >= Number(settings.defaultDueTime.slice(0, 2)) ? 1 : 0));
     const due = new Date(dueAt);
+    const reminderPlan = input.event?.reminderPlan
+      ?? settings.eventKindDefaults.find((entry) => entry.eventKind === eventKind)?.reminderPlan
+      ?? 'REPEAT';
     const item: Item = {
       id: crypto.randomUUID(),
       title: input.title.trim(),
@@ -243,11 +308,11 @@ export const api = {
       dueAt,
       dueLocalDate: localDateKey(due),
       dueLocalTime: localTime(due),
-      dueSource: input.dueAt ? 'EXPLICIT' : 'DEFAULT_EOD',
-      rolloverPolicy: input.mustCompleteToday ? 'NONE' : 'NEXT_WORKDAY_EOD',
+      dueSource: configuredTime ? 'EXPLICIT' : 'DEFAULT_EOD',
+      rolloverPolicy: eventKind || reminderPlan !== 'ONCE' ? 'NONE' : 'NEXT_WORKDAY_EOD',
       rolloverCount: 0,
-      completionPolicy: input.mustCompleteToday ? 'MUST_COMPLETE_TODAY' : 'NORMAL',
-      repeatIntervalMinutes: input.mustCompleteToday
+      completionPolicy: eventKind === 'TODAY_MUST' ? 'MUST_COMPLETE_TODAY' : 'NORMAL',
+      repeatIntervalMinutes: reminderPlan === 'EMPHASIS' || reminderPlan === 'FORCE'
         ? input.repeatIntervalMinutes ?? settings.overtimeIntervalMinutes
         : null,
       nextReminderAt: dueAt,
@@ -257,6 +322,18 @@ export const api = {
       updatedAt: now.toISOString(),
       completedAt: null,
       deletedAt: null,
+      eventKind,
+      reminderPlan,
+      important: input.event?.important ?? false,
+      timeMode: configuredTime ? 'SPECIFIED' : 'DEFAULT',
+      startAt: input.event?.startAt ?? null,
+      endAt: input.event?.endAt ?? null,
+      targetAt: input.event?.targetAt ?? null,
+      leadValue: input.event?.leadValue ?? null,
+      leadUnit: input.event?.leadUnit ?? null,
+      cadenceValue: input.event?.cadenceValue ?? null,
+      cadenceUnit: input.event?.cadenceUnit ?? null,
+      emphasisMaxPerDay: input.event?.emphasisMaxPerDay ?? 8,
       tags: readPreviewTags().filter((tag) => input.tagIds?.includes(tag.id)),
     };
     writePreviewItems([item, ...readPreviewItems()]);
@@ -274,6 +351,26 @@ export const api = {
     target.nextReminderAt = completed ? null : target.dueAt;
     target.updatedAt = new Date().toISOString();
     writePreviewItems(items);
+    return target;
+  },
+
+  async classifyItemAsOrdinary(id: string): Promise<Item> {
+    if (isTauri()) return call<Item>('classify_item_as_ordinary', { id });
+    const items = readPreviewItems();
+    const target = items.find((item) => item.id === id);
+    if (!target) throw new Error('事项不存在');
+    target.eventKind = 'ORDINARY';
+    target.reminderPlan = readPreviewSettings().eventKindDefaults
+      .find((entry) => entry.eventKind === 'ORDINARY')?.reminderPlan ?? 'REPEAT';
+    target.updatedAt = new Date().toISOString();
+    writePreviewItems(items);
+    return target;
+  },
+
+  async completeSeriesOccurrence(id: string): Promise<Item> {
+    if (isTauri()) return call<Item>('complete_series_occurrence', { id });
+    const target = readPreviewItems().find((item) => item.id === id);
+    if (!target) throw new Error('事项不存在');
     return target;
   },
 
@@ -425,8 +522,24 @@ export const api = {
     item.dueLocalTime = localTime(due);
     item.dueSource = 'EXPLICIT';
     item.rolloverPolicy = 'NONE';
-    item.completionPolicy = input.mustCompleteToday ? 'MUST_COMPLETE_TODAY' : 'NORMAL';
-    item.repeatIntervalMinutes = input.mustCompleteToday ? input.repeatIntervalMinutes ?? 30 : null;
+    item.eventKind = input.event?.kind ?? (input.mustCompleteToday ? 'TODAY_MUST' : null);
+    item.reminderPlan = input.event?.reminderPlan
+      ?? readPreviewSettings().eventKindDefaults.find((entry) => entry.eventKind === item.eventKind)?.reminderPlan
+      ?? 'ONCE';
+    item.important = input.event?.important ?? false;
+    item.timeMode = 'SPECIFIED';
+    item.startAt = input.event?.startAt ?? null;
+    item.endAt = input.event?.endAt ?? null;
+    item.targetAt = input.event?.targetAt ?? null;
+    item.leadValue = input.event?.leadValue ?? null;
+    item.leadUnit = input.event?.leadUnit ?? null;
+    item.cadenceValue = input.event?.cadenceValue ?? null;
+    item.cadenceUnit = input.event?.cadenceUnit ?? null;
+    item.emphasisMaxPerDay = input.event?.emphasisMaxPerDay ?? 8;
+    item.completionPolicy = item.eventKind === 'TODAY_MUST' ? 'MUST_COMPLETE_TODAY' : 'NORMAL';
+    item.repeatIntervalMinutes = item.reminderPlan === 'EMPHASIS' || item.reminderPlan === 'FORCE'
+      ? input.repeatIntervalMinutes ?? 30
+      : null;
     item.nextReminderAt = item.status === 'OPEN' ? due.toISOString() : null;
     item.updatedAt = new Date().toISOString();
     writePreviewItems(items);
@@ -500,7 +613,8 @@ export const api = {
     const items = readPreviewItems().filter((item) => {
       const created = new Date(item.createdAt).getTime();
       return (filter.status === 'all' || item.status === filter.status.toUpperCase())
-        && (!filter.categoryId || (filter.categoryId === '__inbox__' ? !item.categoryId : item.categoryId === filter.categoryId))
+        && (!filter.eventKind || item.eventKind === filter.eventKind)
+        && (!filter.categoryId || item.categoryId === filter.categoryId)
         && (!filter.tagId || item.tags.some((tag) => tag.id === filter.tagId))
         && (!filter.createdFrom || created >= new Date(filter.createdFrom).getTime())
         && (!filter.createdTo || created <= new Date(filter.createdTo).getTime())
@@ -632,6 +746,18 @@ export const api = {
       updatedAt: now.toISOString(),
       completedAt: null,
       deletedAt: null,
+      eventKind: 'ONE_TIME',
+      reminderPlan: 'ONCE',
+      important: false,
+      timeMode: 'SPECIFIED',
+      startAt: null,
+      endAt: null,
+      targetAt: null,
+      leadValue: null,
+      leadUnit: null,
+      cadenceValue: null,
+      cadenceUnit: null,
+      emphasisMaxPerDay: 8,
       tags: [],
     };
     writePreviewItems([item, ...readPreviewItems()]);
@@ -651,7 +777,7 @@ export const api = {
       current: {
         path: '浏览器预览数据',
         itemCount: items.length,
-        schemaVersion: 4,
+        schemaVersion: 6,
         updatedAt: new Date().toISOString(),
       },
       latestBackup: null,
@@ -664,7 +790,7 @@ export const api = {
     return {
       path: '浏览器预览不创建文件备份',
       itemCount: readPreviewItems().length,
-      schemaVersion: 4,
+      schemaVersion: 6,
       updatedAt: new Date().toISOString(),
     };
   },

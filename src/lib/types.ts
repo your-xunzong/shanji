@@ -2,6 +2,28 @@ export type ItemStatus = 'OPEN' | 'DONE' | 'ARCHIVED' | 'DELETED';
 export type DueSource = 'EXPLICIT' | 'DEFAULT_EOD' | 'ROLLED_OVER';
 export type CompletionPolicy = 'NORMAL' | 'MUST_COMPLETE_TODAY';
 export type ItemFilter = 'open' | 'today' | 'overdue' | 'done' | 'deleted' | 'all';
+export type EventKind = 'ORDINARY' | 'ONE_TIME' | 'TODAY_MUST' | 'WARNING' | 'CONTINUOUS' | 'MONTHLY' | 'YEARLY';
+export type ReminderPlan = 'REPEAT' | 'EMPHASIS' | 'ONCE' | 'FORCE' | 'CUSTOM';
+export type ScheduleUnit = 'DAY' | 'WEEK' | 'MONTH' | 'YEAR';
+
+export interface EventKindDefault {
+  eventKind: EventKind;
+  reminderPlan: ReminderPlan;
+}
+
+export interface EventConfigurationInput {
+  kind: EventKind | null;
+  reminderPlan: ReminderPlan | null;
+  important: boolean;
+  startAt: string | null;
+  endAt: string | null;
+  targetAt: string | null;
+  leadValue: number | null;
+  leadUnit: ScheduleUnit | null;
+  cadenceValue: number | null;
+  cadenceUnit: ScheduleUnit | null;
+  emphasisMaxPerDay: number | null;
+}
 
 export interface Item {
   id: string;
@@ -25,6 +47,18 @@ export interface Item {
   updatedAt: string;
   completedAt: string | null;
   deletedAt: string | null;
+  eventKind: EventKind | null;
+  reminderPlan: ReminderPlan;
+  important: boolean;
+  timeMode: 'DEFAULT' | 'SPECIFIED';
+  startAt: string | null;
+  endAt: string | null;
+  targetAt: string | null;
+  leadValue: number | null;
+  leadUnit: ScheduleUnit | null;
+  cadenceValue: number | null;
+  cadenceUnit: ScheduleUnit | null;
+  emphasisMaxPerDay: number;
   tags: Tag[];
 }
 
@@ -50,6 +84,7 @@ export interface Settings {
   smtpTo: string;
   smtpUsername: string;
   smtpRepeatMustComplete: boolean;
+  eventKindDefaults: EventKindDefault[];
 }
 
 export interface CreateItemInput {
@@ -60,6 +95,7 @@ export interface CreateItemInput {
   mustCompleteToday: boolean;
   repeatIntervalMinutes?: number | null;
   tagIds?: string[];
+  event?: EventConfigurationInput | null;
 }
 
 export interface UpdateItemInput {
@@ -70,6 +106,7 @@ export interface UpdateItemInput {
   dueAt: string;
   mustCompleteToday: boolean;
   repeatIntervalMinutes: number | null;
+  event?: EventConfigurationInput | null;
 }
 
 export interface UpdateSettingsInput extends Settings {
@@ -84,7 +121,15 @@ export interface DueNotification {
   dueLocalDate: string;
   dueLocalTime: string;
   completionPolicy: CompletionPolicy;
+  eventKind: EventKind | null;
+  reminderPlan: ReminderPlan;
   tagIds: string[];
+}
+
+export interface AppInfo {
+  name: string;
+  version: string;
+  copyright: string;
 }
 
 export interface Category {
@@ -162,6 +207,7 @@ export interface ExportResult {
 
 export interface ExportFilterInput {
   status: 'all' | 'open' | 'done';
+  eventKind: EventKind | null;
   categoryId: string | null;
   tagId: string | null;
   createdFrom: string | null;

@@ -13,12 +13,14 @@ describe('ExportPanel', () => {
     } });
 
     await fireEvent.change(screen.getByLabelText('事项状态'), { target: { value: 'open' } });
+    await fireEvent.change(screen.getByLabelText('事件类型'), { target: { value: 'ORDINARY' } });
     await fireEvent.change(screen.getByLabelText('类型'), { target: { value: 'work' } });
     await fireEvent.change(screen.getByLabelText('标签'), { target: { value: 'customer' } });
     await fireEvent.click(screen.getByRole('button', { name: '选择位置并导出' }));
 
     expect(onExport).toHaveBeenCalledWith({
       status: 'open',
+      eventKind: 'ORDINARY',
       categoryId: 'work',
       tagId: 'customer',
       createdFrom: null,

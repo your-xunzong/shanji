@@ -5,16 +5,17 @@ use std::{
     time::SystemTime,
 };
 
-use chrono::{DateTime, Local, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
     domain::{
-        Category, CreateItemInput, Item, Settings, Tag, TaxonomyInput, UpdateItemInput,
-        UpdateSettingsInput, due_for_local_date, due_from_explicit, must_complete_due,
-        next_default_due, next_repeat_at, parse_time,
+        Category, CreateItemInput, EventConfigurationInput, EventKindDefault, Item, Settings, Tag,
+        TaxonomyInput, UpdateItemInput, UpdateSettingsInput, due_for_local_date, due_from_explicit,
+        must_complete_due, next_daily_at, next_default_due, next_repeat_at, parse_time,
+        shift_calendar,
     },
     error::{AppError, AppResult},
 };
@@ -24,7 +25,8 @@ const MIGRATION_0002: &str = include_str!("../migrations/0002_notification_deliv
 const MIGRATION_0003: &str = include_str!("../migrations/0003_autostart_onboarding.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_types_tags_recycle.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_reminder_channels.sql");
-const LATEST_SCHEMA_VERSION: i64 = 5;
+const MIGRATION_0006: &str = include_str!("../migrations/0006_event_kinds.sql");
+const LATEST_SCHEMA_VERSION: i64 = 6;
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -57,7 +59,16 @@ pub struct DueNotification {
     pub due_local_date: String,
     pub due_local_time: String,
     pub completion_policy: String,
+    pub event_kind: Option<String>,
+    pub reminder_plan: String,
     pub tag_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassificationNotification {
+    pub event_ids: Vec<String>,
+    pub item_id: Option<String>,
+    pub count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -76,8 +87,32 @@ pub struct EmailDeliveryJob {
 #[derive(Debug, Default)]
 pub struct ProcessResult {
     pub notifications: Vec<DueNotification>,
+    pub classification_notifications: Vec<ClassificationNotification>,
     pub changed: bool,
     pub notifications_enabled: bool,
+}
+
+struct DueRow {
+    id: String,
+    title: String,
+    completion_policy: String,
+    reminder_plan: String,
+    event_kind: Option<String>,
+    repeat_interval_minutes: Option<u32>,
+    scheduled_for: String,
+    bypass_quiet_hours: bool,
+    revision: u32,
+    due_local_date: String,
+    due_local_time: String,
+    end_at: Option<String>,
+    target_at: Option<String>,
+    cadence_value: Option<u32>,
+    cadence_unit: Option<String>,
+    emphasis_max_per_day: u32,
+    emphasis_count: u32,
+    emphasis_count_local_date: Option<String>,
+    series_anchor_month: Option<u32>,
+    series_anchor_day: Option<u32>,
 }
 
 pub fn apply_pending_restore(database_path: &Path) -> AppResult<()> {
@@ -164,6 +199,11 @@ impl Database {
             transaction.execute_batch(MIGRATION_0005)?;
             transaction.commit()?;
         }
+        if version < 6 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(MIGRATION_0006)?;
+            transaction.commit()?;
+        }
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -181,6 +221,7 @@ impl Database {
         transaction.execute_batch(MIGRATION_0003)?;
         transaction.execute_batch(MIGRATION_0004)?;
         transaction.execute_batch(MIGRATION_0005)?;
+        transaction.execute_batch(MIGRATION_0006)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -316,6 +357,17 @@ impl Database {
             ],
         )?;
 
+        for entry in &settings.event_kind_defaults {
+            transaction.execute(
+                "INSERT INTO event_kind_defaults (event_kind, reminder_plan, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(event_kind) DO UPDATE SET
+                   reminder_plan = excluded.reminder_plan,
+                   updated_at = excluded.updated_at",
+                params![entry.event_kind, entry.reminder_plan, now.to_rfc3339()],
+            )?;
+        }
+
         if input.update_existing_default_items {
             update_existing_default_items(&transaction, &settings, now)?;
         }
@@ -330,42 +382,61 @@ impl Database {
         let transaction = connection.transaction()?;
         let settings = read_settings(&transaction)?;
         validate_taxonomy_links(&transaction, input.category_id.as_deref(), &input.tag_ids)?;
-        let due = match &input.due_at {
-            Some(value) => due_from_explicit(value)?,
-            None if input.must_complete_today => must_complete_due(now, &settings)?,
-            None => next_default_due(now, &settings)?,
-        };
+        let event = resolve_event_config(
+            &transaction,
+            input.event.as_ref(),
+            input.must_complete_today,
+        )?;
+        let due = initial_due_for_event(&event, input.due_at.as_deref(), now, &settings)?;
 
         let id = Uuid::new_v4().to_string();
         let timestamp = now.to_rfc3339();
         let due_at = due.utc.to_rfc3339();
-        let due_source = if input.due_at.is_some() {
+        let due_source = if input.due_at.is_some()
+            || matches!(event.kind.as_deref(), Some("WARNING" | "CONTINUOUS"))
+        {
             "EXPLICIT"
         } else {
             "DEFAULT_EOD"
         };
-        let completion_policy = if input.must_complete_today {
+        let completion_policy = if event.kind.as_deref() == Some("TODAY_MUST") {
             "MUST_COMPLETE_TODAY"
         } else {
             "NORMAL"
         };
-        let rollover_policy = if input.must_complete_today || input.due_at.is_some() {
-            "NONE"
+        let rollover_policy =
+            if event.kind.is_some() || input.due_at.is_some() || event.reminder_plan != "ONCE" {
+                "NONE"
+            } else {
+                "NEXT_WORKDAY_EOD"
+            };
+        let repeat_interval = matches!(event.reminder_plan.as_str(), "EMPHASIS" | "FORCE")
+            .then_some(
+                input
+                    .repeat_interval_minutes
+                    .unwrap_or(settings.overtime_interval_minutes),
+            );
+        let next_reminder = initial_next_reminder(&event, due.utc, now)?;
+        let classification_next = event.kind.is_none().then(|| due_at.clone());
+        let time_mode = if input.due_at.is_some()
+            || matches!(event.kind.as_deref(), Some("WARNING" | "CONTINUOUS"))
+        {
+            "SPECIFIED"
         } else {
-            "NEXT_WORKDAY_EOD"
+            "DEFAULT"
         };
-        let repeat_interval = input.must_complete_today.then_some(
-            input
-                .repeat_interval_minutes
-                .unwrap_or(settings.overtime_interval_minutes),
-        );
+        let (series_anchor_month, series_anchor_day) =
+            series_anchor(event.kind.as_deref(), due.local_date);
 
         transaction.execute(
             "INSERT INTO items (
                 id, title, notes, status, category_id, due_at, due_local_date, due_local_time,
                 due_source, rollover_policy, completion_policy, repeat_interval_minutes,
-                next_reminder_at, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, 'OPEN', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?5, ?12, ?12)",
+                next_reminder_at, created_at, updated_at, event_kind, reminder_plan, important,
+                time_mode, start_at, end_at, target_at, lead_value, lead_unit,
+                cadence_value, cadence_unit, emphasis_max_per_day, classification_next_reminder_at
+             ) VALUES (?1, ?2, ?3, 'OPEN', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             params![
                 id,
                 input.title.trim(),
@@ -378,8 +449,26 @@ impl Database {
                 rollover_policy,
                 completion_policy,
                 repeat_interval,
+                next_reminder,
                 timestamp,
+                event.kind,
+                event.reminder_plan,
+                bool_to_int(event.important),
+                time_mode,
+                event.start_at,
+                event.end_at,
+                event.target_at,
+                event.lead_value,
+                event.lead_unit,
+                event.cadence_value,
+                event.cadence_unit,
+                event.emphasis_max_per_day,
+                classification_next,
             ],
+        )?;
+        transaction.execute(
+            "UPDATE items SET series_anchor_month = ?1, series_anchor_day = ?2 WHERE id = ?3",
+            params![series_anchor_month, series_anchor_day, id],
         )?;
         replace_item_tags(&transaction, &id, &input.tag_ids)?;
         insert_item_event(&transaction, &id, "CREATED", "{}", &timestamp)?;
@@ -453,15 +542,23 @@ impl Database {
         } else {
             Some(existing.due_at.clone())
         };
+        let classification_next = if completed || existing.event_kind.is_some() {
+            None
+        } else {
+            Some(now_text.clone())
+        };
 
         let changed = transaction.execute(
             "UPDATE items SET status = ?1, completed_at = ?2, next_reminder_at = ?3,
-                reminder_paused = 0, updated_at = ?4, revision = revision + 1 WHERE id = ?5",
+                reminder_paused = 0, updated_at = ?4, revision = revision + 1,
+                classification_next_reminder_at = ?5,
+                series_occurrence_pending = 0 WHERE id = ?6",
             params![
                 if completed { "DONE" } else { "OPEN" },
                 completed.then_some(now_text.clone()),
                 next_reminder,
                 now_text,
+                classification_next,
                 id,
             ],
         )?;
@@ -480,6 +577,139 @@ impl Database {
         self.get_item(id)
     }
 
+    pub fn classify_as_ordinary(&self, id: &str, now: DateTime<Utc>) -> AppResult<Item> {
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let existing = get_item_from(&transaction, id)?;
+        if existing.status == "DELETED" {
+            return Err(AppError::Validation(
+                "请先从回收站恢复记录再选择类型".into(),
+            ));
+        }
+        let reminder_plan: String = transaction.query_row(
+            "SELECT reminder_plan FROM event_kind_defaults WHERE event_kind = 'ORDINARY'",
+            [],
+            |row| row.get(0),
+        )?;
+        let now_text = now.to_rfc3339();
+        let next_reminder = if existing.status == "OPEN" && !existing.reminder_paused {
+            Some(if existing.due_at <= now_text {
+                now_text.clone()
+            } else {
+                existing.due_at
+            })
+        } else {
+            None
+        };
+        transaction.execute(
+            "UPDATE items SET event_kind = 'ORDINARY', reminder_plan = ?1,
+                completion_policy = 'NORMAL', rollover_policy = 'NONE',
+                classification_next_reminder_at = NULL, next_reminder_at = ?2,
+                updated_at = ?3, revision = revision + 1 WHERE id = ?4",
+            params![reminder_plan, next_reminder, now_text, id],
+        )?;
+        insert_item_event(
+            &transaction,
+            id,
+            "EVENT_KIND_SELECTED",
+            r#"{"eventKind":"ORDINARY"}"#,
+            &now_text,
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_item(id)
+    }
+
+    pub fn snooze_classification(
+        &self,
+        item_id: Option<&str>,
+        minutes: u32,
+        now: DateTime<Utc>,
+    ) -> AppResult<()> {
+        if !(5..=1440).contains(&minutes) {
+            return Err(AppError::Validation(
+                "稍后处理时间必须在 5 分钟到 24 小时之间".into(),
+            ));
+        }
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let next = (now + chrono::Duration::minutes(i64::from(minutes))).to_rfc3339();
+        if let Some(item_id) = item_id {
+            connection.execute(
+                "UPDATE items SET classification_next_reminder_at = ?1
+                 WHERE id = ?2 AND event_kind IS NULL AND status = 'OPEN'",
+                params![next, item_id],
+            )?;
+        } else {
+            connection.execute(
+                "UPDATE items SET classification_next_reminder_at = ?1
+                 WHERE event_kind IS NULL AND status = 'OPEN'",
+                [next],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn complete_series_occurrence(&self, id: &str, now: DateTime<Utc>) -> AppResult<Item> {
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let existing = get_item_from(&transaction, id)?;
+        if !matches!(existing.event_kind.as_deref(), Some("MONTHLY" | "YEARLY")) {
+            return Err(AppError::Validation(
+                "只有月度或年度事件可以完成本次".into(),
+            ));
+        }
+        let timestamp = now.to_rfc3339();
+        let (pending, anchor_month, anchor_day) = transaction.query_row(
+            "SELECT series_occurrence_pending, series_anchor_month, series_anchor_day
+             FROM items WHERE id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, Option<u32>>(1)?,
+                    row.get::<_, Option<u32>>(2)?,
+                ))
+            },
+        )?;
+        let current = DateTime::parse_from_rfc3339(&existing.due_at)
+            .map_err(|_| AppError::Validation("周期事件的当前时间数据损坏".into()))?
+            .with_timezone(&Utc);
+        if pending && current > now {
+            transaction.execute(
+                "UPDATE items SET reminder_acknowledged_at = ?1,
+                    series_occurrence_pending = 0, updated_at = ?1,
+                    revision = revision + 1 WHERE id = ?2 AND status = 'OPEN'",
+                params![timestamp, id],
+            )?;
+        } else {
+            let next = next_series_after(
+                current,
+                now,
+                existing.event_kind.as_deref().unwrap_or("MONTHLY"),
+                anchor_month,
+                anchor_day,
+            )?;
+            let local = next.with_timezone(&Local);
+            transaction.execute(
+                "UPDATE items SET due_at = ?1, due_local_date = ?2, due_local_time = ?3,
+                    next_reminder_at = ?1, reminder_acknowledged_at = ?4,
+                    series_occurrence_pending = 0, updated_at = ?4,
+                    revision = revision + 1 WHERE id = ?5 AND status = 'OPEN'",
+                params![
+                    next.to_rfc3339(),
+                    local.date_naive().format("%Y-%m-%d").to_string(),
+                    local.time().format("%H:%M").to_string(),
+                    timestamp,
+                    id,
+                ],
+            )?;
+        }
+        insert_item_event(&transaction, id, "OCCURRENCE_COMPLETED", "{}", &timestamp)?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_item(id)
+    }
+
     pub fn set_reminder_paused(
         &self,
         id: &str,
@@ -489,10 +719,8 @@ impl Database {
         let mut connection = self.connection.lock().expect("database mutex poisoned");
         let transaction = connection.transaction()?;
         let existing = get_item_from(&transaction, id)?;
-        if existing.completion_policy != "MUST_COMPLETE_TODAY" {
-            return Err(AppError::Validation(
-                "只有今日必做事项可以暂停持续提醒".into(),
-            ));
+        if existing.status != "OPEN" {
+            return Err(AppError::Validation("只有待处理事件可以暂停提醒".into()));
         }
         let now_text = now.to_rfc3339();
         let next_reminder = if paused {
@@ -530,6 +758,11 @@ impl Database {
         let existing = get_item_from(&transaction, id)?;
         if existing.status != "OPEN" {
             return Err(AppError::Validation("只有未完成事项可以调整时间".into()));
+        }
+        if existing.due_at < now.to_rfc3339() {
+            return Err(AppError::Validation(
+                "逾期事项的原到期时间不能修改；可以转换类型并从现在开始新计划".into(),
+            ));
         }
 
         let due_at = due.utc.to_rfc3339();
@@ -684,7 +917,6 @@ impl Database {
         now: DateTime<Utc>,
     ) -> AppResult<Item> {
         input.validate()?;
-        let due = due_from_explicit(&input.due_at)?;
         let mut connection = self.connection.lock().expect("database mutex poisoned");
         let transaction = connection.transaction()?;
         let existing = get_item_from(&transaction, id)?;
@@ -693,33 +925,65 @@ impl Database {
         }
         validate_taxonomy_links(&transaction, input.category_id.as_deref(), &input.tag_ids)?;
         let settings = read_settings(&transaction)?;
+        let event = if input.event.is_none() && !input.must_complete_today {
+            ResolvedEventConfig::from_item(&existing)
+        } else {
+            resolve_event_config(
+                &transaction,
+                input.event.as_ref(),
+                input.must_complete_today,
+            )?
+        };
+        let due = initial_due_for_event(&event, Some(&input.due_at), now, &settings)?;
+        if existing.due_at < now.to_rfc3339()
+            && existing.event_kind == event.kind
+            && existing.due_at != due.utc.to_rfc3339()
+        {
+            return Err(AppError::Validation(
+                "逾期事项的原到期时间不能修改；可以转换类型并从现在开始新计划".into(),
+            ));
+        }
         let timestamp = now.to_rfc3339();
         let due_at = due.utc.to_rfc3339();
-        let completion_policy = if input.must_complete_today {
+        let completion_policy = if event.kind.as_deref() == Some("TODAY_MUST") {
             "MUST_COMPLETE_TODAY"
         } else {
             "NORMAL"
         };
-        let repeat_interval = input.must_complete_today.then_some(
-            input
-                .repeat_interval_minutes
-                .unwrap_or(settings.overtime_interval_minutes),
-        );
+        let repeat_interval = matches!(event.reminder_plan.as_str(), "EMPHASIS" | "FORCE")
+            .then_some(
+                input
+                    .repeat_interval_minutes
+                    .unwrap_or(settings.overtime_interval_minutes),
+            );
         let next_reminder = if existing.status == "OPEN" && !existing.reminder_paused {
-            Some(if due.utc <= now {
-                timestamp.clone()
-            } else {
-                due_at.clone()
-            })
+            Some(initial_next_reminder(&event, due.utc, now)?)
         } else {
             None
+        };
+        let classification_next = if event.kind.is_none() && existing.status == "OPEN" {
+            Some(due_at.clone())
+        } else {
+            None
+        };
+        let time_mode = if input.due_at == existing.due_at && event.kind == existing.event_kind {
+            existing.time_mode.as_str()
+        } else {
+            "SPECIFIED"
         };
         transaction.execute(
             "UPDATE items SET title = ?1, notes = ?2, category_id = ?3, due_at = ?4,
                 due_local_date = ?5, due_local_time = ?6, due_source = 'EXPLICIT',
                 rollover_policy = 'NONE', completion_policy = ?7, repeat_interval_minutes = ?8,
                 next_reminder_at = ?9, reminder_paused = 0, updated_at = ?10,
-                revision = revision + 1 WHERE id = ?11",
+                revision = revision + 1, event_kind = ?11, reminder_plan = ?12,
+                important = ?13, time_mode = ?14, start_at = ?15, end_at = ?16,
+                target_at = ?17, lead_value = ?18, lead_unit = ?19,
+                cadence_value = ?20, cadence_unit = ?21,
+                emphasis_max_per_day = ?22, emphasis_count = 0,
+                emphasis_count_local_date = NULL,
+                classification_next_reminder_at = ?23,
+                series_occurrence_pending = 0 WHERE id = ?24",
             params![
                 input.title.trim(),
                 input.notes,
@@ -731,8 +995,27 @@ impl Database {
                 repeat_interval,
                 next_reminder,
                 timestamp,
+                event.kind,
+                event.reminder_plan,
+                bool_to_int(event.important),
+                time_mode,
+                event.start_at,
+                event.end_at,
+                event.target_at,
+                event.lead_value,
+                event.lead_unit,
+                event.cadence_value,
+                event.cadence_unit,
+                event.emphasis_max_per_day,
+                classification_next,
                 id,
             ],
+        )?;
+        let (series_anchor_month, series_anchor_day) =
+            series_anchor(event.kind.as_deref(), due.local_date);
+        transaction.execute(
+            "UPDATE items SET series_anchor_month = ?1, series_anchor_day = ?2 WHERE id = ?3",
+            params![series_anchor_month, series_anchor_day, id],
         )?;
         replace_item_tags(&transaction, id, &input.tag_ids)?;
         insert_item_event(&transaction, id, "EDITED", "{}", &timestamp)?;
@@ -758,18 +1041,25 @@ impl Database {
         } else if existing.due_at <= timestamp {
             Some(timestamp.clone())
         } else {
-            Some(existing.due_at)
+            Some(existing.due_at.clone())
+        };
+        let classification_next = if deleted || status != "OPEN" || existing.event_kind.is_some() {
+            None
+        } else {
+            Some(timestamp.clone())
         };
         transaction.execute(
             "UPDATE items SET status = ?1, deleted_at = ?2,
                 next_reminder_at = ?3, reminder_paused = 0, updated_at = ?4,
-                deleted_from_status = ?5, revision = revision + 1 WHERE id = ?6",
+                deleted_from_status = ?5, revision = revision + 1,
+                classification_next_reminder_at = ?6 WHERE id = ?7",
             params![
                 status,
                 deleted.then_some(timestamp.clone()),
                 next_reminder,
                 timestamp,
                 if deleted { Some(existing.status) } else { None },
+                classification_next,
                 id
             ],
         )?;
@@ -988,7 +1278,7 @@ impl Database {
         let rows = {
             let mut statement = transaction.prepare(
                 "SELECT d.id, d.reminder_event_id, i.id, i.title, i.due_local_date,
-                        i.due_local_time, i.completion_policy
+                        i.due_local_time, i.completion_policy, i.event_kind, i.reminder_plan
                  FROM channel_deliveries d
                  JOIN items i ON i.id = d.item_id
                  WHERE d.channel = 'email' AND d.result = 'FAILED'
@@ -1011,6 +1301,8 @@ impl Database {
                             due_local_date: row.get(4)?,
                             due_local_time: row.get(5)?,
                             completion_policy: row.get(6)?,
+                            event_kind: row.get(7)?,
+                            reminder_plan: row.get(8)?,
                             tag_ids: Vec::new(),
                         },
                     ))
@@ -1116,7 +1408,7 @@ impl Database {
         let stale_claims = {
             let mut statement = transaction.prepare(
                 "SELECT e.id, e.item_id, i.title, i.due_local_date, i.due_local_time,
-                        i.completion_policy
+                        i.completion_policy, i.event_kind, i.reminder_plan
                  FROM reminder_events e
                  JOIN items i ON i.id = e.item_id
                  WHERE e.result = 'CLAIMED' AND e.sent_at <= ?1 AND i.status = 'OPEN'
@@ -1130,6 +1422,8 @@ impl Database {
                     due_local_date: row.get(3)?,
                     due_local_time: row.get(4)?,
                     completion_policy: row.get(5)?,
+                    event_kind: row.get(6)?,
+                    reminder_plan: row.get(7)?,
                     tag_ids: Vec::new(),
                 })
             })?;
@@ -1150,96 +1444,215 @@ impl Database {
 
         let due_rows = {
             let mut statement = transaction.prepare(
-                "SELECT id, title, completion_policy, repeat_interval_minutes,
-                        next_reminder_at, bypass_app_quiet_hours, revision,
-                        due_local_date, due_local_time
+                "SELECT id, title, completion_policy, reminder_plan, event_kind,
+                        repeat_interval_minutes, next_reminder_at, bypass_app_quiet_hours,
+                        revision, due_local_date, due_local_time, end_at, target_at,
+                        cadence_value, cadence_unit, emphasis_max_per_day,
+                        emphasis_count, emphasis_count_local_date,
+                        series_anchor_month, series_anchor_day
                  FROM items
                  WHERE status = 'OPEN' AND reminder_paused = 0
                    AND next_reminder_at IS NOT NULL AND next_reminder_at <= ?1
                  ORDER BY next_reminder_at ASC",
             )?;
             let rows = statement.query_map([&now_text], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<u32>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)? != 0,
-                    row.get::<_, u32>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                ))
+                Ok(DueRow {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    completion_policy: row.get(2)?,
+                    reminder_plan: row.get(3)?,
+                    event_kind: row.get(4)?,
+                    repeat_interval_minutes: row.get(5)?,
+                    scheduled_for: row.get(6)?,
+                    bypass_quiet_hours: row.get::<_, i64>(7)? != 0,
+                    revision: row.get(8)?,
+                    due_local_date: row.get(9)?,
+                    due_local_time: row.get(10)?,
+                    end_at: row.get(11)?,
+                    target_at: row.get(12)?,
+                    cadence_value: row.get(13)?,
+                    cadence_unit: row.get(14)?,
+                    emphasis_max_per_day: row.get(15)?,
+                    emphasis_count: row.get(16)?,
+                    emphasis_count_local_date: row.get(17)?,
+                    series_anchor_month: row.get(18)?,
+                    series_anchor_day: row.get(19)?,
+                })
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
 
-        for (
-            id,
-            title,
-            policy,
-            interval,
-            scheduled_for,
-            bypass_quiet,
-            revision,
-            due_local_date,
-            due_local_time,
-        ) in due_rows
-        {
-            let idempotency_key = format!("{id}:{scheduled_for}:{revision}");
+        for row in due_rows {
+            if should_stop_without_delivery(&row, now)? {
+                transaction.execute(
+                    "UPDATE items SET next_reminder_at = NULL, updated_at = ?1 WHERE id = ?2",
+                    params![now_text, row.id],
+                )?;
+                result.changed = true;
+                continue;
+            }
+            let idempotency_key = format!("{}:{}:{}", row.id, row.scheduled_for, row.revision);
             let event_id = Uuid::new_v4().to_string();
             let inserted = transaction.execute(
                 "INSERT OR IGNORE INTO reminder_events
                    (id, item_id, scheduled_for, sent_at, idempotency_key, result)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'CLAIMED')",
-                params![event_id, id, scheduled_for, now_text, idempotency_key],
+                params![
+                    event_id,
+                    row.id,
+                    row.scheduled_for,
+                    now_text,
+                    idempotency_key
+                ],
             )?;
 
-            let next_reminder = if policy == "MUST_COMPLETE_TODAY" {
-                Some(
-                    next_repeat_at(
-                        now,
-                        interval.unwrap_or(settings.overtime_interval_minutes),
-                        &settings,
-                        bypass_quiet,
-                    )?
-                    .to_rfc3339(),
-                )
-            } else if settings.repeat_unacknowledged_enabled {
-                Some(
-                    next_repeat_at(
-                        now,
-                        settings.unacknowledged_repeat_minutes,
-                        &settings,
-                        bypass_quiet,
-                    )?
-                    .to_rfc3339(),
-                )
+            let next_reminder = next_after_delivery(&row, now, &settings)?;
+            let (emphasis_count, emphasis_date) = if row.reminder_plan == "EMPHASIS" {
+                let date = now
+                    .with_timezone(&Local)
+                    .date_naive()
+                    .format("%Y-%m-%d")
+                    .to_string();
+                let count = if row.emphasis_count_local_date.as_deref() == Some(date.as_str()) {
+                    row.emphasis_count.saturating_add(1)
+                } else {
+                    1
+                };
+                (count, Some(date))
             } else {
-                None
+                (row.emphasis_count, row.emphasis_count_local_date.clone())
             };
-            transaction.execute(
-                "UPDATE items SET next_reminder_at = ?1, reminder_acknowledged_at = NULL,
-                    updated_at = ?2 WHERE id = ?3",
-                params![next_reminder, now_text, id],
-            )?;
+            let is_series = matches!(row.event_kind.as_deref(), Some("MONTHLY" | "YEARLY"));
+            if is_series && row.reminder_plan == "ONCE" {
+                if let Some(next) = next_reminder {
+                    let local = next.with_timezone(&Local);
+                    transaction.execute(
+                        "UPDATE items SET due_at = ?1, due_local_date = ?2, due_local_time = ?3,
+                            next_reminder_at = ?1, reminder_acknowledged_at = NULL,
+                            updated_at = ?4, emphasis_count = ?5,
+                            emphasis_count_local_date = ?6,
+                            series_occurrence_pending = 1 WHERE id = ?7",
+                        params![
+                            next.to_rfc3339(),
+                            local.date_naive().format("%Y-%m-%d").to_string(),
+                            local.time().format("%H:%M").to_string(),
+                            now_text,
+                            emphasis_count,
+                            emphasis_date,
+                            row.id,
+                        ],
+                    )?;
+                }
+            } else if is_series {
+                transaction.execute(
+                    "UPDATE items SET next_reminder_at = ?1, reminder_acknowledged_at = NULL,
+                        updated_at = ?2, emphasis_count = ?3,
+                        emphasis_count_local_date = ?4,
+                        series_occurrence_pending = 1 WHERE id = ?5",
+                    params![
+                        next_reminder.map(|value| value.to_rfc3339()),
+                        now_text,
+                        emphasis_count,
+                        emphasis_date,
+                        row.id
+                    ],
+                )?;
+            } else {
+                transaction.execute(
+                    "UPDATE items SET next_reminder_at = ?1, reminder_acknowledged_at = NULL,
+                        updated_at = ?2, emphasis_count = ?3,
+                        emphasis_count_local_date = ?4 WHERE id = ?5",
+                    params![
+                        next_reminder.map(|value| value.to_rfc3339()),
+                        now_text,
+                        emphasis_count,
+                        emphasis_date,
+                        row.id
+                    ],
+                )?;
+            }
 
             if inserted > 0 {
-                let tag_ids = load_item_tags(&transaction, &id)?
+                let tag_ids = load_item_tags(&transaction, &row.id)?
                     .into_iter()
                     .map(|tag| tag.id)
                     .collect();
                 result.notifications.push(DueNotification {
                     event_id,
-                    item_id: id,
-                    title,
-                    due_local_date,
-                    due_local_time,
-                    completion_policy: policy,
+                    item_id: row.id,
+                    title: row.title,
+                    due_local_date: row.due_local_date,
+                    due_local_time: row.due_local_time,
+                    completion_policy: row.completion_policy,
+                    event_kind: row.event_kind,
+                    reminder_plan: row.reminder_plan,
                     tag_ids,
                 });
             }
             result.changed = true;
+        }
+
+        let classification_rows = {
+            let mut statement = transaction.prepare(
+                "SELECT id, classification_next_reminder_at, revision
+                 FROM items
+                 WHERE event_kind IS NULL AND status = 'OPEN' AND reminder_paused = 0
+                   AND classification_next_reminder_at IS NOT NULL
+                   AND classification_next_reminder_at <= ?1
+                 ORDER BY classification_next_reminder_at, created_at",
+            )?;
+            statement
+                .query_map([&now_text], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u32>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut claimed_classifications = Vec::new();
+        let next_classification =
+            next_daily_at(now, parse_time(&settings.default_due_time)?)?.to_rfc3339();
+        for (item_id, scheduled_for, revision) in classification_rows {
+            let event_id = Uuid::new_v4().to_string();
+            let idempotency_key = format!("classification:{item_id}:{scheduled_for}:{revision}");
+            let inserted = transaction.execute(
+                "INSERT OR IGNORE INTO classification_reminder_events
+                   (id, item_id, scheduled_for, attempted_at, idempotency_key, result)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'CLAIMED')",
+                params![event_id, item_id, scheduled_for, now_text, idempotency_key],
+            )?;
+            transaction.execute(
+                "UPDATE items SET classification_next_reminder_at = ?1, updated_at = ?2
+                 WHERE id = ?3 AND event_kind IS NULL",
+                params![next_classification, now_text, item_id],
+            )?;
+            if inserted > 0 {
+                claimed_classifications.push((event_id, item_id));
+            }
+            result.changed = true;
+        }
+        if claimed_classifications.len() == 1 {
+            let (event_id, item_id) = claimed_classifications.remove(0);
+            result
+                .classification_notifications
+                .push(ClassificationNotification {
+                    event_ids: vec![event_id],
+                    item_id: Some(item_id),
+                    count: 1,
+                });
+        } else if !claimed_classifications.is_empty() {
+            result
+                .classification_notifications
+                .push(ClassificationNotification {
+                    count: claimed_classifications.len(),
+                    event_ids: claimed_classifications
+                        .into_iter()
+                        .map(|(event_id, _)| event_id)
+                        .collect(),
+                    item_id: None,
+                });
         }
 
         transaction.commit()?;
@@ -1334,6 +1747,30 @@ impl Database {
         Ok(())
     }
 
+    pub fn mark_classification_delivery(
+        &self,
+        event_ids: &[String],
+        result: &str,
+        error_code: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> AppResult<()> {
+        if !matches!(result, "SUBMITTED" | "FAILED" | "DISABLED") {
+            return Err(AppError::Validation("分类提醒投递状态无效".into()));
+        }
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        for event_id in event_ids {
+            transaction.execute(
+                "UPDATE classification_reminder_events
+                 SET result = ?1, submitted_at = ?2, error_code = ?3
+                 WHERE id = ?4 AND result = 'CLAIMED'",
+                params![result, now.to_rfc3339(), error_code, event_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn last_notification_delivery(&self) -> AppResult<Option<NotificationDelivery>> {
         let connection = self.connection.lock().expect("database mutex poisoned");
         connection
@@ -1415,7 +1852,7 @@ fn claimed_event_item_id(
 }
 
 fn read_settings(connection: &Connection) -> AppResult<Settings> {
-    connection
+    let mut settings = connection
         .query_row(
             "SELECT default_due_time, workdays, overtime_interval_minutes,
                     quiet_hours_enabled, quiet_start, quiet_end, global_shortcut,
@@ -1457,9 +1894,30 @@ fn read_settings(connection: &Connection) -> AppResult<Settings> {
                     smtp_to: row.get(18)?,
                     smtp_username: row.get(19)?,
                     smtp_repeat_must_complete: row.get::<_, i64>(20)? != 0,
+                    event_kind_defaults: Vec::new(),
                 })
             },
         )
+        .map_err(AppError::from)?;
+    settings.event_kind_defaults = load_event_kind_defaults(connection)?;
+    Ok(settings)
+}
+
+fn load_event_kind_defaults(connection: &Connection) -> AppResult<Vec<EventKindDefault>> {
+    let mut statement = connection.prepare(
+        "SELECT event_kind, reminder_plan FROM event_kind_defaults
+         ORDER BY CASE event_kind
+           WHEN 'ORDINARY' THEN 1 WHEN 'ONE_TIME' THEN 2 WHEN 'TODAY_MUST' THEN 3
+           WHEN 'WARNING' THEN 4 WHEN 'CONTINUOUS' THEN 5 WHEN 'MONTHLY' THEN 6 ELSE 7 END",
+    )?;
+    statement
+        .query_map([], |row| {
+            Ok(EventKindDefault {
+                event_kind: row.get(0)?,
+                reminder_plan: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(AppError::from)
 }
 
@@ -1469,7 +1927,9 @@ fn item_select() -> &'static str {
             i.rollover_policy, i.rollover_count, i.completion_policy,
             i.repeat_interval_minutes, i.next_reminder_at, i.reminder_paused,
             i.bypass_app_quiet_hours, i.created_at, i.updated_at, i.completed_at,
-            i.deleted_at
+            i.deleted_at, i.event_kind, i.reminder_plan, i.important, i.time_mode,
+            i.start_at, i.end_at, i.target_at, i.lead_value, i.lead_unit,
+            i.cadence_value, i.cadence_unit, i.emphasis_max_per_day
      FROM items i LEFT JOIN categories c ON c.id = i.category_id"
 }
 
@@ -1496,6 +1956,18 @@ fn row_to_item(row: &Row<'_>) -> rusqlite::Result<Item> {
         updated_at: row.get(18)?,
         completed_at: row.get(19)?,
         deleted_at: row.get(20)?,
+        event_kind: row.get(21)?,
+        reminder_plan: row.get(22)?,
+        important: row.get::<_, i64>(23)? != 0,
+        time_mode: row.get(24)?,
+        start_at: row.get(25)?,
+        end_at: row.get(26)?,
+        target_at: row.get(27)?,
+        lead_value: row.get(28)?,
+        lead_unit: row.get(29)?,
+        cadence_value: row.get(30)?,
+        cadence_unit: row.get(31)?,
+        emphasis_max_per_day: row.get(32)?,
         tags: Vec::new(),
     })
 }
@@ -1653,6 +2125,366 @@ fn insert_item_event(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedEventConfig {
+    kind: Option<String>,
+    reminder_plan: String,
+    important: bool,
+    start_at: Option<String>,
+    end_at: Option<String>,
+    target_at: Option<String>,
+    lead_value: Option<u32>,
+    lead_unit: Option<String>,
+    cadence_value: Option<u32>,
+    cadence_unit: Option<String>,
+    emphasis_max_per_day: u32,
+}
+
+impl ResolvedEventConfig {
+    fn from_item(item: &Item) -> Self {
+        Self {
+            kind: item.event_kind.clone(),
+            reminder_plan: item.reminder_plan.clone(),
+            important: item.important,
+            start_at: item.start_at.clone(),
+            end_at: item.end_at.clone(),
+            target_at: item.target_at.clone(),
+            lead_value: item.lead_value,
+            lead_unit: item.lead_unit.clone(),
+            cadence_value: item.cadence_value,
+            cadence_unit: item.cadence_unit.clone(),
+            emphasis_max_per_day: item.emphasis_max_per_day,
+        }
+    }
+}
+
+fn resolve_event_config(
+    connection: &Connection,
+    input: Option<&EventConfigurationInput>,
+    legacy_must_complete: bool,
+) -> AppResult<ResolvedEventConfig> {
+    if let Some(input) = input {
+        input.validate()?;
+    }
+    let kind = input
+        .and_then(|event| event.kind.clone())
+        .or_else(|| legacy_must_complete.then(|| "TODAY_MUST".to_string()));
+    let reminder_plan = if let Some(plan) = input.and_then(|event| event.reminder_plan.clone()) {
+        plan
+    } else if let Some(kind) = &kind {
+        connection.query_row(
+            "SELECT reminder_plan FROM event_kind_defaults WHERE event_kind = ?1",
+            [kind],
+            |row| row.get(0),
+        )?
+    } else {
+        "REPEAT".into()
+    };
+    let input = input.cloned().unwrap_or_default();
+    let cadence_value = input
+        .cadence_value
+        .or_else(|| (reminder_plan == "CUSTOM").then_some(1));
+    let cadence_unit = input
+        .cadence_unit
+        .or_else(|| (reminder_plan == "CUSTOM").then(|| "DAY".to_string()));
+    Ok(ResolvedEventConfig {
+        kind,
+        reminder_plan,
+        important: input.important,
+        start_at: input.start_at,
+        end_at: input.end_at,
+        target_at: input.target_at,
+        lead_value: input.lead_value,
+        lead_unit: input.lead_unit,
+        cadence_value,
+        cadence_unit,
+        emphasis_max_per_day: input.emphasis_max_per_day.unwrap_or(8),
+    })
+}
+
+fn initial_due_for_event(
+    config: &ResolvedEventConfig,
+    explicit_due: Option<&str>,
+    now: DateTime<Utc>,
+    settings: &Settings,
+) -> AppResult<crate::domain::DueMoment> {
+    match config.kind.as_deref() {
+        Some("WARNING") => due_from_explicit(
+            config
+                .target_at
+                .as_deref()
+                .ok_or_else(|| AppError::Validation("预警事件需要目标时间".into()))?,
+        ),
+        Some("CONTINUOUS") => due_from_explicit(
+            config
+                .start_at
+                .as_deref()
+                .ok_or_else(|| AppError::Validation("持续事件需要开始时间".into()))?,
+        ),
+        Some("TODAY_MUST") => match explicit_due {
+            Some(value) => due_from_explicit(value),
+            None => must_complete_due(now, settings),
+        },
+        _ => match explicit_due {
+            Some(value) => due_from_explicit(value),
+            None => next_default_due(now, settings),
+        },
+    }
+}
+
+fn initial_next_reminder(
+    config: &ResolvedEventConfig,
+    due_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> AppResult<String> {
+    let candidate = if config.kind.as_deref() == Some("WARNING") {
+        shift_calendar(
+            due_at,
+            config.lead_value.unwrap_or(1),
+            config.lead_unit.as_deref().unwrap_or("DAY"),
+            false,
+        )?
+    } else {
+        due_at
+    };
+    Ok(candidate.max(now).to_rfc3339())
+}
+
+fn next_after_delivery(
+    row: &DueRow,
+    now: DateTime<Utc>,
+    settings: &Settings,
+) -> AppResult<Option<DateTime<Utc>>> {
+    let scheduled = DateTime::parse_from_rfc3339(&row.scheduled_for)
+        .map_err(|_| AppError::Validation("提醒计划时间损坏".into()))?
+        .with_timezone(&Utc);
+    let local_time = parse_time(&row.due_local_time)?;
+
+    if row.event_kind.as_deref() == Some("WARNING")
+        && let Some(target) = &row.target_at
+    {
+        let target = DateTime::parse_from_rfc3339(target)
+            .map_err(|_| AppError::Validation("预警目标时间损坏".into()))?
+            .with_timezone(&Utc);
+        if scheduled < target && now < target {
+            let next = next_daily_at(now, local_time)?;
+            return Ok(Some(next.min(target)));
+        }
+    }
+
+    match row.event_kind.as_deref() {
+        Some("CONTINUOUS") => {
+            let next = next_calendar_after(
+                scheduled,
+                now,
+                row.cadence_value.unwrap_or(1),
+                row.cadence_unit.as_deref().unwrap_or("DAY"),
+            )?;
+            let end = row
+                .end_at
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc));
+            return Ok(end.filter(|end| next <= *end).map(|_| next));
+        }
+        Some(kind @ ("MONTHLY" | "YEARLY")) => {
+            return match row.reminder_plan.as_str() {
+                "ONCE" => next_series_after(
+                    scheduled,
+                    now,
+                    kind,
+                    row.series_anchor_month,
+                    row.series_anchor_day,
+                )
+                .map(Some),
+                "REPEAT" => next_daily_at(now, local_time).map(Some),
+                "EMPHASIS" => next_emphasis_at(row, now, settings).map(Some),
+                "FORCE" => next_repeat_at(
+                    now,
+                    row.repeat_interval_minutes
+                        .unwrap_or(settings.overtime_interval_minutes),
+                    settings,
+                    row.bypass_quiet_hours,
+                )
+                .map(Some),
+                "CUSTOM" => match (row.cadence_value, row.cadence_unit.as_deref()) {
+                    (Some(value), Some(unit)) => {
+                        next_calendar_after(scheduled, now, value, unit).map(Some)
+                    }
+                    _ => Ok(None),
+                },
+                _ => Ok(None),
+            };
+        }
+        _ => {}
+    }
+
+    match row.reminder_plan.as_str() {
+        "REPEAT" => next_daily_at(now, local_time).map(Some),
+        "EMPHASIS" => next_emphasis_at(row, now, settings).map(Some),
+        "FORCE" => next_repeat_at(
+            now,
+            row.repeat_interval_minutes
+                .unwrap_or(settings.overtime_interval_minutes),
+            settings,
+            row.bypass_quiet_hours,
+        )
+        .map(Some),
+        "CUSTOM" => match (row.cadence_value, row.cadence_unit.as_deref()) {
+            (Some(value), Some(unit)) => next_calendar_after(scheduled, now, value, unit).map(Some),
+            _ => Ok(None),
+        },
+        _ if settings.repeat_unacknowledged_enabled && row.event_kind.is_none() => next_repeat_at(
+            now,
+            settings.unacknowledged_repeat_minutes,
+            settings,
+            row.bypass_quiet_hours,
+        )
+        .map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn should_stop_without_delivery(row: &DueRow, now: DateTime<Utc>) -> AppResult<bool> {
+    let expires_at_day_end = row.event_kind.as_deref() == Some("ONE_TIME")
+        || (row.reminder_plan == "ONCE"
+            && matches!(row.event_kind.as_deref(), Some("ORDINARY" | "TODAY_MUST")));
+    if expires_at_day_end {
+        let due_date = NaiveDate::parse_from_str(&row.due_local_date, "%Y-%m-%d")
+            .map_err(|_| AppError::Validation("一次性事件的本地日期数据损坏".into()))?;
+        if now.with_timezone(&Local).date_naive() > due_date {
+            return Ok(true);
+        }
+    }
+    if row.event_kind.as_deref() == Some("CONTINUOUS")
+        && let Some(end) = row.end_at.as_deref()
+    {
+        let end = DateTime::parse_from_rfc3339(end)
+            .map_err(|_| AppError::Validation("持续事件的结束时间数据损坏".into()))?
+            .with_timezone(&Utc);
+        if now > end {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn next_calendar_after(
+    scheduled: DateTime<Utc>,
+    now: DateTime<Utc>,
+    amount: u32,
+    unit: &str,
+) -> AppResult<DateTime<Utc>> {
+    let mut next = shift_calendar(scheduled, amount, unit, true)?;
+    for _ in 0..512 {
+        if next > now {
+            return Ok(next);
+        }
+        next = shift_calendar(next, amount, unit, true)?;
+    }
+    Err(AppError::Validation(
+        "无法在有限次计算内找到下一次提醒".into(),
+    ))
+}
+
+fn series_anchor(kind: Option<&str>, date: NaiveDate) -> (Option<u32>, Option<u32>) {
+    match kind {
+        Some("MONTHLY") => (None, Some(date.day())),
+        Some("YEARLY") => (Some(date.month()), Some(date.day())),
+        _ => (None, None),
+    }
+}
+
+fn next_series_after(
+    scheduled: DateTime<Utc>,
+    now: DateTime<Utc>,
+    kind: &str,
+    anchor_month: Option<u32>,
+    anchor_day: Option<u32>,
+) -> AppResult<DateTime<Utc>> {
+    let local = scheduled.with_timezone(&Local);
+    let mut year = local.year();
+    let mut month = local.month();
+    let day = anchor_day.unwrap_or(local.day());
+    for _ in 0..512 {
+        match kind {
+            "MONTHLY" => {
+                if month == 12 {
+                    year = year
+                        .checked_add(1)
+                        .ok_or_else(|| AppError::Validation("无法计算下一年".into()))?;
+                    month = 1;
+                } else {
+                    month += 1;
+                }
+            }
+            "YEARLY" => {
+                year = year
+                    .checked_add(1)
+                    .ok_or_else(|| AppError::Validation("无法计算下一年".into()))?;
+                month = anchor_month.unwrap_or(local.month());
+            }
+            _ => return Err(AppError::Validation("周期事件类型无效".into())),
+        }
+        let last_day = days_in_month(year, month)?;
+        let date = NaiveDate::from_ymd_opt(year, month, day.min(last_day))
+            .ok_or_else(|| AppError::Validation("无法计算下一次周期日期".into()))?;
+        let candidate = due_for_local_date(date, local.time())?.utc;
+        if candidate > now {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::Validation(
+        "无法在有限次计算内找到下一次周期".into(),
+    ))
+}
+
+fn days_in_month(year: i32, month: u32) -> AppResult<u32> {
+    let (next_year, next_month) = if month == 12 {
+        (
+            year.checked_add(1)
+                .ok_or_else(|| AppError::Validation("无法计算下一年".into()))?,
+            1,
+        )
+    } else {
+        (year, month + 1)
+    };
+    let first_next = NaiveDate::from_ymd_opt(next_year, next_month, 1)
+        .ok_or_else(|| AppError::Validation("无法计算月末日期".into()))?;
+    Ok(first_next
+        .pred_opt()
+        .ok_or_else(|| AppError::Validation("无法计算月末日期".into()))?
+        .day())
+}
+
+fn next_emphasis_at(
+    row: &DueRow,
+    now: DateTime<Utc>,
+    settings: &Settings,
+) -> AppResult<DateTime<Utc>> {
+    let local_date = now
+        .with_timezone(&Local)
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let count = if row.emphasis_count_local_date.as_deref() == Some(local_date.as_str()) {
+        row.emphasis_count.saturating_add(1)
+    } else {
+        1
+    };
+    if count >= row.emphasis_max_per_day {
+        next_daily_at(now, parse_time(&row.due_local_time)?)
+    } else {
+        next_repeat_at(
+            now,
+            row.repeat_interval_minutes
+                .unwrap_or(settings.overtime_interval_minutes),
+            settings,
+            row.bypass_quiet_hours,
+        )
+    }
+}
+
 fn update_existing_default_items(
     transaction: &Transaction<'_>,
     settings: &Settings,
@@ -1750,6 +2582,7 @@ fn rollover_default_items(
         let mut statement = transaction.prepare(
             "SELECT id FROM items
              WHERE status = 'OPEN' AND completion_policy = 'NORMAL'
+               AND reminder_plan = 'ONCE'
                AND rollover_policy = 'NEXT_WORKDAY_EOD'
                AND due_source IN ('DEFAULT_EOD', 'ROLLED_OVER')
                AND due_local_date < ?1",
@@ -1901,6 +2734,438 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn event(kind: &str, reminder_plan: &str) -> EventConfigurationInput {
+        EventConfigurationInput {
+            kind: Some(kind.into()),
+            reminder_plan: Some(reminder_plan.into()),
+            important: false,
+            start_at: None,
+            end_at: None,
+            target_at: None,
+            lead_value: None,
+            lead_unit: None,
+            cadence_value: None,
+            cadence_unit: None,
+            emphasis_max_per_day: None,
+        }
+    }
+
+    fn create_configured_item(
+        database: &Database,
+        title: &str,
+        due: DateTime<Utc>,
+        event: EventConfigurationInput,
+        now: DateTime<Utc>,
+    ) -> Item {
+        database
+            .create_item(
+                &CreateItemInput {
+                    title: title.into(),
+                    notes: String::new(),
+                    category_id: Some("work".into()),
+                    due_at: Some(due.to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
+                    event: Some(event),
+                },
+                now,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn v5_upgrade_keeps_type_and_tag_as_separate_dimensions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shanji.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATION_0001).unwrap();
+        connection.execute_batch(MIGRATION_0002).unwrap();
+        connection.execute_batch(MIGRATION_0003).unwrap();
+        connection.execute_batch(MIGRATION_0004).unwrap();
+        connection.execute_batch(MIGRATION_0005).unwrap();
+        connection
+            .execute(
+                "INSERT INTO tags (id, name, color, position) VALUES ('project-a', '项目 A', '#B06C49', 10)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO items (
+                    id, title, notes, status, category_id, due_at, due_local_date,
+                    due_local_time, due_source, rollover_policy, completion_policy,
+                    next_reminder_at, created_at, updated_at
+                 ) VALUES (
+                    'legacy-item', '旧版事项', '', 'OPEN', 'work',
+                    '2026-09-01T10:00:00+00:00', '2026-09-01', '18:00',
+                    'EXPLICIT', 'NONE', 'NORMAL', '2026-09-01T10:00:00+00:00',
+                    '2026-09-01T09:00:00+00:00', '2026-09-01T09:00:00+00:00'
+                 )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO item_tags (item_id, tag_id) VALUES ('legacy-item', 'project-a')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        let item = database.get_item("legacy-item").unwrap();
+        assert_eq!(item.event_kind.as_deref(), Some("ORDINARY"));
+        assert_eq!(item.reminder_plan, "ONCE");
+        assert_eq!(item.category_id.as_deref(), Some("work"));
+        assert_eq!(item.category_name.as_deref(), Some("工作"));
+        assert_eq!(item.tags.len(), 1);
+        assert_eq!(item.tags[0].id, "project-a");
+        assert_eq!(database.list_tags().unwrap().len(), 1);
+        assert!(
+            database
+                .list_tags()
+                .unwrap()
+                .iter()
+                .all(|tag| !tag.id.starts_with("legacy-category-"))
+        );
+    }
+
+    #[test]
+    fn event_kind_conversion_preserves_type_and_tags() {
+        let database = Database::in_memory().unwrap();
+        let tag = database
+            .create_tag(&TaxonomyInput {
+                name: "项目 A".into(),
+                color: "#B06C49".into(),
+            })
+            .unwrap();
+        let due = at_local(2026, 9, 2, 18, 0);
+        let item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "精细管理".into(),
+                    notes: String::new(),
+                    category_id: Some("work".into()),
+                    due_at: Some(due.to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: vec![tag.id.clone()],
+                    event: Some(event("ORDINARY", "REPEAT")),
+                },
+                at_local(2026, 9, 2, 9, 0),
+            )
+            .unwrap();
+        let updated = database
+            .update_item(
+                &item.id,
+                &UpdateItemInput {
+                    title: item.title.clone(),
+                    notes: item.notes.clone(),
+                    category_id: item.category_id.clone(),
+                    tag_ids: vec![tag.id.clone()],
+                    due_at: due.to_rfc3339(),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    event: Some(event("YEARLY", "ONCE")),
+                },
+                at_local(2026, 9, 2, 10, 0),
+            )
+            .unwrap();
+        assert_eq!(updated.event_kind.as_deref(), Some("YEARLY"));
+        assert_eq!(updated.category_id.as_deref(), Some("work"));
+        assert_eq!(updated.tags[0].id, tag.id);
+    }
+
+    #[test]
+    fn ordinary_repeats_daily_but_one_time_expires_after_its_local_day() {
+        let database = Database::in_memory().unwrap();
+        let due = at_local(2026, 9, 1, 18, 0);
+        let ordinary = create_configured_item(
+            &database,
+            "每日回顾",
+            due,
+            event("ORDINARY", "REPEAT"),
+            due - chrono::Duration::hours(1),
+        );
+        let one_time = create_configured_item(
+            &database,
+            "一次性提醒",
+            due,
+            event("ONE_TIME", "ONCE"),
+            due - chrono::Duration::hours(1),
+        );
+
+        let result = database.process_due(at_local(2026, 9, 2, 8, 0)).unwrap();
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|entry| entry.item_id == ordinary.id)
+        );
+        assert!(
+            !result
+                .notifications
+                .iter()
+                .any(|entry| entry.item_id == one_time.id)
+        );
+        assert_eq!(
+            database.get_item(&one_time.id).unwrap().next_reminder_at,
+            None
+        );
+        assert_eq!(
+            database.get_item(&ordinary.id).unwrap().next_reminder_at,
+            Some(at_local(2026, 9, 2, 18, 0).to_rfc3339())
+        );
+    }
+
+    #[test]
+    fn today_must_with_once_plan_stops_after_the_day_ends() {
+        let database = Database::in_memory().unwrap();
+        let due = at_local(2026, 9, 1, 22, 0);
+        let item = create_configured_item(
+            &database,
+            "今日必做但仅提醒一次",
+            due,
+            event("TODAY_MUST", "ONCE"),
+            due - chrono::Duration::hours(1),
+        );
+        let result = database.process_due(at_local(2026, 9, 2, 8, 0)).unwrap();
+        assert!(result.notifications.is_empty());
+        assert_eq!(database.get_item(&item.id).unwrap().next_reminder_at, None);
+    }
+
+    #[test]
+    fn warning_repeats_daily_from_lead_time_until_target() {
+        let database = Database::in_memory().unwrap();
+        let target = at_local(2026, 9, 10, 10, 0);
+        let mut warning = event("WARNING", "REPEAT");
+        warning.target_at = Some(target.to_rfc3339());
+        warning.lead_value = Some(3);
+        warning.lead_unit = Some("DAY".into());
+        let item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "证书到期预警".into(),
+                    notes: String::new(),
+                    category_id: Some("work".into()),
+                    due_at: None,
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
+                    event: Some(warning),
+                },
+                at_local(2026, 9, 6, 9, 0),
+            )
+            .unwrap();
+        assert_eq!(
+            item.next_reminder_at,
+            Some(at_local(2026, 9, 7, 10, 0).to_rfc3339())
+        );
+        let first = database.process_due(at_local(2026, 9, 7, 10, 0)).unwrap();
+        assert_eq!(first.notifications.len(), 1);
+        assert_eq!(
+            database.get_item(&item.id).unwrap().next_reminder_at,
+            Some(at_local(2026, 9, 8, 10, 0).to_rfc3339())
+        );
+    }
+
+    #[test]
+    fn monthly_series_keeps_its_day_anchor_and_complete_current_does_not_skip() {
+        let database = Database::in_memory().unwrap();
+        let january = at_local(2026, 1, 31, 9, 0);
+        let item = create_configured_item(
+            &database,
+            "月末结账",
+            january,
+            event("MONTHLY", "ONCE"),
+            at_local(2026, 1, 10, 9, 0),
+        );
+
+        let after_early_completion = database
+            .complete_series_occurrence(&item.id, at_local(2026, 1, 10, 10, 0))
+            .unwrap();
+        assert_eq!(
+            after_early_completion.due_at,
+            at_local(2026, 2, 28, 9, 0).to_rfc3339()
+        );
+
+        let february = at_local(2026, 2, 28, 9, 0);
+        let notification = database
+            .process_due(february)
+            .unwrap()
+            .notifications
+            .remove(0);
+        database
+            .mark_notification_submitted(&notification.event_id, february)
+            .unwrap();
+        assert_eq!(
+            database.get_item(&item.id).unwrap().due_at,
+            at_local(2026, 3, 31, 9, 0).to_rfc3339()
+        );
+
+        let after_current_completion = database
+            .complete_series_occurrence(&item.id, february + chrono::Duration::minutes(1))
+            .unwrap();
+        assert_eq!(
+            after_current_completion.due_at,
+            at_local(2026, 3, 31, 9, 0).to_rfc3339()
+        );
+        assert!(
+            database
+                .list_pending_reminders(february + chrono::Duration::minutes(1))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn monthly_force_plan_repeats_current_occurrence_until_it_is_completed() {
+        let database = Database::in_memory().unwrap();
+        let january = at_local(2026, 1, 31, 9, 0);
+        let item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "月度强制盘点".into(),
+                    notes: String::new(),
+                    category_id: Some("work".into()),
+                    due_at: Some(january.to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: Some(30),
+                    tag_ids: Vec::new(),
+                    event: Some(event("MONTHLY", "FORCE")),
+                },
+                at_local(2026, 1, 30, 9, 0),
+            )
+            .unwrap();
+
+        let notification = database
+            .process_due(january)
+            .unwrap()
+            .notifications
+            .remove(0);
+        database
+            .mark_notification_submitted(&notification.event_id, january)
+            .unwrap();
+        let waiting = database.get_item(&item.id).unwrap();
+        assert_eq!(waiting.due_at, january.to_rfc3339());
+        assert_eq!(
+            waiting.next_reminder_at,
+            Some((january + chrono::Duration::minutes(30)).to_rfc3339())
+        );
+
+        let completed = database
+            .complete_series_occurrence(&item.id, january + chrono::Duration::minutes(1))
+            .unwrap();
+        assert_eq!(completed.due_at, at_local(2026, 2, 28, 9, 0).to_rfc3339());
+        assert_eq!(
+            completed.next_reminder_at,
+            Some(at_local(2026, 2, 28, 9, 0).to_rfc3339())
+        );
+    }
+
+    #[test]
+    fn continuous_event_skips_missed_cycles_and_stops_after_end() {
+        let database = Database::in_memory().unwrap();
+        let start = at_local(2026, 9, 1, 9, 0);
+        let end = at_local(2026, 9, 10, 9, 0);
+        let mut continuous = event("CONTINUOUS", "CUSTOM");
+        continuous.start_at = Some(start.to_rfc3339());
+        continuous.end_at = Some(end.to_rfc3339());
+        continuous.cadence_value = Some(3);
+        continuous.cadence_unit = Some("DAY".into());
+        let item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "持续备考".into(),
+                    notes: String::new(),
+                    category_id: Some("personal".into()),
+                    due_at: None,
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
+                    event: Some(continuous),
+                },
+                start - chrono::Duration::hours(1),
+            )
+            .unwrap();
+        let first = database.process_due(start).unwrap().notifications.remove(0);
+        database
+            .mark_notification_submitted(&first.event_id, start)
+            .unwrap();
+        let wake = at_local(2026, 9, 8, 9, 0);
+        let result = database.process_due(wake).unwrap();
+        assert_eq!(result.notifications.len(), 1);
+        database
+            .mark_notification_submitted(&result.notifications[0].event_id, wake)
+            .unwrap();
+        assert_eq!(
+            database.get_item(&item.id).unwrap().next_reminder_at,
+            Some(end.to_rfc3339())
+        );
+        let after_end = database.process_due(at_local(2026, 9, 11, 9, 0)).unwrap();
+        assert!(after_end.notifications.is_empty());
+        assert_eq!(database.get_item(&item.id).unwrap().next_reminder_at, None);
+    }
+
+    #[test]
+    fn emphasis_honors_the_daily_delivery_limit() {
+        let database = Database::in_memory().unwrap();
+        let due = at_local(2026, 9, 1, 18, 0);
+        let mut emphasis = event("TODAY_MUST", "EMPHASIS");
+        emphasis.emphasis_max_per_day = Some(2);
+        let item = database
+            .create_item(
+                &CreateItemInput {
+                    title: "强调事项".into(),
+                    notes: String::new(),
+                    category_id: Some("work".into()),
+                    due_at: Some(due.to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: Some(15),
+                    tag_ids: Vec::new(),
+                    event: Some(emphasis),
+                },
+                due - chrono::Duration::hours(1),
+            )
+            .unwrap();
+        database.process_due(due).unwrap();
+        database
+            .process_due(due + chrono::Duration::minutes(15))
+            .unwrap();
+        assert_eq!(
+            database.get_item(&item.id).unwrap().next_reminder_at,
+            Some(at_local(2026, 9, 2, 18, 0).to_rfc3339())
+        );
+    }
+
+    #[test]
+    fn multiple_unclassified_items_share_one_classification_notification() {
+        let database = Database::in_memory().unwrap();
+        let due = at_local(2026, 9, 1, 18, 0);
+        for title in ["待分类一", "待分类二"] {
+            database
+                .create_item(
+                    &CreateItemInput {
+                        title: title.into(),
+                        notes: String::new(),
+                        category_id: None,
+                        due_at: Some(due.to_rfc3339()),
+                        must_complete_today: false,
+                        repeat_interval_minutes: None,
+                        tag_ids: Vec::new(),
+                        event: None,
+                    },
+                    due - chrono::Duration::hours(1),
+                )
+                .unwrap();
+        }
+        let result = database.process_due(due).unwrap();
+        assert_eq!(result.classification_notifications.len(), 1);
+        assert_eq!(result.classification_notifications[0].count, 2);
+        assert!(result.classification_notifications[0].item_id.is_none());
+    }
+
     #[test]
     fn create_default_item_and_complete_in_one_store() {
         let database = Database::in_memory().unwrap();
@@ -1914,6 +3179,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 at_local(2026, 8, 27, 10, 0),
             )
@@ -1942,6 +3208,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 now,
             )
@@ -1973,6 +3240,7 @@ mod tests {
                     smtp_username: current.smtp_username,
                     smtp_repeat_must_complete: current.smtp_repeat_must_complete,
                     smtp_password: None,
+                    event_kind_defaults: current.event_kind_defaults,
                 },
                 now,
             )
@@ -1992,6 +3260,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 now,
             )
@@ -2013,6 +3282,7 @@ mod tests {
                     must_complete_today: true,
                     repeat_interval_minutes: Some(30),
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 at_local(2026, 8, 27, 17, 0),
             )
@@ -2040,6 +3310,7 @@ mod tests {
                     must_complete_today: true,
                     repeat_interval_minutes: Some(15),
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 now,
             )
@@ -2071,6 +3342,7 @@ mod tests {
                     must_complete_today: true,
                     repeat_interval_minutes: Some(15),
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 at_local(2026, 8, 27, 10, 0),
             )
@@ -2097,7 +3369,7 @@ mod tests {
     }
 
     #[test]
-    fn overdue_item_can_be_rescheduled() {
+    fn overdue_item_keeps_its_original_due_time() {
         let database = Database::in_memory().unwrap();
         let item = database
             .create_item(
@@ -2109,19 +3381,18 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 at_local(2026, 8, 27, 14, 0),
             )
             .unwrap();
 
         let next = at_local(2026, 8, 28, 9, 30);
-        let updated = database
+        let error = database
             .reschedule_item(&item.id, &next.to_rfc3339(), at_local(2026, 8, 27, 22, 0))
-            .unwrap();
-        assert_eq!(updated.due_local_date, "2026-08-28");
-        assert_eq!(updated.due_local_time, "09:30");
-        assert_eq!(updated.due_source, "EXPLICIT");
-        assert_eq!(updated.next_reminder_at, Some(next.to_rfc3339()));
+            .unwrap_err();
+        assert!(error.to_string().contains("原到期时间不能修改"));
+        assert_eq!(database.get_item(&item.id).unwrap().due_local_time, "15:00");
     }
 
     #[test]
@@ -2138,6 +3409,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 at_local(2026, 8, 27, 17, 0),
             )
@@ -2178,7 +3450,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert!(delivery_columns.contains(&"submitted_at".into()));
         assert!(delivery_columns.contains(&"error_code".into()));
         assert!(settings_columns.contains(&"autostart_enabled".into()));
@@ -2200,6 +3472,9 @@ mod tests {
         assert!(tag_table_exists);
         assert!(item_columns.contains(&"deleted_at".into()));
         assert!(item_columns.contains(&"reminder_acknowledged_at".into()));
+        assert!(item_columns.contains(&"event_kind".into()));
+        assert!(item_columns.contains(&"series_anchor_month".into()));
+        assert!(item_columns.contains(&"series_anchor_day".into()));
         assert!(settings_columns.contains(&"smtp_enabled".into()));
         assert!(!settings_columns.contains(&"smtp_password".into()));
         let channel_table_exists = connection
@@ -2233,8 +3508,9 @@ mod tests {
             .unwrap();
         database.move_tag(&second.id, "up").unwrap();
         let tags = database.list_tags().unwrap();
-        assert_eq!(tags[0].id, second.id);
-        assert_eq!(tags[1].id, first.id);
+        let first_index = tags.iter().position(|tag| tag.id == first.id).unwrap();
+        let second_index = tags.iter().position(|tag| tag.id == second.id).unwrap();
+        assert!(second_index < first_index);
     }
 
     #[test]
@@ -2257,6 +3533,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 now,
             )
@@ -2273,6 +3550,7 @@ mod tests {
                     due_at: item.due_at.clone(),
                     must_complete_today: false,
                     repeat_interval_minutes: None,
+                    event: None,
                 },
                 now,
             )
@@ -2302,6 +3580,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 now,
             )
@@ -2342,6 +3621,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 created,
             )
@@ -2371,6 +3651,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 at_local(2026, 8, 28, 17, 0),
             )
@@ -2399,6 +3680,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 now,
             )
@@ -2414,6 +3696,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 now,
             )
@@ -2465,6 +3748,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 at_local(2026, 8, 27, 17, 0),
             )
@@ -2497,6 +3781,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 at_local(2026, 8, 27, 17, 0),
             )
@@ -2552,6 +3837,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 at_local(2026, 8, 27, 17, 0),
             )
@@ -2593,6 +3879,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 due - chrono::Duration::hours(1),
             )
@@ -2663,6 +3950,7 @@ mod tests {
                     must_complete_today: true,
                     repeat_interval_minutes: Some(30),
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 due - chrono::Duration::hours(1),
             )
@@ -2715,6 +4003,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: vec![tag.id.clone()],
+                    event: None,
                 },
                 due - chrono::Duration::hours(1),
             )
@@ -2812,6 +4101,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
+                    event: None,
                 },
                 due - chrono::Duration::hours(1),
             )

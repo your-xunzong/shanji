@@ -1,5 +1,5 @@
 use chrono::{
-    DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, NaiveDateTime, NaiveTime,
+    DateTime, Datelike, Duration, Local, LocalResult, Months, NaiveDate, NaiveDateTime, NaiveTime,
     TimeZone, Utc,
 };
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,46 @@ pub struct Settings {
     pub smtp_to: String,
     pub smtp_username: String,
     pub smtp_repeat_must_complete: bool,
+    pub event_kind_defaults: Vec<EventKindDefault>,
+}
+
+pub const EVENT_KINDS: [&str; 7] = [
+    "ORDINARY",
+    "ONE_TIME",
+    "TODAY_MUST",
+    "WARNING",
+    "CONTINUOUS",
+    "MONTHLY",
+    "YEARLY",
+];
+
+pub const REMINDER_PLANS: [&str; 5] = ["REPEAT", "EMPHASIS", "ONCE", "FORCE", "CUSTOM"];
+pub const SCHEDULE_UNITS: [&str; 4] = ["DAY", "WEEK", "MONTH", "YEAR"];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventKindDefault {
+    pub event_kind: String,
+    pub reminder_plan: String,
+}
+
+#[cfg(test)]
+pub fn default_event_kind_defaults() -> Vec<EventKindDefault> {
+    [
+        ("ORDINARY", "REPEAT"),
+        ("ONE_TIME", "ONCE"),
+        ("TODAY_MUST", "EMPHASIS"),
+        ("WARNING", "REPEAT"),
+        ("CONTINUOUS", "CUSTOM"),
+        ("MONTHLY", "ONCE"),
+        ("YEARLY", "ONCE"),
+    ]
+    .into_iter()
+    .map(|(event_kind, reminder_plan)| EventKindDefault {
+        event_kind: event_kind.into(),
+        reminder_plan: reminder_plan.into(),
+    })
+    .collect()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,6 +113,7 @@ pub struct UpdateSettingsInput {
     pub smtp_username: String,
     pub smtp_repeat_must_complete: bool,
     pub smtp_password: Option<String>,
+    pub event_kind_defaults: Vec<EventKindDefault>,
 }
 
 impl UpdateSettingsInput {
@@ -108,6 +149,7 @@ impl UpdateSettingsInput {
             }
         }
         validate_global_shortcut(&self.global_shortcut)?;
+        validate_event_kind_defaults(&self.event_kind_defaults)?;
         Ok(())
     }
 
@@ -137,8 +179,34 @@ impl UpdateSettingsInput {
             smtp_to: self.smtp_to.trim().to_string(),
             smtp_username: self.smtp_username.trim().to_string(),
             smtp_repeat_must_complete: self.smtp_repeat_must_complete,
+            event_kind_defaults: self.event_kind_defaults.clone(),
         }
     }
+}
+
+fn validate_event_kind_defaults(defaults: &[EventKindDefault]) -> AppResult<()> {
+    if defaults.len() != EVENT_KINDS.len() {
+        return Err(AppError::Validation(
+            "请为七种事件分别选择默认提醒方案".into(),
+        ));
+    }
+    let mut kinds = defaults
+        .iter()
+        .map(|entry| entry.event_kind.as_str())
+        .collect::<Vec<_>>();
+    kinds.sort_unstable();
+    kinds.dedup();
+    if kinds.len() != EVENT_KINDS.len()
+        || kinds.iter().any(|kind| !EVENT_KINDS.contains(kind))
+        || defaults
+            .iter()
+            .any(|entry| !REMINDER_PLANS.contains(&entry.reminder_plan.as_str()))
+    {
+        return Err(AppError::Validation(
+            "事件默认提醒方案不完整，请重新选择".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_global_shortcut(value: &str) -> AppResult<()> {
@@ -207,7 +275,117 @@ pub struct Item {
     pub updated_at: String,
     pub completed_at: Option<String>,
     pub deleted_at: Option<String>,
+    pub event_kind: Option<String>,
+    pub reminder_plan: String,
+    pub important: bool,
+    pub time_mode: String,
+    pub start_at: Option<String>,
+    pub end_at: Option<String>,
+    pub target_at: Option<String>,
+    pub lead_value: Option<u32>,
+    pub lead_unit: Option<String>,
+    pub cadence_value: Option<u32>,
+    pub cadence_unit: Option<String>,
+    pub emphasis_max_per_day: u32,
     pub tags: Vec<Tag>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EventConfigurationInput {
+    pub kind: Option<String>,
+    pub reminder_plan: Option<String>,
+    #[serde(default)]
+    pub important: bool,
+    pub start_at: Option<String>,
+    pub end_at: Option<String>,
+    pub target_at: Option<String>,
+    pub lead_value: Option<u32>,
+    pub lead_unit: Option<String>,
+    pub cadence_value: Option<u32>,
+    pub cadence_unit: Option<String>,
+    pub emphasis_max_per_day: Option<u32>,
+}
+
+impl EventConfigurationInput {
+    pub fn validate(&self) -> AppResult<()> {
+        if let Some(kind) = &self.kind
+            && !EVENT_KINDS.contains(&kind.as_str())
+        {
+            return Err(AppError::Validation("请选择有效的事件类型".into()));
+        }
+        if let Some(plan) = &self.reminder_plan
+            && !REMINDER_PLANS.contains(&plan.as_str())
+        {
+            return Err(AppError::Validation("请选择有效的提醒方案".into()));
+        }
+        if self.lead_value == Some(0) || self.cadence_value == Some(0) {
+            return Err(AppError::Validation("提醒周期必须大于 0".into()));
+        }
+        if self
+            .emphasis_max_per_day
+            .is_some_and(|value| !(1..=96).contains(&value))
+        {
+            return Err(AppError::Validation(
+                "每日强调提醒次数必须在 1–96 次之间".into(),
+            ));
+        }
+        if let Some(unit) = &self.lead_unit
+            && !SCHEDULE_UNITS.contains(&unit.as_str())
+        {
+            return Err(AppError::Validation("请选择有效的预警单位".into()));
+        }
+        if let Some(unit) = &self.cadence_unit
+            && !SCHEDULE_UNITS.contains(&unit.as_str())
+        {
+            return Err(AppError::Validation("请选择有效的提醒周期单位".into()));
+        }
+
+        let start = parse_optional_datetime(self.start_at.as_deref())?;
+        let end = parse_optional_datetime(self.end_at.as_deref())?;
+        parse_optional_datetime(self.target_at.as_deref())?;
+        match self.kind.as_deref() {
+            Some("WARNING")
+                if self.target_at.is_none()
+                    || self.lead_value.is_none()
+                    || self.lead_unit.is_none() =>
+            {
+                return Err(AppError::Validation("预警事件需要目标时间和提前量".into()));
+            }
+            Some("CONTINUOUS")
+                if start.is_none()
+                    || end.is_none()
+                    || self.cadence_value.is_none()
+                    || self.cadence_unit.is_none() =>
+            {
+                return Err(AppError::Validation(
+                    "持续事件需要开始时间、结束时间和提醒周期".into(),
+                ));
+            }
+            _ => {}
+        }
+        if self.reminder_plan.as_deref() == Some("CUSTOM")
+            && (self.cadence_value.is_none() || self.cadence_unit.is_none())
+        {
+            return Err(AppError::Validation("自定义提醒需要提醒周期".into()));
+        }
+        if let (Some(start), Some(end)) = (start, end)
+            && start > end
+        {
+            return Err(AppError::Validation("结束时间不能早于开始时间".into()));
+        }
+        Ok(())
+    }
+}
+
+fn parse_optional_datetime(value: Option<&str>) -> AppResult<Option<DateTime<Utc>>> {
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|_| AppError::Validation("事件时间格式无效".into()))
+        })
+        .transpose()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,6 +400,8 @@ pub struct CreateItemInput {
     pub repeat_interval_minutes: Option<u32>,
     #[serde(default)]
     pub tag_ids: Vec<String>,
+    #[serde(default)]
+    pub event: Option<EventConfigurationInput>,
 }
 
 impl CreateItemInput {
@@ -241,6 +421,9 @@ impl CreateItemInput {
         if let Some(due_at) = &self.due_at {
             DateTime::parse_from_rfc3339(due_at)
                 .map_err(|_| AppError::Validation("指定时间格式无效".into()))?;
+        }
+        if let Some(event) = &self.event {
+            event.validate()?;
         }
         Ok(())
     }
@@ -294,6 +477,8 @@ pub struct UpdateItemInput {
     pub due_at: String,
     pub must_complete_today: bool,
     pub repeat_interval_minutes: Option<u32>,
+    #[serde(default)]
+    pub event: Option<EventConfigurationInput>,
 }
 
 impl UpdateItemInput {
@@ -306,6 +491,7 @@ impl UpdateItemInput {
             must_complete_today: self.must_complete_today,
             repeat_interval_minutes: self.repeat_interval_minutes,
             tag_ids: self.tag_ids.clone(),
+            event: self.event.clone(),
         }
         .validate()
     }
@@ -414,6 +600,42 @@ pub fn next_repeat_at(
     Ok(resolve_local_datetime(end_date.and_time(end))?.with_timezone(&Utc))
 }
 
+pub fn next_daily_at(now_utc: DateTime<Utc>, time: NaiveTime) -> AppResult<DateTime<Utc>> {
+    let local = now_utc.with_timezone(&Local);
+    let mut date = local.date_naive();
+    let today = resolve_local_datetime(date.and_time(time))?.with_timezone(&Utc);
+    if today <= now_utc {
+        date += Duration::days(1);
+    }
+    Ok(resolve_local_datetime(date.and_time(time))?.with_timezone(&Utc))
+}
+
+pub fn shift_calendar(
+    value: DateTime<Utc>,
+    amount: u32,
+    unit: &str,
+    forward: bool,
+) -> AppResult<DateTime<Utc>> {
+    if amount == 0 || !SCHEDULE_UNITS.contains(&unit) {
+        return Err(AppError::Validation("提醒周期无效".into()));
+    }
+    let local = value.with_timezone(&Local);
+    let date = local.date_naive();
+    let shifted_date = match (unit, forward) {
+        ("DAY", true) => date.checked_add_signed(Duration::days(i64::from(amount))),
+        ("DAY", false) => date.checked_sub_signed(Duration::days(i64::from(amount))),
+        ("WEEK", true) => date.checked_add_signed(Duration::weeks(i64::from(amount))),
+        ("WEEK", false) => date.checked_sub_signed(Duration::weeks(i64::from(amount))),
+        ("MONTH", true) => date.checked_add_months(Months::new(amount)),
+        ("MONTH", false) => date.checked_sub_months(Months::new(amount)),
+        ("YEAR", true) => date.checked_add_months(Months::new(amount.saturating_mul(12))),
+        ("YEAR", false) => date.checked_sub_months(Months::new(amount.saturating_mul(12))),
+        _ => None,
+    }
+    .ok_or_else(|| AppError::Validation("无法计算下一次日历时间".into()))?;
+    Ok(resolve_local_datetime(shifted_date.and_time(local.time()))?.with_timezone(&Utc))
+}
+
 fn time_is_quiet(value: NaiveTime, start: NaiveTime, end: NaiveTime) -> bool {
     if start == end {
         return false;
@@ -481,6 +703,7 @@ mod tests {
             smtp_to: String::new(),
             smtp_username: String::new(),
             smtp_repeat_must_complete: false,
+            event_kind_defaults: default_event_kind_defaults(),
         }
     }
 
@@ -534,6 +757,37 @@ mod tests {
         assert_eq!(
             next_local.time(),
             NaiveTime::from_hms_opt(7, 30, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn monthly_calendar_shift_uses_the_last_valid_day() {
+        let january = Local
+            .with_ymd_and_hms(2026, 1, 31, 9, 30, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let february = shift_calendar(january, 1, "MONTH", true)
+            .unwrap()
+            .with_timezone(&Local);
+        assert_eq!(
+            february.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()
+        );
+        assert_eq!(february.time(), NaiveTime::from_hms_opt(9, 30, 0).unwrap());
+    }
+
+    #[test]
+    fn yearly_calendar_shift_clamps_leap_day_in_non_leap_year() {
+        let leap_day = Local
+            .with_ymd_and_hms(2028, 2, 29, 15, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let next_year = shift_calendar(leap_day, 1, "YEAR", true)
+            .unwrap()
+            .with_timezone(&Local);
+        assert_eq!(
+            next_year.date_naive(),
+            NaiveDate::from_ymd_opt(2029, 2, 28).unwrap()
         );
     }
 

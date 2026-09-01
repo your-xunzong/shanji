@@ -32,6 +32,15 @@ const settings: Settings = {
   smtpTo: '',
   smtpUsername: '',
   smtpRepeatMustComplete: false,
+  eventKindDefaults: [
+    { eventKind: 'ORDINARY', reminderPlan: 'REPEAT' },
+    { eventKind: 'ONE_TIME', reminderPlan: 'ONCE' },
+    { eventKind: 'TODAY_MUST', reminderPlan: 'EMPHASIS' },
+    { eventKind: 'WARNING', reminderPlan: 'REPEAT' },
+    { eventKind: 'CONTINUOUS', reminderPlan: 'CUSTOM' },
+    { eventKind: 'MONTHLY', reminderPlan: 'ONCE' },
+    { eventKind: 'YEARLY', reminderPlan: 'ONCE' },
+  ],
 };
 
 describe('Tauri startup calls', () => {

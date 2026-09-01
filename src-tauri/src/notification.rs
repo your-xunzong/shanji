@@ -3,7 +3,10 @@ use std::{fs, path::PathBuf};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::{db::DueNotification, error::AppResult};
+use crate::{
+    db::{ClassificationNotification, DueNotification},
+    error::AppResult,
+};
 
 #[cfg(windows)]
 const WINDOWS_INSTALLED_APP_ID: &str = "com.shanji.desktop";
@@ -192,6 +195,85 @@ impl NotificationService {
         }
     }
 
+    pub fn send_classification(
+        &self,
+        notification: &ClassificationNotification,
+    ) -> Result<(), DeliveryError> {
+        #[cfg(windows)]
+        {
+            use tauri_winrt_notification::{Scenario, Toast};
+
+            if self.portable && !self.windows_identity_registered() {
+                return Err(DeliveryError {
+                    code: "identity_registration_required",
+                    diagnostic: "便携版通知身份尚未注册".into(),
+                });
+            }
+            if !self.windows_identity_registered() {
+                self.register_windows_identity()?;
+            }
+
+            let app = self.app.clone();
+            let item_id = notification.item_id.clone();
+            let count = notification.count;
+            let body = if count == 1 {
+                "这条记录还没有选择事件类型".to_string()
+            } else {
+                format!("有 {count} 条记录还没有选择事件类型")
+            };
+            let mut toast = Toast::new(self.windows_app_id())
+                .title("闪记 · 待选择事件类型")
+                .text1(&body)
+                .text2("记录已经安全保存，可以现在处理或稍后再选。")
+                .scenario(Scenario::Reminder)
+                .on_activated(move |action| {
+                    handle_classification_action(&app, item_id.as_deref(), action.as_deref());
+                    Ok(())
+                });
+            if count == 1 {
+                toast = toast.add_button("设为普通", "set-ordinary");
+            }
+            toast = toast
+                .add_button(
+                    if count == 1 {
+                        "选择其他事件类型"
+                    } else {
+                        "处理待选类型"
+                    },
+                    "choose-type",
+                )
+                .add_button("稍后处理", "snooze-classification");
+            toast.show().map_err(|error| DeliveryError {
+                code: "platform_submit_failed",
+                diagnostic: error.to_string(),
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            use tauri_plugin_notification::NotificationExt;
+
+            let body = if notification.count == 1 {
+                "这条记录还没有选择事件类型。打开闪记即可处理。".to_string()
+            } else {
+                format!(
+                    "有 {} 条记录还没有选择事件类型。打开闪记即可处理。",
+                    notification.count
+                )
+            };
+            self.app
+                .notification()
+                .builder()
+                .title("闪记 · 待选择事件类型")
+                .body(body)
+                .show()
+                .map_err(|error| DeliveryError {
+                    code: "platform_submit_failed",
+                    diagnostic: error.to_string(),
+                })
+        }
+    }
+
     #[cfg(windows)]
     fn send_windows(
         &self,
@@ -331,6 +413,36 @@ fn handle_notification_action(app: &AppHandle, item_id: &str, action: Option<&st
         _ => {
             let _ = crate::show_main_window(app);
             let _ = app.emit("notification_opened", item_id.to_string());
+        }
+    }
+}
+
+#[cfg(windows)]
+fn handle_classification_action(app: &AppHandle, item_id: Option<&str>, action: Option<&str>) {
+    match action {
+        Some("set-ordinary") => {
+            if let (Some(state), Some(item_id)) = (app.try_state::<crate::AppState>(), item_id) {
+                let now = state.clock.now_utc();
+                if state.database.classify_as_ordinary(item_id, now).is_ok() {
+                    state.scheduler.wake();
+                    let _ = app.emit("items_changed", ());
+                }
+            }
+        }
+        Some("snooze-classification") => {
+            if let Some(state) = app.try_state::<crate::AppState>() {
+                let now = state.clock.now_utc();
+                let _ = state.database.snooze_classification(item_id, 60, now);
+                state.scheduler.wake();
+                let _ = app.emit("items_changed", ());
+            }
+        }
+        _ => {
+            let _ = crate::show_main_window(app);
+            let _ = app.emit(
+                "classification_opened",
+                item_id.unwrap_or_default().to_string(),
+            );
         }
     }
 }

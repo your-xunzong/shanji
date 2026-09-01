@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { EVENT_KIND_OPTIONS, REMINDER_PLAN_OPTIONS } from '../lib/presentation';
   import type {
+    AppInfo,
     AutostartStatus,
     NotificationStatus,
     Settings,
@@ -8,6 +10,8 @@
     DataFileSummary,
     SmtpStatus,
     Tag,
+    EventKind,
+    ReminderPlan,
   } from '../lib/types';
 
   export let settings: Settings;
@@ -43,6 +47,7 @@
   };
   export let onOpenDataDirectory: () => Promise<void> = async () => {};
   export let onRestoreDatabase: (path: string) => Promise<void> = async () => {};
+  export let appInfo: AppInfo | null = null;
 
   let form: Settings = structuredClone(settings);
   let updateExistingDefaultItems = false;
@@ -73,6 +78,17 @@
     form.workdays = form.workdays.includes(day)
       ? form.workdays.filter((value) => value !== day)
       : [...form.workdays, day].sort();
+    form = { ...form };
+  }
+
+  function eventDefault(kind: EventKind): ReminderPlan {
+    return form.eventKindDefaults.find((entry) => entry.eventKind === kind)?.reminderPlan ?? 'ONCE';
+  }
+
+  function setEventDefault(kind: EventKind, reminderPlan: ReminderPlan): void {
+    form.eventKindDefaults = form.eventKindDefaults.map((entry) =>
+      entry.eventKind === kind ? { ...entry, reminderPlan } : entry,
+    );
     form = { ...form };
   }
 
@@ -281,6 +297,23 @@
 
     <section class="settings-section">
       <div class="section-heading">
+        <h3>事件默认提醒</h3>
+        <p>选择事件类型时自动使用；只影响新记录和之后主动转换的记录。</p>
+      </div>
+      <div class="event-default-grid">
+        {#each EVENT_KIND_OPTIONS as option}
+          <label>
+            <span><strong>{option.label}</strong><small>{option.description}</small></span>
+            <select value={eventDefault(option.value)} on:change={(event) => setEventDefault(option.value, event.currentTarget.value as ReminderPlan)}>
+              {#each REMINDER_PLAN_OPTIONS as plan}<option value={plan.value}>{plan.label}</option>{/each}
+            </select>
+          </label>
+        {/each}
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <div class="section-heading">
         <h3>今日必做</h3>
         <p>到期后按此间隔继续提醒，直到完成或暂停。</p>
       </div>
@@ -419,7 +452,7 @@
           <strong>哪些标签发送邮件</strong>
           <small>事项包含任一已选标签时发送；没有标签的事项不会发送。勾选后立即保存。</small>
           {#if tags.length === 0}
-            <p>还没有标签，请先在“类型与标签”中添加。</p>
+            <p>还没有标签，请先在“整理方式”中添加。</p>
           {:else}
             <div class="email-route-tags">
               {#each tags as tag}
@@ -481,6 +514,17 @@
         <p class="data-backup-note">正在读取数据位置…</p>
       {/if}
       {#if dataActionStatus}<p class="data-action-status" role="status">{dataActionStatus}</p>{/if}
+    </section>
+
+    <section class="settings-section about-section">
+      <div class="section-heading"><h3>关于闪记</h3><p>版本信息与本地数据说明。</p></div>
+      <div class="about-card">
+        <span class="brand-mark large" aria-hidden="true"></span>
+        <div><strong>{appInfo?.name ?? '闪记'}</strong><small>版本 {appInfo?.version ?? '读取中'}</small><small>{appInfo?.copyright ?? '© 2026 闪记'}</small></div>
+      </div>
+      <p class="field-help">闪记默认离线运行。事项正文、备注和本地草稿不会在未授权时上传。</p>
+      <div class="data-action-row"><button class="text-mini" on:click={onOpenDataDirectory}>打开数据位置</button></div>
+      <details class="license-details"><summary>第三方开源许可</summary><p>闪记使用第三方开源组件。各组件版权归其权利人所有，分发包中的许可文件适用。</p></details>
     </section>
   </div>
 

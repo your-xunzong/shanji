@@ -2,6 +2,7 @@ node_modules/
 dist/
 .svelte-kit/
 src-tauri/target/
+.cargo-target-*/
 src-tauri/gen/
 .tmp/
 *.log

@@ -13,6 +13,7 @@ use crate::{
 #[serde(rename_all = "camelCase")]
 pub struct ExportFilterInput {
     pub status: String,
+    pub event_kind: Option<String>,
     pub category_id: Option<String>,
     pub tag_id: Option<String>,
     pub created_from: Option<String>,
@@ -40,11 +41,14 @@ pub fn filter_items(items: Vec<Item>, filter: &ExportFilterInput) -> AppResult<V
                 "done" => item.status == "DONE",
                 _ => true,
             };
-            let category_matches = match filter.category_id.as_deref() {
-                Some("__inbox__") => item.category_id.is_none(),
-                Some(id) => item.category_id.as_deref() == Some(id),
-                None => true,
-            };
+            let event_kind_matches = filter
+                .event_kind
+                .as_deref()
+                .is_none_or(|kind| item.event_kind.as_deref() == Some(kind));
+            let category_matches = filter
+                .category_id
+                .as_deref()
+                .is_none_or(|id| item.category_id.as_deref() == Some(id));
             let tag_matches = filter
                 .tag_id
                 .as_deref()
@@ -55,7 +59,12 @@ pub fn filter_items(items: Vec<Item>, filter: &ExportFilterInput) -> AppResult<V
             let after_start =
                 created_from.is_none_or(|from| created.is_some_and(|value| value >= from));
             let before_end = created_to.is_none_or(|to| created.is_some_and(|value| value <= to));
-            status_matches && category_matches && tag_matches && after_start && before_end
+            status_matches
+                && event_kind_matches
+                && category_matches
+                && tag_matches
+                && after_start
+                && before_end
         })
         .collect())
 }
@@ -115,12 +124,17 @@ fn write_workbook(path: &Path, items: &[Item]) -> Result<(), XlsxError> {
         "事项内容",
         "备注",
         "状态",
+        "事件类型",
         "类型",
+        "重要",
+        "提醒方案",
         "标签",
         "创建时间（本地）",
         "当前到期时间（本地）",
+        "开始时间（本地）",
+        "结束时间（本地）",
+        "预警目标（本地）",
         "完成时间（本地）",
-        "今日必做",
         "顺延次数",
         "提醒状态",
     ];
@@ -128,7 +142,8 @@ fn write_workbook(path: &Path, items: &[Item]) -> Result<(), XlsxError> {
         detail.write_string_with_format(0, column as u16, *value, &header)?;
     }
     for (column, width) in [
-        35.0, 30.0, 10.0, 12.0, 22.0, 20.0, 20.0, 20.0, 10.0, 10.0, 16.0,
+        35.0, 30.0, 10.0, 12.0, 12.0, 9.0, 12.0, 22.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 10.0,
+        16.0,
     ]
     .into_iter()
     .enumerate()
@@ -142,9 +157,12 @@ fn write_workbook(path: &Path, items: &[Item]) -> Result<(), XlsxError> {
             excel_safe_text(&item.title),
             excel_safe_text(&item.notes),
             status_label(&item.status).to_string(),
+            event_kind_label(item.event_kind.as_deref()).to_string(),
             item.category_name
                 .clone()
-                .unwrap_or_else(|| "收件箱".into()),
+                .unwrap_or_else(|| "未分类".into()),
+            if item.important { "是" } else { "否" }.into(),
+            reminder_plan_label(&item.reminder_plan).to_string(),
             item.tags
                 .iter()
                 .map(|tag| tag.name.as_str())
@@ -152,16 +170,22 @@ fn write_workbook(path: &Path, items: &[Item]) -> Result<(), XlsxError> {
                 .join("、"),
             local_datetime(&item.created_at),
             format!("{} {}", item.due_local_date, item.due_local_time),
+            item.start_at
+                .as_deref()
+                .map(local_datetime)
+                .unwrap_or_default(),
+            item.end_at
+                .as_deref()
+                .map(local_datetime)
+                .unwrap_or_default(),
+            item.target_at
+                .as_deref()
+                .map(local_datetime)
+                .unwrap_or_default(),
             item.completed_at
                 .as_deref()
                 .map(local_datetime)
                 .unwrap_or_default(),
-            if item.completion_policy == "MUST_COMPLETE_TODAY" {
-                "是"
-            } else {
-                "否"
-            }
-            .into(),
             item.rollover_count.to_string(),
             reminder_label(item).to_string(),
         ];
@@ -169,11 +193,11 @@ fn write_workbook(path: &Path, items: &[Item]) -> Result<(), XlsxError> {
             detail.write_string(row, column as u16, value)?;
         }
     }
-    detail.autofilter(0, 0, items.len() as u32, 10)?;
+    detail.autofilter(0, 0, items.len() as u32, 15)?;
 
     let summary = workbook.add_worksheet();
-    summary.set_name("分类汇总")?;
-    for (column, value) in ["类型", "事项数", "待处理", "已完成", "今日必做"]
+    summary.set_name("事件类型汇总")?;
+    for (column, value) in ["事件类型", "事项数", "待处理", "已完成", "今日必做"]
         .iter()
         .enumerate()
     {
@@ -181,10 +205,7 @@ fn write_workbook(path: &Path, items: &[Item]) -> Result<(), XlsxError> {
     }
     let mut counts: BTreeMap<String, [u32; 4]> = BTreeMap::new();
     for item in items {
-        let key = item
-            .category_name
-            .clone()
-            .unwrap_or_else(|| "收件箱".into());
+        let key = event_kind_label(item.event_kind.as_deref()).to_string();
         let entry = counts.entry(key).or_default();
         entry[0] += 1;
         if item.status == "OPEN" {
@@ -207,6 +228,38 @@ fn write_workbook(path: &Path, items: &[Item]) -> Result<(), XlsxError> {
     summary.set_column_width(0, 24)?;
     for column in 1..=4 {
         summary.set_column_width(column, 12)?;
+    }
+
+    let category_summary = workbook.add_worksheet();
+    category_summary.set_name("类型汇总")?;
+    for (column, value) in ["类型", "事项数", "待处理", "已完成"].iter().enumerate() {
+        category_summary.write_string_with_format(0, column as u16, *value, &header)?;
+    }
+    let mut category_counts: BTreeMap<String, [u32; 3]> = BTreeMap::new();
+    for item in items {
+        let key = item
+            .category_name
+            .clone()
+            .unwrap_or_else(|| "未分类".into());
+        let entry = category_counts.entry(key).or_default();
+        entry[0] += 1;
+        if item.status == "OPEN" {
+            entry[1] += 1;
+        }
+        if item.status == "DONE" {
+            entry[2] += 1;
+        }
+    }
+    for (index, (name, values)) in category_counts.into_iter().enumerate() {
+        let row = index as u32 + 1;
+        category_summary.write_string(row, 0, excel_safe_text(&name))?;
+        for (column, value) in values.into_iter().enumerate() {
+            category_summary.write_number(row, column as u16 + 1, f64::from(value))?;
+        }
+    }
+    category_summary.set_column_width(0, 24)?;
+    for column in 1..=3 {
+        category_summary.set_column_width(column, 12)?;
     }
 
     workbook.save(path)
@@ -238,6 +291,31 @@ fn status_label(status: &str) -> &str {
         "ARCHIVED" => "已归档",
         "DELETED" => "回收站",
         _ => "未知",
+    }
+}
+
+fn event_kind_label(kind: Option<&str>) -> &str {
+    match kind {
+        Some("ORDINARY") => "普通",
+        Some("ONE_TIME") => "一次性",
+        Some("TODAY_MUST") => "今日必做",
+        Some("WARNING") => "预警",
+        Some("CONTINUOUS") => "持续",
+        Some("MONTHLY") => "月度",
+        Some("YEARLY") => "年度",
+        Some(_) => "未知类型",
+        None => "待选择事件类型",
+    }
+}
+
+fn reminder_plan_label(plan: &str) -> &str {
+    match plan {
+        "REPEAT" => "重复",
+        "EMPHASIS" => "强调",
+        "ONCE" => "一次性",
+        "FORCE" => "强制",
+        "CUSTOM" => "自定义",
+        _ => "未知方案",
     }
 }
 
@@ -287,6 +365,18 @@ mod tests {
             updated_at: created_at.into(),
             completed_at: None,
             deleted_at: None,
+            event_kind: Some("ORDINARY".into()),
+            reminder_plan: "REPEAT".into(),
+            important: false,
+            time_mode: "SPECIFIED".into(),
+            start_at: None,
+            end_at: None,
+            target_at: None,
+            lead_value: None,
+            lead_unit: None,
+            cadence_value: None,
+            cadence_unit: None,
+            emphasis_max_per_day: 8,
             tags: tag_id
                 .map(|id| {
                     vec![Tag {
@@ -355,6 +445,7 @@ mod tests {
             items,
             &ExportFilterInput {
                 status: "open".into(),
+                event_kind: Some("ORDINARY".into()),
                 category_id: Some("work".into()),
                 tag_id: Some("customer".into()),
                 created_from: Some("2026-08-01T00:00:00+00:00".into()),
@@ -393,6 +484,18 @@ mod tests {
             updated_at: "2026-08-28T09:00:00+00:00".into(),
             completed_at: None,
             deleted_at: None,
+            event_kind: Some("TODAY_MUST".into()),
+            reminder_plan: "EMPHASIS".into(),
+            important: true,
+            time_mode: "SPECIFIED".into(),
+            start_at: None,
+            end_at: None,
+            target_at: None,
+            lead_value: None,
+            lead_unit: None,
+            cadence_value: None,
+            cadence_unit: None,
+            emphasis_max_per_day: 8,
             tags: vec![Tag {
                 id: "customer".into(),
                 name: "客户".into(),

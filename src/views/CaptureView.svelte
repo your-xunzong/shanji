@@ -3,20 +3,21 @@
   import { isTauri } from '@tauri-apps/api/core';
   import { api } from '../lib/api';
   import {
+    EVENT_KIND_OPTIONS,
     duePreview,
     localDateTimeInputLabel,
     localInputToIso,
     mustCompletePreview,
   } from '../lib/presentation';
-  import type { Category, Settings, Tag } from '../lib/types';
+  import type { EventKind, ScheduleUnit, Settings, Tag } from '../lib/types';
 
   let content = '';
+  let eventKind: EventKind | '' = '';
   let mustCompleteToday = false;
-  let categoryId: string | null = null;
+  let important = false;
   let dueAt = '';
   let timePickerOpen = false;
   let settings: Settings | null = null;
-  let categories: Category[] = [];
   let tags: Tag[] = [];
   let tagIds: string[] = [];
   let tagPickerOpen = false;
@@ -26,7 +27,16 @@
   let inputElement: HTMLTextAreaElement;
   let draftTimer: ReturnType<typeof setTimeout> | undefined;
   let unlisten: (() => void) | undefined;
+  let eventPickerOpen = false;
+  let startAt = '';
+  let endAt = '';
+  let targetAt = '';
+  let leadValue = 1;
+  let leadUnit: ScheduleUnit = 'DAY';
+  let cadenceValue = 1;
+  let cadenceUnit: ScheduleUnit = 'DAY';
 
+  $: mustCompleteToday = eventKind === 'TODAY_MUST';
   $: dueLabel = dueAt
     ? `指定：${localDateTimeInputLabel(dueAt)}`
     : mustCompleteToday
@@ -49,14 +59,12 @@
 
   async function refreshContext(): Promise<void> {
     try {
-      const [loadedSettings, loadedCategories, loadedTags, draft] = await Promise.all([
+      const [loadedSettings, loadedTags, draft] = await Promise.all([
         api.getSettings(),
-        api.listCategories(),
         api.listTags(),
         api.loadDraft(),
       ]);
       settings = loadedSettings;
-      categories = loadedCategories;
       tags = loadedTags;
       if (!content) content = draft;
     } catch (cause) {
@@ -122,20 +130,42 @@
     saving = true;
     error = '';
     try {
+      if (eventKind === 'WARNING' && !targetAt) {
+        throw new Error('请设置预警事件的发生时间，或先选择“稍后选择事件类型”。');
+      }
+      if (eventKind === 'CONTINUOUS' && (!startAt || !endAt)) {
+        throw new Error('请设置持续事件的开始和结束时间，或先选择“稍后选择事件类型”。');
+      }
       await api.createItem({
         title,
-        categoryId,
+        categoryId: null,
         dueAt: localInputToIso(dueAt),
         mustCompleteToday,
         repeatIntervalMinutes: mustCompleteToday
           ? settings?.overtimeIntervalMinutes ?? 30
           : null,
         tagIds,
+        event: {
+          kind: eventKind || null,
+          reminderPlan: null,
+          important,
+          startAt: localInputToIso(startAt),
+          endAt: localInputToIso(endAt),
+          targetAt: localInputToIso(targetAt),
+          leadValue: eventKind === 'WARNING' ? leadValue : null,
+          leadUnit: eventKind === 'WARNING' ? leadUnit : null,
+          cadenceValue: eventKind === 'CONTINUOUS' ? cadenceValue : null,
+          cadenceUnit: eventKind === 'CONTINUOUS' ? cadenceUnit : null,
+          emphasisMaxPerDay: null,
+        },
       });
       content = '';
-      mustCompleteToday = false;
-      categoryId = null;
+      eventKind = '';
+      important = false;
       dueAt = '';
+      startAt = '';
+      endAt = '';
+      targetAt = '';
       tagIds = [];
       saved = true;
       await new Promise((resolve) => setTimeout(resolve, 160));
@@ -180,6 +210,14 @@
   function toggleTagPicker(): void {
     tagPickerOpen = !tagPickerOpen;
     if (tagPickerOpen) timePickerOpen = false;
+  }
+
+  function handleEventKindChange(): void {
+    eventPickerOpen = eventKind === 'WARNING' || eventKind === 'CONTINUOUS';
+    if (eventPickerOpen) {
+      timePickerOpen = false;
+      tagPickerOpen = false;
+    }
   }
 </script>
 
@@ -244,15 +282,32 @@
       </div>
     {/if}
 
-    <label class="chip select-chip">
+    <label class="chip select-chip" class:active={Boolean(eventKind)}>
       <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h5l1.5 2h6.5v8h-13z" /></svg>
-      <select bind:value={categoryId} aria-label="选择分类">
-        <option value={null}>收件箱</option>
-        {#each categories as category}
-          <option value={category.id}>{category.name}</option>
+      <select bind:value={eventKind} aria-label="选择事件类型" on:change={handleEventKindChange}>
+        <option value="">稍后选择事件类型</option>
+        {#each EVENT_KIND_OPTIONS as option}
+          <option value={option.value}>{option.label}</option>
         {/each}
       </select>
     </label>
+
+    {#if eventPickerOpen && eventKind === 'WARNING'}
+      <div class="capture-event-picker">
+        <div class="time-picker-heading"><div><strong>设置预警</strong><small>从提前时间开始，每天提醒</small></div><button class="icon-button" aria-label="关闭预警设置" on:click={() => (eventPickerOpen = false)}>×</button></div>
+        <label class="custom-time-field"><span>事件发生时间</span><input type="datetime-local" bind:value={targetAt} /></label>
+        <div class="event-rule-row"><label><span>提前</span><input type="number" min="1" max="999" bind:value={leadValue} /></label><label><span>单位</span><select bind:value={leadUnit}><option value="DAY">天</option><option value="WEEK">周</option><option value="MONTH">月</option><option value="YEAR">年</option></select></label></div>
+        <button class="primary-mini" disabled={!targetAt} on:click={() => (eventPickerOpen = false)}>设置好了</button>
+      </div>
+    {:else if eventPickerOpen && eventKind === 'CONTINUOUS'}
+      <div class="capture-event-picker">
+        <div class="time-picker-heading"><div><strong>设置持续时间</strong><small>只在这段时间内按周期提醒</small></div><button class="icon-button" aria-label="关闭持续事件设置" on:click={() => (eventPickerOpen = false)}>×</button></div>
+        <label class="custom-time-field"><span>开始</span><input type="datetime-local" bind:value={startAt} /></label>
+        <label class="custom-time-field"><span>结束</span><input type="datetime-local" bind:value={endAt} /></label>
+        <div class="event-rule-row"><label><span>每</span><input type="number" min="1" max="999" bind:value={cadenceValue} /></label><label><span>周期</span><select bind:value={cadenceUnit}><option value="DAY">天</option><option value="WEEK">周</option><option value="MONTH">月</option><option value="YEAR">年</option></select></label></div>
+        <button class="primary-mini" disabled={!startAt || !endAt} on:click={() => (eventPickerOpen = false)}>设置好了</button>
+      </div>
+    {/if}
 
     {#if tags.length > 0}
       <button type="button" class="chip capture-tag-button" class:active={tagIds.length > 0} aria-expanded={tagPickerOpen} on:click={toggleTagPicker}>
@@ -269,8 +324,8 @@
       {/if}
     {/if}
 
-    <label class="must-chip" class:active={mustCompleteToday}>
-      <input type="checkbox" bind:checked={mustCompleteToday} />
+    <label class="must-chip" class:active={eventKind === 'TODAY_MUST'}>
+      <input type="checkbox" checked={eventKind === 'TODAY_MUST'} on:change={(event) => (eventKind = event.currentTarget.checked ? 'TODAY_MUST' : '')} />
       <span class="must-dot" aria-hidden="true"></span>
       今日必做
       {#if mustCompleteToday}

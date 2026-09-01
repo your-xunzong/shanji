@@ -25,6 +25,8 @@
         dueLocalDate: '2026-08-29',
         dueLocalTime: '18:00',
         completionPolicy: 'MUST_COMPLETE_TODAY',
+        eventKind: 'TODAY_MUST',
+        reminderPlan: 'FORCE',
         tagIds: [],
       }];
     }

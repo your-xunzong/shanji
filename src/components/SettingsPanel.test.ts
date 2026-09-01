@@ -25,6 +25,15 @@ const settings: Settings = {
   smtpTo: '',
   smtpUsername: '',
   smtpRepeatMustComplete: false,
+  eventKindDefaults: [
+    { eventKind: 'ORDINARY', reminderPlan: 'REPEAT' },
+    { eventKind: 'ONE_TIME', reminderPlan: 'ONCE' },
+    { eventKind: 'TODAY_MUST', reminderPlan: 'EMPHASIS' },
+    { eventKind: 'WARNING', reminderPlan: 'REPEAT' },
+    { eventKind: 'CONTINUOUS', reminderPlan: 'CUSTOM' },
+    { eventKind: 'MONTHLY', reminderPlan: 'ONCE' },
+    { eventKind: 'YEARLY', reminderPlan: 'ONCE' },
+  ],
 };
 
 const notificationStatus: NotificationStatus = {
@@ -46,6 +55,33 @@ const autostartStatus: AutostartStatus = {
 };
 
 describe('SettingsPanel', () => {
+  it('显示运行时版本并保存事件默认方案', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(SettingsPanel, {
+      settings,
+      saving: false,
+      notificationStatus,
+      autostartStatus,
+      appInfo: { name: '闪记', version: '0.6.0', copyright: '© 2026 闪记' },
+      onClose: vi.fn(),
+      onSave,
+      onTestNotification: vi.fn().mockResolvedValue(undefined),
+      onTestReminderMode: vi.fn().mockResolvedValue(undefined),
+      onRegisterNotifications: vi.fn().mockResolvedValue(undefined),
+      onUnregisterNotifications: vi.fn().mockResolvedValue(undefined),
+      onOpenOnboarding: vi.fn(),
+    });
+
+    expect(screen.getByText('版本 0.6.0')).toBeInTheDocument();
+    await fireEvent.change(screen.getByLabelText(/^今日必做/), { target: { value: 'FORCE' } });
+    await fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
+      eventKindDefaults: expect.arrayContaining([
+        { eventKind: 'TODAY_MUST', reminderPlan: 'FORCE' },
+      ]),
+    }));
+  });
+
   it('原样展示后端返回的快捷键错误', async () => {
     const message = '快捷键“Ctrl+Shift+Space”已被其他程序占用；原快捷键仍然有效。';
     render(SettingsPanel, {

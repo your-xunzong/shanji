@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { EVENT_KIND_OPTIONS } from '../lib/presentation';
   import type { Category, Tag, TaxonomyInput } from '../lib/types';
 
   export let categories: Category[];
@@ -19,6 +20,7 @@
   let newTag: TaxonomyInput = { name: '', color: '#B06C49' };
   let busy = '';
   let error = '';
+
   let deletingCategory: Category | null = null;
   let reassignDraft = '';
 
@@ -58,6 +60,11 @@
     });
   }
 
+  async function deleteTag(tag: Tag): Promise<void> {
+    if (!window.confirm(`删除标签“${tag.name}”吗？事项本身不会被删除。`)) return;
+    await run(`delete-tag-${tag.id}`, () => onDeleteTag(tag.id));
+  }
+
   function requestDeleteCategory(category: Category): void {
     deletingCategory = category;
     reassignDraft = '';
@@ -70,25 +77,29 @@
     await run(`delete-category-${id}`, () => onDeleteCategory(id, reassignDraft || null));
     if (!error) deletingCategory = null;
   }
-
-  async function deleteTag(tag: Tag): Promise<void> {
-    if (!window.confirm(`确定删除标签“${tag.name}”吗？它只会从事项上移除。`)) return;
-    await run(`delete-tag-${tag.id}`, () => onDeleteTag(tag.id));
-  }
 </script>
 
 <div class="panel-backdrop" role="presentation" on:click={onClose}></div>
 <aside class="settings-panel organizer-panel" aria-labelledby="organizer-heading">
   <header class="settings-header">
-    <div><p class="eyebrow">整理方式</p><h2 id="organizer-heading">类型与标签</h2></div>
-    <button class="icon-button" aria-label="关闭类型与标签" on:click={onClose}>
+    <div><p class="eyebrow">整理方式</p><h2 id="organizer-heading">事件类型、类型与标签</h2></div>
+    <button class="icon-button" aria-label="关闭整理方式" on:click={onClose}>
       <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg>
     </button>
   </header>
 
   <div class="settings-content">
     <section class="settings-section">
-      <div class="section-heading"><h3>类型</h3><p>每个事项选择一个工作性质。没有类型的事项会显示在收件箱。</p></div>
+      <div class="section-heading"><h3>七种事件类型</h3><p>表达时间性质，决定事项何时发生与如何延续。</p></div>
+      <div class="event-kind-overview">
+        {#each EVENT_KIND_OPTIONS as option}
+          <div><strong>{option.label}</strong><span>{option.description}</span></div>
+        {/each}
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <div class="section-heading"><h3>类型</h3><p>每个事项最多选一个性质，例如工作、个人或学习。</p></div>
       <div class="taxonomy-list">
         {#each categories as category, index (category.id)}
           <div class="taxonomy-row">
@@ -104,24 +115,25 @@
             <strong>删除“{deletingCategory.name}”</strong>
             <p>事项不会被删除。请选择这些事项之后使用的类型。</p>
             <select bind:value={reassignDraft} aria-label="删除类型后的迁移目标">
-              <option value="">改为收件箱（无类型）</option>
+              <option value="">保留为未分类</option>
               {#each categories.filter((category) => category.id !== deletingCategory?.id) as category}
                 <option value={category.id}>改为“{category.name}”</option>
               {/each}
             </select>
-            <div><button class="danger-confirm" disabled={Boolean(busy)} on:click={confirmDeleteCategory}>确认删除</button><button class="text-mini" on:click={() => (deletingCategory = null)}>取消</button></div>
+            <div><button class="danger-confirm" disabled={Boolean(busy)} on:click={confirmDeleteCategory}>删除类型</button><button class="text-mini" on:click={() => (deletingCategory = null)}>取消</button></div>
           </div>
         {/if}
         <div class="taxonomy-row taxonomy-new">
           <input type="color" bind:value={newCategory.color} aria-label="新类型颜色" />
-          <input type="text" maxlength="30" bind:value={newCategory.name} placeholder="新类型名称" aria-label="新类型名称" />
+          <input type="text" maxlength="30" bind:value={newCategory.name} placeholder="例如：学习" aria-label="新类型名称" />
           <button class="primary-mini" disabled={Boolean(busy) || !newCategory.name.trim()} on:click={createCategory}>添加类型</button>
         </div>
       </div>
+      {#if categories.length === 0}<p class="taxonomy-empty">还没有类型。未选择时，事项会显示为“未分类”。</p>{/if}
     </section>
 
     <section class="settings-section">
-      <div class="section-heading"><h3>标签</h3><p>标签可以多选，用颜色快速区分事项内容。</p></div>
+      <div class="section-heading"><h3>标签</h3><p>标签可以多选，用于项目、客户等可重用的内容特征。</p></div>
       <div class="taxonomy-list">
         {#each tags as tag, index (tag.id)}
           <div class="taxonomy-row">
@@ -134,11 +146,11 @@
         {/each}
         <div class="taxonomy-row taxonomy-new">
           <input type="color" bind:value={newTag.color} aria-label="新标签颜色" />
-          <input type="text" maxlength="30" bind:value={newTag.name} placeholder="新标签名称" aria-label="新标签名称" />
+          <input type="text" maxlength="30" bind:value={newTag.name} placeholder="例如：项目 A、客户" aria-label="新标签名称" />
           <button class="primary-mini" disabled={Boolean(busy) || !newTag.name.trim()} on:click={createTag}>添加标签</button>
         </div>
       </div>
-      {#if tags.length === 0}<p class="taxonomy-empty">还没有标签。添加后可在事项编辑中选择多个标签。</p>{/if}
+      {#if tags.length === 0}<p class="taxonomy-empty">还没有标签。添加后可在一个事项上选择多个。</p>{/if}
     </section>
     {#if error}<p class="organizer-error" role="alert">{error}</p>{/if}
   </div>

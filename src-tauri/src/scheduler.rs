@@ -172,6 +172,45 @@ fn process_once(
                     }
                 }
             }
+            for notification in result.classification_notifications {
+                if !result.notifications_enabled {
+                    if let Err(error) = database.mark_classification_delivery(
+                        &notification.event_ids,
+                        "DISABLED",
+                        Some("notifications_disabled"),
+                        now,
+                    ) {
+                        eprintln!("待选类型通知关闭状态记录失败：{error}");
+                    }
+                    continue;
+                }
+                match notifications.send_classification(&notification) {
+                    Ok(()) => {
+                        if let Err(error) = database.mark_classification_delivery(
+                            &notification.event_ids,
+                            "SUBMITTED",
+                            None,
+                            now,
+                        ) {
+                            eprintln!("待选类型通知结果记录失败：{error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "待选类型通知提交失败（{}）：{}",
+                            error.code, error.diagnostic
+                        );
+                        if let Err(database_error) = database.mark_classification_delivery(
+                            &notification.event_ids,
+                            "FAILED",
+                            Some(error.code),
+                            now,
+                        ) {
+                            eprintln!("待选类型通知失败结果记录失败：{database_error}");
+                        }
+                    }
+                }
+            }
             if result.changed {
                 let _ = app.emit("items_changed", ());
                 let _ = app.emit("reminder_center_changed", ());
@@ -189,7 +228,8 @@ fn should_use_persistent_notification(
     notification: &crate::db::DueNotification,
 ) -> bool {
     settings.persistent_notifications_enabled
-        && notification.completion_policy == "MUST_COMPLETE_TODAY"
+        && (notification.completion_policy == "MUST_COMPLETE_TODAY"
+            || notification.reminder_plan == "FORCE")
 }
 
 fn deliver_email(
@@ -244,6 +284,7 @@ mod tests {
             smtp_to: String::new(),
             smtp_username: String::new(),
             smtp_repeat_must_complete: false,
+            event_kind_defaults: crate::domain::default_event_kind_defaults(),
         }
     }
 
@@ -255,12 +296,18 @@ mod tests {
             due_local_date: "2026-08-29".into(),
             due_local_time: "18:00".into(),
             completion_policy: policy.into(),
+            event_kind: (policy == "MUST_COMPLETE_TODAY").then(|| "TODAY_MUST".into()),
+            reminder_plan: if policy == "MUST_COMPLETE_TODAY" {
+                "EMPHASIS".into()
+            } else {
+                "ONCE".into()
+            },
             tag_ids: Vec::new(),
         }
     }
 
     #[test]
-    fn persistent_native_mode_is_reserved_for_must_complete_items() {
+    fn persistent_native_mode_supports_today_must_and_force_plan() {
         let mut settings = settings();
         assert!(should_use_persistent_notification(
             &settings,
@@ -270,6 +317,9 @@ mod tests {
             &settings,
             &notification("NORMAL")
         ));
+        let mut forced = notification("NORMAL");
+        forced.reminder_plan = "FORCE".into();
+        assert!(should_use_persistent_notification(&settings, &forced));
         settings.persistent_notifications_enabled = false;
         assert!(!should_use_persistent_notification(
             &settings,

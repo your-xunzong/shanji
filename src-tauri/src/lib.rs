@@ -147,8 +147,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_items,
+            commands::get_app_info,
             commands::create_item,
             commands::set_item_completed,
+            commands::classify_item_as_ordinary,
+            commands::complete_series_occurrence,
             commands::set_reminder_paused,
             commands::reschedule_item,
             commands::get_settings,
