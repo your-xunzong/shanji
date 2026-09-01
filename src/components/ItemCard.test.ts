@@ -15,6 +15,7 @@ const item: Item = {
   eventKind: 'ORDINARY', reminderPlan: 'REPEAT', important: false, timeMode: 'SPECIFIED',
   startAt: null, endAt: null, targetAt: null, leadValue: null, leadUnit: null,
   cadenceValue: null, cadenceUnit: null, emphasisMaxPerDay: 8,
+  repeatTimeMode: 'SPECIFIED', repeatTimes: ['18:00'],
   tags: [{ id: 'customer', name: '客户', color: '#B06C49' }],
 };
 
@@ -33,5 +34,43 @@ describe('ItemCard', () => {
     expect(screen.getByLabelText('类型')).toHaveValue('work');
     expect(screen.getByRole('button', { name: '客户' })).toHaveClass('active');
     expect(screen.getByRole('button', { name: '保存修改' })).toBeInTheDocument();
+  });
+
+  it('allows a repeat item to restore the current two default times', async () => {
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    render(ItemCard, { props: {
+      item,
+      repeatDefaultTimes: ['09:30', '16:30'],
+      categories: [], tags: [],
+      onComplete: vi.fn(), onPause: vi.fn(), onReschedule: vi.fn(),
+      onUpdate, onDelete: vi.fn(), onPermanentDelete: vi.fn(),
+    } });
+    await fireEvent.click(screen.getByRole('button', { name: '编辑' }));
+    await fireEvent.click(screen.getByRole('radio', { name: /每天两个时间/ }));
+    await fireEvent.click(screen.getByRole('button', { name: '保存修改' }));
+    expect(onUpdate).toHaveBeenCalledWith(item, expect.objectContaining({
+      event: expect.objectContaining({
+        repeatTimeMode: 'DEFAULT',
+        repeatTimes: ['09:30', '16:30'],
+      }),
+    }));
+  });
+
+  it('editing another field does not replace an existing default snapshot', async () => {
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    const existing = { ...item, repeatTimeMode: 'DEFAULT' as const, repeatTimes: ['10:00', '17:00'] };
+    render(ItemCard, { props: {
+      item: existing,
+      repeatDefaultTimes: ['09:30', '16:30'],
+      categories: [], tags: [],
+      onComplete: vi.fn(), onPause: vi.fn(), onReschedule: vi.fn(),
+      onUpdate, onDelete: vi.fn(), onPermanentDelete: vi.fn(),
+    } });
+    await fireEvent.click(screen.getByRole('button', { name: '编辑' }));
+    expect(screen.getByRole('button', { name: /恢复当前默认/ })).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: '保存修改' }));
+    expect(onUpdate).toHaveBeenCalledWith(existing, expect.objectContaining({
+      event: expect.objectContaining({ repeatTimes: ['10:00', '17:00'] }),
+    }));
   });
 });

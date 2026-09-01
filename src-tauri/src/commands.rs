@@ -18,7 +18,7 @@ use crate::{
     notification::NotificationStatus,
 };
 
-const CURRENT_ONBOARDING_VERSION: u32 = 2;
+const CURRENT_ONBOARDING_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -894,6 +894,8 @@ pub(crate) fn insert_notification_test_item(
                 cadence_value: None,
                 cadence_unit: None,
                 emphasis_max_per_day: None,
+                repeat_time_mode: None,
+                repeat_times: Vec::new(),
             }),
         },
         now,

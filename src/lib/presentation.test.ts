@@ -42,6 +42,8 @@ const baseItem: Item = {
   cadenceValue: null,
   cadenceUnit: null,
   emphasisMaxPerDay: 8,
+  repeatTimeMode: 'SPECIFIED',
+  repeatTimes: ['18:00'],
   tags: [],
 };
 

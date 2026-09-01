@@ -5,6 +5,7 @@ import type { AutostartStatus, NotificationStatus, Settings } from '../lib/types
 
 const settings: Settings = {
   defaultDueTime: '18:00',
+  repeatDefaultTimes: ['10:00', '17:00'],
   workdays: [1, 2, 3, 4, 5],
   overtimeIntervalMinutes: 30,
   quietHoursEnabled: true,
@@ -62,7 +63,7 @@ describe('SettingsPanel', () => {
       saving: false,
       notificationStatus,
       autostartStatus,
-      appInfo: { name: '闪记', version: '0.6.0', copyright: '© 2026 闪记' },
+      appInfo: { name: '闪记', version: '0.7.0', copyright: '© 2026 闪记' },
       onClose: vi.fn(),
       onSave,
       onTestNotification: vi.fn().mockResolvedValue(undefined),
@@ -72,7 +73,7 @@ describe('SettingsPanel', () => {
       onOpenOnboarding: vi.fn(),
     });
 
-    expect(screen.getByText('版本 0.6.0')).toBeInTheDocument();
+    expect(screen.getByText('版本 0.7.0')).toBeInTheDocument();
     await fireEvent.change(screen.getByLabelText(/^今日必做/), { target: { value: 'FORCE' } });
     await fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
@@ -100,6 +101,27 @@ describe('SettingsPanel', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(message);
+  });
+
+  it('重复提醒默认时间相同时不提交设置', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(SettingsPanel, {
+      settings,
+      saving: false,
+      notificationStatus,
+      autostartStatus,
+      onClose: vi.fn(),
+      onSave,
+      onTestNotification: vi.fn().mockResolvedValue(undefined),
+      onTestReminderMode: vi.fn().mockResolvedValue(undefined),
+      onRegisterNotifications: vi.fn().mockResolvedValue(undefined),
+      onUnregisterNotifications: vi.fn().mockResolvedValue(undefined),
+      onOpenOnboarding: vi.fn(),
+    });
+    await fireEvent.input(screen.getByLabelText('第二次'), { target: { value: '10:00' } });
+    expect(screen.getByRole('alert')).toHaveTextContent('不能使用相同时间');
+    expect(screen.getByRole('button', { name: '保存设置' })).toBeDisabled();
+    expect(onSave).not.toHaveBeenCalled();
   });
 
   it('submits an SMTP password separately from ordinary settings', async () => {

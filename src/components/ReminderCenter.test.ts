@@ -15,6 +15,7 @@ const item: Item = {
   eventKind: 'TODAY_MUST', reminderPlan: 'EMPHASIS', important: true, timeMode: 'SPECIFIED',
   startAt: null, endAt: null, targetAt: null, leadValue: null, leadUnit: null,
   cadenceValue: null, cadenceUnit: null, emphasisMaxPerDay: 8,
+  repeatTimeMode: 'SPECIFIED', repeatTimes: [],
   tags: [],
 };
 

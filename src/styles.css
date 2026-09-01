@@ -1137,6 +1137,7 @@ kbd {
 
 .item-editor input[type="text"],
 .item-editor input[type="datetime-local"],
+.item-editor input[type="time"],
 .item-editor select,
 .item-editor textarea {
   width: 100%;
@@ -1156,6 +1157,26 @@ kbd {
 
 .editor-wide {
   grid-column: 1 / -1;
+}
+
+.repeat-plan-editor {
+  padding: 10px;
+  border: 1px solid #d8e0e6;
+  border-radius: 8px;
+  background: white;
+  gap: 8px;
+}
+
+.repeat-plan-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.repeat-plan-options label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .tag-picker > div {
@@ -1797,6 +1818,12 @@ kbd {
   font-size: 10px;
 }
 
+.field-error {
+  margin: 8px 0 0;
+  color: var(--vermilion);
+  font-size: 10px;
+}
+
 .notification-test-row {
   display: flex;
   margin-top: 16px;
@@ -2269,6 +2296,7 @@ kbd {
   display: flex;
   min-width: 0;
   padding: 39px 42px 28px;
+  overflow: hidden;
   flex-direction: column;
 }
 
@@ -2282,7 +2310,10 @@ kbd {
 
 .onboarding-body {
   flex: 1;
+  min-height: 0;
   padding-top: 28px;
+  padding-right: 3px;
+  overflow-y: auto;
 }
 
 .onboarding-lead {
@@ -2388,6 +2419,50 @@ kbd {
   grid-template-columns: 170px minmax(0, 1fr);
   align-items: end;
   gap: 24px;
+}
+
+.onboarding-repeat-times {
+  display: grid;
+  margin-top: 12px;
+  padding: 16px 20px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f9fbfc;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 20px;
+}
+
+.onboarding-repeat-times > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.onboarding-repeat-times small {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.paired-time-fields {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+}
+
+.paired-time-fields label {
+  display: grid;
+  gap: 5px;
+  color: #526172;
+  font-size: 9px;
+}
+
+.paired-time-fields input {
+  padding: 8px 9px;
+  border: 1px solid #bdc8d3;
+  border-radius: 7px;
+  background: white;
+  color: var(--ink);
 }
 
 .onboarding-time-field,
@@ -2591,9 +2666,17 @@ kbd {
     padding: 30px 25px 22px;
   }
 
+  .onboarding-dialog {
+    height: min(680px, calc(100vh - 36px));
+  }
+
   .onboarding-time-card {
     grid-template-columns: 1fr;
     gap: 15px;
+  }
+
+  .onboarding-repeat-times {
+    grid-template-columns: 1fr;
   }
 }
 

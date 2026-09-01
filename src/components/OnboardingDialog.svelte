@@ -17,6 +17,8 @@
   let step = 0;
   let autostartEnabled = firstRun ? true : autostartStatus.enabled;
   let defaultDueTime = settings.defaultDueTime;
+  let repeatTimeFirst = settings.repeatDefaultTimes[0] ?? '10:00';
+  let repeatTimeSecond = settings.repeatDefaultTimes[1] ?? '17:00';
   let globalShortcut = settings.globalShortcut;
   let enablePortableNotifications = false;
   let busy = false;
@@ -33,7 +35,7 @@
   const quickTimes = ['17:30', '18:00', '18:30'];
 
   $: shortcutError = validateShortcut(globalShortcut);
-  $: timeError = validateTime(defaultDueTime);
+  $: timeError = validateTimes(defaultDueTime, repeatTimeFirst, repeatTimeSecond);
 
   onMount(() => {
     const previousFocus = document.activeElement as HTMLElement | null;
@@ -59,9 +61,12 @@
     return '';
   }
 
-  function validateTime(value: string): string {
-    if (!value) return '请选择默认提醒时间。';
-    if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value)) return '请选择有效的默认提醒时间。';
+  function validateTimes(defaultTime: string, firstTime: string, secondTime: string): string {
+    const valid = (value: string) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
+    if (!valid(defaultTime)) return '请选择有效的默认到期时间。';
+    if (!valid(firstTime)) return '请选择有效的第一次重复提醒时间。';
+    if (!valid(secondTime)) return '请选择有效的第二次重复提醒时间。';
+    if (firstTime === secondTime) return '两次重复提醒不能使用相同时间。';
     return '';
   }
 
@@ -79,6 +84,7 @@
       await onFinish({
         autostartEnabled,
         defaultDueTime,
+        repeatDefaultTimes: [repeatTimeFirst, repeatTimeSecond].sort(),
         globalShortcut: globalShortcut.trim(),
         enablePortableNotifications,
       });
@@ -194,10 +200,10 @@
           <p class="onboarding-note warning">便携版启动项指向当前程序路径。移动或删除整个目录后，需要重新设置。</p>
         {/if}
       {:else if step === 2}
-        <p class="onboarding-lead">选一个适合你工作节奏的时间。已有事项不会改变。</p>
+        <p class="onboarding-lead">设置未指定时间的到期点，以及重复事项每天的两个提醒时点。已有事项不会改变。</p>
         <div class="onboarding-time-card">
           <label class="onboarding-time-field">
-            <span>默认提醒时间</span>
+            <span>未指定时间的默认到期</span>
             <input
               type="time"
               bind:value={defaultDueTime}
@@ -220,10 +226,21 @@
             </div>
           </div>
         </div>
+        <div class="onboarding-repeat-times" aria-labelledby="onboarding-repeat-label">
+          <div>
+            <strong id="onboarding-repeat-label">重复事项每天提醒两次</strong>
+            <small>新事项会复制这两个时间，以后修改默认值不会改动已有事项。</small>
+          </div>
+          <div class="paired-time-fields">
+            <label><span>第一次</span><input type="time" bind:value={repeatTimeFirst} aria-invalid={!!timeError} /></label>
+            <span aria-hidden="true">·</span>
+            <label><span>第二次</span><input type="time" bind:value={repeatTimeSecond} aria-invalid={!!timeError} /></label>
+          </div>
+        </div>
         {#if timeError}
           <p id="onboarding-time-error" class="onboarding-field-error" role="alert">{timeError}</p>
         {:else}
-          <p class="reminder-time-preview">未填写时间的新事项会在 <strong>{defaultDueTime}</strong> 提醒。</p>
+          <p class="reminder-time-preview">普通未指定时间的事项在 <strong>{defaultDueTime}</strong> 到期；重复事项默认在 <strong>{[repeatTimeFirst, repeatTimeSecond].sort().join('、')}</strong> 提醒。</p>
         {/if}
       {:else}
         <p class="onboarding-lead">这个组合键只负责唤起闪记。应用不会记录其他按键或输入内容。</p>

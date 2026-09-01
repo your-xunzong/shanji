@@ -264,6 +264,7 @@ mod tests {
     fn settings() -> Settings {
         Settings {
             default_due_time: "18:00".into(),
+            repeat_default_times: vec!["10:00".into(), "17:00".into()],
             workdays: vec![1, 2, 3, 4, 5],
             overtime_interval_minutes: 30,
             quiet_hours_enabled: true,

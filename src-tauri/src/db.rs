@@ -14,8 +14,8 @@ use crate::{
     domain::{
         Category, CreateItemInput, EventConfigurationInput, EventKindDefault, Item, Settings, Tag,
         TaxonomyInput, UpdateItemInput, UpdateSettingsInput, due_for_local_date, due_from_explicit,
-        must_complete_due, next_daily_at, next_default_due, next_repeat_at, parse_time,
-        shift_calendar,
+        must_complete_due, next_daily_at, next_default_due, next_repeat_at, next_repeat_slot_after,
+        parse_time, shift_calendar,
     },
     error::{AppError, AppResult},
 };
@@ -26,7 +26,8 @@ const MIGRATION_0003: &str = include_str!("../migrations/0003_autostart_onboardi
 const MIGRATION_0004: &str = include_str!("../migrations/0004_types_tags_recycle.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_reminder_channels.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_event_kinds.sql");
-const LATEST_SCHEMA_VERSION: i64 = 6;
+const MIGRATION_0007: &str = include_str!("../migrations/0007_repeat_time_slots.sql");
+const LATEST_SCHEMA_VERSION: i64 = 7;
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -113,6 +114,8 @@ struct DueRow {
     emphasis_count_local_date: Option<String>,
     series_anchor_month: Option<u32>,
     series_anchor_day: Option<u32>,
+    repeat_time_first: Option<String>,
+    repeat_time_second: Option<String>,
 }
 
 pub fn apply_pending_restore(database_path: &Path) -> AppResult<()> {
@@ -204,6 +207,11 @@ impl Database {
             transaction.execute_batch(MIGRATION_0006)?;
             transaction.commit()?;
         }
+        if version < 7 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(MIGRATION_0007)?;
+            transaction.commit()?;
+        }
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -222,6 +230,7 @@ impl Database {
         transaction.execute_batch(MIGRATION_0004)?;
         transaction.execute_batch(MIGRATION_0005)?;
         transaction.execute_batch(MIGRATION_0006)?;
+        transaction.execute_batch(MIGRATION_0007)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -330,7 +339,9 @@ impl Database {
                 smtp_from = ?18,
                 smtp_to = ?19,
                 smtp_username = ?20,
-                smtp_repeat_must_complete = ?21
+                smtp_repeat_must_complete = ?21,
+                repeat_default_time_first = ?22,
+                repeat_default_time_second = ?23
              WHERE id = 1",
             params![
                 settings.default_due_time,
@@ -354,6 +365,8 @@ impl Database {
                 settings.smtp_to,
                 settings.smtp_username,
                 bool_to_int(settings.smtp_repeat_must_complete),
+                settings.repeat_default_times[0],
+                settings.repeat_default_times[1],
             ],
         )?;
 
@@ -387,6 +400,8 @@ impl Database {
             input.event.as_ref(),
             input.must_complete_today,
         )?;
+        let (repeat_time_mode, repeat_times) =
+            repeat_schedule_for_event(&event, input.due_at.as_deref(), &settings)?;
         let due = initial_due_for_event(&event, input.due_at.as_deref(), now, &settings)?;
 
         let id = Uuid::new_v4().to_string();
@@ -416,7 +431,7 @@ impl Database {
                     .repeat_interval_minutes
                     .unwrap_or(settings.overtime_interval_minutes),
             );
-        let next_reminder = initial_next_reminder(&event, due.utc, now)?;
+        let next_reminder = initial_next_reminder(&event, due.utc, now, &repeat_times)?;
         let classification_next = event.kind.is_none().then(|| due_at.clone());
         let time_mode = if input.due_at.is_some()
             || matches!(event.kind.as_deref(), Some("WARNING" | "CONTINUOUS"))
@@ -434,9 +449,11 @@ impl Database {
                 due_source, rollover_policy, completion_policy, repeat_interval_minutes,
                 next_reminder_at, created_at, updated_at, event_kind, reminder_plan, important,
                 time_mode, start_at, end_at, target_at, lead_value, lead_unit,
-                cadence_value, cadence_unit, emphasis_max_per_day, classification_next_reminder_at
+                cadence_value, cadence_unit, emphasis_max_per_day, classification_next_reminder_at,
+                repeat_time_mode, repeat_time_first, repeat_time_second
              ) VALUES (?1, ?2, ?3, 'OPEN', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13,
-                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
+                ?27, ?28, ?29)",
             params![
                 id,
                 input.title.trim(),
@@ -464,6 +481,9 @@ impl Database {
                 event.cadence_unit,
                 event.emphasis_max_per_day,
                 classification_next,
+                repeat_time_mode,
+                repeat_times.first(),
+                repeat_times.get(1),
             ],
         )?;
         transaction.execute(
@@ -770,7 +790,12 @@ impl Database {
         transaction.execute(
             "UPDATE items SET due_at = ?1, due_local_date = ?2, due_local_time = ?3,
                 due_source = 'EXPLICIT', rollover_policy = 'NONE', next_reminder_at = ?1,
-                reminder_paused = 0, updated_at = ?4, revision = revision + 1 WHERE id = ?5",
+                reminder_paused = 0, updated_at = ?4, revision = revision + 1,
+                time_mode = 'SPECIFIED',
+                repeat_time_mode = CASE WHEN reminder_plan = 'REPEAT' THEN 'SPECIFIED' ELSE repeat_time_mode END,
+                repeat_time_first = CASE WHEN reminder_plan = 'REPEAT' THEN ?3 ELSE repeat_time_first END,
+                repeat_time_second = CASE WHEN reminder_plan = 'REPEAT' THEN NULL ELSE repeat_time_second END
+                WHERE id = ?5",
             params![
                 due_at,
                 due.local_date.format("%Y-%m-%d").to_string(),
@@ -934,6 +959,8 @@ impl Database {
                 input.must_complete_today,
             )?
         };
+        let (repeat_time_mode, repeat_times) =
+            repeat_schedule_for_event(&event, Some(&input.due_at), &settings)?;
         let due = initial_due_for_event(&event, Some(&input.due_at), now, &settings)?;
         if existing.due_at < now.to_rfc3339()
             && existing.event_kind == event.kind
@@ -957,7 +984,7 @@ impl Database {
                     .unwrap_or(settings.overtime_interval_minutes),
             );
         let next_reminder = if existing.status == "OPEN" && !existing.reminder_paused {
-            Some(initial_next_reminder(&event, due.utc, now)?)
+            Some(initial_next_reminder(&event, due.utc, now, &repeat_times)?)
         } else {
             None
         };
@@ -983,7 +1010,8 @@ impl Database {
                 emphasis_max_per_day = ?22, emphasis_count = 0,
                 emphasis_count_local_date = NULL,
                 classification_next_reminder_at = ?23,
-                series_occurrence_pending = 0 WHERE id = ?24",
+                series_occurrence_pending = 0, repeat_time_mode = ?24,
+                repeat_time_first = ?25, repeat_time_second = ?26 WHERE id = ?27",
             params![
                 input.title.trim(),
                 input.notes,
@@ -1008,6 +1036,9 @@ impl Database {
                 event.cadence_unit,
                 event.emphasis_max_per_day,
                 classification_next,
+                repeat_time_mode,
+                repeat_times.first(),
+                repeat_times.get(1),
                 id,
             ],
         )?;
@@ -1449,7 +1480,8 @@ impl Database {
                         revision, due_local_date, due_local_time, end_at, target_at,
                         cadence_value, cadence_unit, emphasis_max_per_day,
                         emphasis_count, emphasis_count_local_date,
-                        series_anchor_month, series_anchor_day
+                        series_anchor_month, series_anchor_day,
+                        repeat_time_first, repeat_time_second
                  FROM items
                  WHERE status = 'OPEN' AND reminder_paused = 0
                    AND next_reminder_at IS NOT NULL AND next_reminder_at <= ?1
@@ -1477,6 +1509,8 @@ impl Database {
                     emphasis_count_local_date: row.get(17)?,
                     series_anchor_month: row.get(18)?,
                     series_anchor_day: row.get(19)?,
+                    repeat_time_first: row.get(20)?,
+                    repeat_time_second: row.get(21)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
@@ -1577,12 +1611,14 @@ impl Database {
                     .into_iter()
                     .map(|tag| tag.id)
                     .collect();
+                let scheduled_local = scheduled_local_fields(&row.scheduled_for)
+                    .unwrap_or_else(|| (row.due_local_date.clone(), row.due_local_time.clone()));
                 result.notifications.push(DueNotification {
                     event_id,
                     item_id: row.id,
                     title: row.title,
-                    due_local_date: row.due_local_date,
-                    due_local_time: row.due_local_time,
+                    due_local_date: scheduled_local.0,
+                    due_local_time: scheduled_local.1,
                     completion_policy: row.completion_policy,
                     event_kind: row.event_kind,
                     reminder_plan: row.reminder_plan,
@@ -1837,6 +1873,16 @@ impl Database {
     }
 }
 
+fn scheduled_local_fields(value: &str) -> Option<(String, String)> {
+    DateTime::parse_from_rfc3339(value).ok().map(|scheduled| {
+        let local = scheduled.with_timezone(&Local);
+        (
+            local.date_naive().format("%Y-%m-%d").to_string(),
+            local.time().format("%H:%M").to_string(),
+        )
+    })
+}
+
 fn claimed_event_item_id(
     transaction: &Transaction<'_>,
     event_id: &str,
@@ -1860,7 +1906,8 @@ fn read_settings(connection: &Connection) -> AppResult<Settings> {
                     persistent_notifications_enabled, overlay_reminders_enabled,
                     repeat_unacknowledged_enabled, unacknowledged_repeat_minutes,
                     smtp_enabled, smtp_host, smtp_port, smtp_security,
-                    smtp_from, smtp_to, smtp_username, smtp_repeat_must_complete
+                    smtp_from, smtp_to, smtp_username, smtp_repeat_must_complete,
+                    repeat_default_time_first, repeat_default_time_second
              FROM app_settings WHERE id = 1",
             [],
             |row| {
@@ -1874,6 +1921,7 @@ fn read_settings(connection: &Connection) -> AppResult<Settings> {
                 })?;
                 Ok(Settings {
                     default_due_time: row.get(0)?,
+                    repeat_default_times: vec![row.get(21)?, row.get(22)?],
                     workdays,
                     overtime_interval_minutes: row.get(2)?,
                     quiet_hours_enabled: row.get::<_, i64>(3)? != 0,
@@ -1929,7 +1977,8 @@ fn item_select() -> &'static str {
             i.bypass_app_quiet_hours, i.created_at, i.updated_at, i.completed_at,
             i.deleted_at, i.event_kind, i.reminder_plan, i.important, i.time_mode,
             i.start_at, i.end_at, i.target_at, i.lead_value, i.lead_unit,
-            i.cadence_value, i.cadence_unit, i.emphasis_max_per_day
+            i.cadence_value, i.cadence_unit, i.emphasis_max_per_day,
+            i.repeat_time_mode, i.repeat_time_first, i.repeat_time_second
      FROM items i LEFT JOIN categories c ON c.id = i.category_id"
 }
 
@@ -1968,6 +2017,14 @@ fn row_to_item(row: &Row<'_>) -> rusqlite::Result<Item> {
         cadence_value: row.get(30)?,
         cadence_unit: row.get(31)?,
         emphasis_max_per_day: row.get(32)?,
+        repeat_time_mode: row.get(33)?,
+        repeat_times: [
+            row.get::<_, Option<String>>(34)?,
+            row.get::<_, Option<String>>(35)?,
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
         tags: Vec::new(),
     })
 }
@@ -2138,6 +2195,8 @@ struct ResolvedEventConfig {
     cadence_value: Option<u32>,
     cadence_unit: Option<String>,
     emphasis_max_per_day: u32,
+    repeat_time_mode: Option<String>,
+    repeat_times: Vec<String>,
 }
 
 impl ResolvedEventConfig {
@@ -2154,6 +2213,8 @@ impl ResolvedEventConfig {
             cadence_value: item.cadence_value,
             cadence_unit: item.cadence_unit.clone(),
             emphasis_max_per_day: item.emphasis_max_per_day,
+            repeat_time_mode: Some(item.repeat_time_mode.clone()),
+            repeat_times: item.repeat_times.clone(),
         }
     }
 }
@@ -2199,7 +2260,56 @@ fn resolve_event_config(
         cadence_value,
         cadence_unit,
         emphasis_max_per_day: input.emphasis_max_per_day.unwrap_or(8),
+        repeat_time_mode: input.repeat_time_mode,
+        repeat_times: input.repeat_times,
     })
+}
+
+fn repeat_schedule_for_event(
+    config: &ResolvedEventConfig,
+    explicit_due: Option<&str>,
+    settings: &Settings,
+) -> AppResult<(String, Vec<String>)> {
+    if config.reminder_plan != "REPEAT" {
+        return Ok((
+            config
+                .repeat_time_mode
+                .clone()
+                .unwrap_or_else(|| "SPECIFIED".into()),
+            config.repeat_times.clone(),
+        ));
+    }
+
+    match config.repeat_time_mode.as_deref() {
+        Some("DEFAULT") if config.repeat_times.len() == 2 => {
+            let mut times = config.repeat_times.clone();
+            times.sort();
+            Ok(("DEFAULT".into(), times))
+        }
+        Some("DEFAULT") => Ok(("DEFAULT".into(), settings.repeat_default_times.clone())),
+        Some("SPECIFIED") if !config.repeat_times.is_empty() => {
+            Ok(("SPECIFIED".into(), vec![config.repeat_times[0].clone()]))
+        }
+        _ if !config.repeat_times.is_empty() => Ok((
+            config.repeat_time_mode.clone().unwrap_or_else(|| {
+                if config.repeat_times.len() == 2 {
+                    "DEFAULT"
+                } else {
+                    "SPECIFIED"
+                }
+                .into()
+            }),
+            config.repeat_times.clone(),
+        )),
+        _ if explicit_due.is_some() => {
+            let due = due_from_explicit(explicit_due.expect("checked above"))?;
+            Ok((
+                "SPECIFIED".into(),
+                vec![due.local_time.format("%H:%M").to_string()],
+            ))
+        }
+        _ => Ok(("DEFAULT".into(), settings.repeat_default_times.clone())),
+    }
 }
 
 fn initial_due_for_event(
@@ -2208,6 +2318,15 @@ fn initial_due_for_event(
     now: DateTime<Utc>,
     settings: &Settings,
 ) -> AppResult<crate::domain::DueMoment> {
+    if config.reminder_plan == "REPEAT"
+        && explicit_due.is_none()
+        && !matches!(config.kind.as_deref(), Some("WARNING" | "CONTINUOUS"))
+    {
+        let (_, repeat_times) = repeat_schedule_for_event(config, explicit_due, settings)?;
+        let next = next_repeat_slot_after(now, &repeat_times)?;
+        let local = next.with_timezone(&Local);
+        return due_for_local_date(local.date_naive(), local.time());
+    }
     match config.kind.as_deref() {
         Some("WARNING") => due_from_explicit(
             config
@@ -2236,6 +2355,7 @@ fn initial_next_reminder(
     config: &ResolvedEventConfig,
     due_at: DateTime<Utc>,
     now: DateTime<Utc>,
+    repeat_times: &[String],
 ) -> AppResult<String> {
     let candidate = if config.kind.as_deref() == Some("WARNING") {
         shift_calendar(
@@ -2244,6 +2364,8 @@ fn initial_next_reminder(
             config.lead_unit.as_deref().unwrap_or("DAY"),
             false,
         )?
+    } else if config.reminder_plan == "REPEAT" && due_at <= now {
+        next_repeat_slot_after(now, repeat_times)?
     } else {
         due_at
     };
@@ -2259,6 +2381,7 @@ fn next_after_delivery(
         .map_err(|_| AppError::Validation("提醒计划时间损坏".into()))?
         .with_timezone(&Utc);
     let local_time = parse_time(&row.due_local_time)?;
+    let repeat_times = repeat_times_for_row(row);
 
     if row.event_kind.as_deref() == Some("WARNING")
         && let Some(target) = &row.target_at
@@ -2267,13 +2390,27 @@ fn next_after_delivery(
             .map_err(|_| AppError::Validation("预警目标时间损坏".into()))?
             .with_timezone(&Utc);
         if scheduled < target && now < target {
-            let next = next_daily_at(now, local_time)?;
+            let next = if row.reminder_plan == "REPEAT" {
+                next_repeat_slot_after(now, &repeat_times)?
+            } else {
+                crate::domain::next_daily_at(now, local_time)?
+            };
             return Ok(Some(next.min(target)));
         }
+        return Ok(None);
     }
 
     match row.event_kind.as_deref() {
         Some("CONTINUOUS") => {
+            if row.reminder_plan == "REPEAT" {
+                let next = next_repeat_slot_after(now, &repeat_times)?;
+                let end = row
+                    .end_at
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc));
+                return Ok(end.filter(|end| next <= *end).map(|_| next));
+            }
             let next = next_calendar_after(
                 scheduled,
                 now,
@@ -2297,7 +2434,7 @@ fn next_after_delivery(
                     row.series_anchor_day,
                 )
                 .map(Some),
-                "REPEAT" => next_daily_at(now, local_time).map(Some),
+                "REPEAT" => next_repeat_slot_after(now, &repeat_times).map(Some),
                 "EMPHASIS" => next_emphasis_at(row, now, settings).map(Some),
                 "FORCE" => next_repeat_at(
                     now,
@@ -2320,7 +2457,7 @@ fn next_after_delivery(
     }
 
     match row.reminder_plan.as_str() {
-        "REPEAT" => next_daily_at(now, local_time).map(Some),
+        "REPEAT" => next_repeat_slot_after(now, &repeat_times).map(Some),
         "EMPHASIS" => next_emphasis_at(row, now, settings).map(Some),
         "FORCE" => next_repeat_at(
             now,
@@ -2343,6 +2480,22 @@ fn next_after_delivery(
         .map(Some),
         _ => Ok(None),
     }
+}
+
+fn repeat_times_for_row(row: &DueRow) -> Vec<String> {
+    [
+        row.repeat_time_first.clone(),
+        row.repeat_time_second.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .into_iter()
+    .chain(
+        (row.repeat_time_first.is_none() && row.repeat_time_second.is_none())
+            .then(|| row.due_local_time.clone()),
+    )
+    .collect()
 }
 
 fn should_stop_without_delivery(row: &DueRow, now: DateTime<Utc>) -> AppResult<bool> {
@@ -2747,6 +2900,8 @@ mod tests {
             cadence_value: None,
             cadence_unit: None,
             emphasis_max_per_day: None,
+            repeat_time_mode: None,
+            repeat_times: Vec::new(),
         }
     }
 
@@ -2936,7 +3091,7 @@ mod tests {
     }
 
     #[test]
-    fn warning_repeats_daily_from_lead_time_until_target() {
+    fn warning_repeats_at_daily_slots_from_lead_time_until_target() {
         let database = Database::in_memory().unwrap();
         let target = at_local(2026, 9, 10, 10, 0);
         let mut warning = event("WARNING", "REPEAT");
@@ -2966,8 +3121,152 @@ mod tests {
         assert_eq!(first.notifications.len(), 1);
         assert_eq!(
             database.get_item(&item.id).unwrap().next_reminder_at,
-            Some(at_local(2026, 9, 8, 10, 0).to_rfc3339())
+            Some(at_local(2026, 9, 7, 17, 0).to_rfc3339())
         );
+        database
+            .mark_notification_submitted(
+                &first.notifications[0].event_id,
+                at_local(2026, 9, 7, 10, 0),
+            )
+            .unwrap();
+        database
+            .connection
+            .lock()
+            .expect("database mutex poisoned")
+            .execute(
+                "UPDATE items SET next_reminder_at = ?1 WHERE id = ?2",
+                params![target.to_rfc3339(), item.id],
+            )
+            .unwrap();
+        let target_delivery = database.process_due(target).unwrap();
+        assert_eq!(target_delivery.notifications.len(), 1);
+        assert_eq!(database.get_item(&item.id).unwrap().next_reminder_at, None);
+    }
+
+    #[test]
+    fn default_repeat_item_uses_two_snapshot_slots_and_skips_missed_history() {
+        let database = Database::in_memory().unwrap();
+        let created = database
+            .create_item(
+                &CreateItemInput {
+                    title: "双时点提醒".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: None,
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
+                    event: Some(event("ORDINARY", "REPEAT")),
+                },
+                at_local(2026, 9, 1, 9, 0),
+            )
+            .unwrap();
+        assert_eq!(created.repeat_time_mode, "DEFAULT");
+        assert_eq!(created.repeat_times, vec!["10:00", "17:00"]);
+        assert_eq!(
+            created.next_reminder_at,
+            Some(at_local(2026, 9, 1, 10, 0).to_rfc3339())
+        );
+
+        let first = database.process_due(at_local(2026, 9, 1, 10, 1)).unwrap();
+        assert_eq!(first.notifications.len(), 1);
+        assert_eq!(first.notifications[0].due_local_time, "10:00");
+        database
+            .mark_notification_submitted(
+                &first.notifications[0].event_id,
+                at_local(2026, 9, 1, 10, 1),
+            )
+            .unwrap();
+        assert_eq!(
+            database.get_item(&created.id).unwrap().next_reminder_at,
+            Some(at_local(2026, 9, 1, 17, 0).to_rfc3339())
+        );
+
+        let after_sleep = database.process_due(at_local(2026, 9, 1, 22, 0)).unwrap();
+        assert_eq!(after_sleep.notifications.len(), 1);
+        assert_eq!(after_sleep.notifications[0].due_local_time, "17:00");
+        assert_eq!(
+            database.get_item(&created.id).unwrap().next_reminder_at,
+            Some(at_local(2026, 9, 2, 10, 0).to_rfc3339())
+        );
+    }
+
+    #[test]
+    fn changing_repeat_defaults_does_not_rewrite_existing_item_snapshot() {
+        let database = Database::in_memory().unwrap();
+        let now = at_local(2026, 9, 1, 9, 0);
+        let existing = database
+            .create_item(
+                &CreateItemInput {
+                    title: "保留旧时间".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: None,
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
+                    event: Some(event("ORDINARY", "REPEAT")),
+                },
+                now,
+            )
+            .unwrap();
+        let current = database.get_settings().unwrap();
+        database
+            .update_settings(
+                &UpdateSettingsInput {
+                    default_due_time: current.default_due_time,
+                    repeat_default_times: vec!["09:30".into(), "16:30".into()],
+                    workdays: current.workdays,
+                    overtime_interval_minutes: current.overtime_interval_minutes,
+                    quiet_hours_enabled: current.quiet_hours_enabled,
+                    quiet_start: current.quiet_start,
+                    quiet_end: current.quiet_end,
+                    global_shortcut: current.global_shortcut,
+                    notifications_enabled: current.notifications_enabled,
+                    autostart_enabled: current.autostart_enabled,
+                    update_existing_default_items: false,
+                    persistent_notifications_enabled: current.persistent_notifications_enabled,
+                    overlay_reminders_enabled: current.overlay_reminders_enabled,
+                    repeat_unacknowledged_enabled: current.repeat_unacknowledged_enabled,
+                    unacknowledged_repeat_minutes: current.unacknowledged_repeat_minutes,
+                    smtp_enabled: current.smtp_enabled,
+                    smtp_host: current.smtp_host,
+                    smtp_port: current.smtp_port,
+                    smtp_security: current.smtp_security,
+                    smtp_from: current.smtp_from,
+                    smtp_to: current.smtp_to,
+                    smtp_username: current.smtp_username,
+                    smtp_repeat_must_complete: current.smtp_repeat_must_complete,
+                    smtp_password: None,
+                    event_kind_defaults: current.event_kind_defaults,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            database.get_item(&existing.id).unwrap().repeat_times,
+            vec!["10:00", "17:00"]
+        );
+        let mut preserved_event = event("ORDINARY", "REPEAT");
+        preserved_event.repeat_time_mode = Some("DEFAULT".into());
+        preserved_event.repeat_times = vec!["10:00".into(), "17:00".into()];
+        let edited = database
+            .update_item(
+                &existing.id,
+                &UpdateItemInput {
+                    title: "只修改标题".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    tag_ids: Vec::new(),
+                    due_at: existing.due_at,
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    event: Some(preserved_event),
+                },
+                at_local(2026, 9, 1, 9, 5),
+            )
+            .unwrap();
+        assert_eq!(edited.repeat_times, vec!["10:00", "17:00"]);
     }
 
     #[test]
@@ -3179,7 +3478,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
-                    event: None,
+                    event: Some(event("ORDINARY", "ONCE")),
                 },
                 at_local(2026, 8, 27, 10, 0),
             )
@@ -3208,7 +3507,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
-                    event: None,
+                    event: Some(event("ORDINARY", "ONCE")),
                 },
                 now,
             )
@@ -3218,6 +3517,7 @@ mod tests {
             .update_settings(
                 &UpdateSettingsInput {
                     default_due_time: "17:30".into(),
+                    repeat_default_times: current.repeat_default_times,
                     workdays: current.workdays,
                     overtime_interval_minutes: current.overtime_interval_minutes,
                     quiet_hours_enabled: current.quiet_hours_enabled,
@@ -3260,7 +3560,7 @@ mod tests {
                     must_complete_today: false,
                     repeat_interval_minutes: None,
                     tag_ids: Vec::new(),
-                    event: None,
+                    event: Some(event("ORDINARY", "ONCE")),
                 },
                 now,
             )
@@ -3450,11 +3750,13 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         assert!(delivery_columns.contains(&"submitted_at".into()));
         assert!(delivery_columns.contains(&"error_code".into()));
         assert!(settings_columns.contains(&"autostart_enabled".into()));
         assert!(settings_columns.contains(&"onboarding_version".into()));
+        assert!(settings_columns.contains(&"repeat_default_time_first".into()));
+        assert!(settings_columns.contains(&"repeat_default_time_second".into()));
         let tag_table_exists = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'item_tags')",
@@ -3475,6 +3777,9 @@ mod tests {
         assert!(item_columns.contains(&"event_kind".into()));
         assert!(item_columns.contains(&"series_anchor_month".into()));
         assert!(item_columns.contains(&"series_anchor_day".into()));
+        assert!(item_columns.contains(&"repeat_time_mode".into()));
+        assert!(item_columns.contains(&"repeat_time_first".into()));
+        assert!(item_columns.contains(&"repeat_time_second".into()));
         assert!(settings_columns.contains(&"smtp_enabled".into()));
         assert!(!settings_columns.contains(&"smtp_password".into()));
         let channel_table_exists = connection
@@ -3486,6 +3791,42 @@ mod tests {
             .unwrap();
         assert!(channel_table_exists);
         assert!(path.with_extension("db.backup-before-v3").exists());
+    }
+
+    #[test]
+    fn v6_repeat_item_migrates_to_one_specified_daily_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shanji-v6.db");
+        let mut connection = Connection::open(&path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute_batch(MIGRATION_0001).unwrap();
+        transaction.execute_batch(MIGRATION_0002).unwrap();
+        transaction.execute_batch(MIGRATION_0003).unwrap();
+        transaction.execute_batch(MIGRATION_0004).unwrap();
+        transaction.execute_batch(MIGRATION_0005).unwrap();
+        transaction.execute_batch(MIGRATION_0006).unwrap();
+        transaction
+            .execute(
+                "INSERT INTO items (
+                id, title, status, due_at, due_local_date, due_local_time,
+                due_source, rollover_policy, completion_policy, next_reminder_at,
+                created_at, updated_at, event_kind, reminder_plan
+             ) VALUES ('old-repeat', '旧重复事项', 'OPEN', ?1, '2026-09-01', '15:00',
+                'EXPLICIT', 'NONE', 'NORMAL', ?1, ?1, ?1, 'ORDINARY', 'REPEAT')",
+                [at_local(2026, 9, 1, 15, 0).to_rfc3339()],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        let item = database.get_item("old-repeat").unwrap();
+        assert_eq!(item.repeat_time_mode, "SPECIFIED");
+        assert_eq!(item.repeat_times, vec!["15:00"]);
+        assert_eq!(
+            database.get_settings().unwrap().repeat_default_times,
+            vec!["10:00", "17:00"]
+        );
     }
 
     #[test]

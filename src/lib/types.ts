@@ -5,6 +5,7 @@ export type ItemFilter = 'open' | 'today' | 'overdue' | 'done' | 'deleted' | 'al
 export type EventKind = 'ORDINARY' | 'ONE_TIME' | 'TODAY_MUST' | 'WARNING' | 'CONTINUOUS' | 'MONTHLY' | 'YEARLY';
 export type ReminderPlan = 'REPEAT' | 'EMPHASIS' | 'ONCE' | 'FORCE' | 'CUSTOM';
 export type ScheduleUnit = 'DAY' | 'WEEK' | 'MONTH' | 'YEAR';
+export type RepeatTimeMode = 'DEFAULT' | 'SPECIFIED';
 
 export interface EventKindDefault {
   eventKind: EventKind;
@@ -23,6 +24,8 @@ export interface EventConfigurationInput {
   cadenceValue: number | null;
   cadenceUnit: ScheduleUnit | null;
   emphasisMaxPerDay: number | null;
+  repeatTimeMode: RepeatTimeMode | null;
+  repeatTimes: string[];
 }
 
 export interface Item {
@@ -59,11 +62,14 @@ export interface Item {
   cadenceValue: number | null;
   cadenceUnit: ScheduleUnit | null;
   emphasisMaxPerDay: number;
+  repeatTimeMode: RepeatTimeMode;
+  repeatTimes: string[];
   tags: Tag[];
 }
 
 export interface Settings {
   defaultDueTime: string;
+  repeatDefaultTimes: string[];
   workdays: number[];
   overtimeIntervalMinutes: number;
   quietHoursEnabled: boolean;
@@ -183,6 +189,7 @@ export interface OnboardingStatus {
 export interface OnboardingFinishInput {
   autostartEnabled: boolean;
   defaultDueTime: string;
+  repeatDefaultTimes: string[];
   globalShortcut: string;
   enablePortableNotifications: boolean;
 }

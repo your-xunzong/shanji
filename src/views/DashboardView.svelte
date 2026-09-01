@@ -498,6 +498,7 @@
       settings = await api.updateSettings({
         ...settings,
         defaultDueTime: input.defaultDueTime,
+        repeatDefaultTimes: input.repeatDefaultTimes,
         autostartEnabled: input.autostartEnabled,
         globalShortcut: input.globalShortcut,
         updateExistingDefaultItems: false,
@@ -505,7 +506,7 @@
     } catch (cause) {
       const message = readableError(cause, '');
       if (message.includes('快捷键') || message.includes('开机启动')) throw cause;
-      throw new Error('默认提醒时间没有保存，原设置仍然有效，请重试。');
+      throw new Error('时间设置没有保存，原提醒时间仍然有效，请重试。');
     }
     autostartStatus = await api.getAutostartStatus();
     if (autostartStatus.available) settings.autostartEnabled = autostartStatus.enabled;
@@ -707,6 +708,7 @@
             onReschedule={rescheduleItem}
             {categories}
             {tags}
+            repeatDefaultTimes={settings?.repeatDefaultTimes ?? ['10:00', '17:00']}
             onUpdate={updateItem}
             onDelete={deleteItem}
             onPermanentDelete={permanentlyDeleteItem}

@@ -8,7 +8,7 @@
     nextReminderLabel,
     toLocalDateTimeInput,
   } from '../lib/presentation';
-  import type { Category, EventKind, Item, ReminderPlan, ScheduleUnit, Tag, UpdateItemInput } from '../lib/types';
+  import type { Category, EventKind, Item, ReminderPlan, RepeatTimeMode, ScheduleUnit, Tag, UpdateItemInput } from '../lib/types';
 
   export let item: Item;
   export let busy = false;
@@ -17,6 +17,7 @@
   export let onReschedule: (item: Item, dueAt: string) => Promise<void>;
   export let categories: Category[] = [];
   export let tags: Tag[] = [];
+  export let repeatDefaultTimes: string[] = ['10:00', '17:00'];
   export let onUpdate: (item: Item, input: UpdateItemInput) => Promise<void>;
   export let onDelete: (item: Item, deleted: boolean) => Promise<void>;
   export let onPermanentDelete: (item: Item) => Promise<void>;
@@ -43,6 +44,9 @@
   let cadenceValueDraft = 1;
   let cadenceUnitDraft: ScheduleUnit = 'DAY';
   let emphasisMaxDraft = 8;
+  let repeatTimeModeDraft: RepeatTimeMode = 'SPECIFIED';
+  let repeatSpecifiedTimeDraft = '10:00';
+  let repeatTimesDraft: string[] = ['10:00', '17:00'];
   let openedFromParent = false;
 
   $: timing = itemTiming(item);
@@ -96,6 +100,9 @@
     cadenceValueDraft = item.cadenceValue ?? 1;
     cadenceUnitDraft = item.cadenceUnit ?? 'DAY';
     emphasisMaxDraft = item.emphasisMaxPerDay;
+    repeatTimeModeDraft = item.repeatTimeMode;
+    repeatSpecifiedTimeDraft = item.repeatTimes[0] ?? item.dueLocalTime;
+    repeatTimesDraft = item.repeatTimes.length === 2 ? [...item.repeatTimes] : [...repeatDefaultTimes];
     editError = '';
     editingItem = true;
     editingTime = false;
@@ -105,6 +112,11 @@
     tagDrafts = tagDrafts.includes(id)
       ? tagDrafts.filter((value) => value !== id)
       : [...tagDrafts, id];
+  }
+
+  function useDefaultRepeatTimes(): void {
+    if (repeatTimeModeDraft !== 'DEFAULT') repeatTimesDraft = [...repeatDefaultTimes];
+    repeatTimeModeDraft = 'DEFAULT';
   }
 
   async function saveItem(): Promise<void> {
@@ -123,6 +135,10 @@
     }
     if (eventKindDraft === 'CONTINUOUS' && (!startDraft || !endDraft)) {
       editError = '请设置持续事件的开始和结束时间';
+      return;
+    }
+    if (reminderPlanDraft === 'REPEAT' && repeatTimeModeDraft === 'SPECIFIED' && !repeatSpecifiedTimeDraft) {
+      editError = '请选择每天提醒的时间';
       return;
     }
     editError = '';
@@ -147,6 +163,12 @@
           cadenceValue: eventKindDraft === 'CONTINUOUS' || reminderPlanDraft === 'CUSTOM' ? cadenceValueDraft : null,
           cadenceUnit: eventKindDraft === 'CONTINUOUS' || reminderPlanDraft === 'CUSTOM' ? cadenceUnitDraft : null,
           emphasisMaxPerDay: reminderPlanDraft === 'EMPHASIS' ? emphasisMaxDraft : null,
+          repeatTimeMode: reminderPlanDraft === 'REPEAT' ? repeatTimeModeDraft : null,
+          repeatTimes: reminderPlanDraft === 'REPEAT'
+            ? repeatTimeModeDraft === 'DEFAULT'
+              ? repeatTimesDraft
+              : [repeatSpecifiedTimeDraft]
+            : [],
         },
       });
       editingItem = false;
@@ -216,6 +238,19 @@
         <div class="editor-wide tag-picker"><span>标签</span><div>{#each tags as tag}<button type="button" class:active={tagDrafts.includes(tag.id)} style={`--tag-color:${tag.color}`} on:click={() => toggleTag(tag.id)}>{tag.name}</button>{/each}{#if tags.length === 0}<small>可在“整理方式”中添加</small>{/if}</div></div>
         <label class="editor-check editor-wide"><input type="checkbox" bind:checked={importantDraft} /><span>标记为重要</span></label>
         {#if reminderPlanDraft === 'EMPHASIS' || reminderPlanDraft === 'FORCE'}<label><span>再次提醒间隔</span><select bind:value={repeatDraft}><option value={15}>15 分钟</option><option value={30}>30 分钟</option><option value={60}>60 分钟</option><option value={120}>2 小时</option></select></label>{/if}
+        {#if reminderPlanDraft === 'REPEAT'}
+          <div class="editor-wide repeat-plan-editor">
+            <span>每天提醒时间</span>
+            <div class="repeat-plan-options">
+              <label><input type="radio" checked={repeatTimeModeDraft === 'DEFAULT'} value="DEFAULT" on:change={useDefaultRepeatTimes} /><span>每天两个时间（{repeatTimesDraft.join('、')}）</span></label>
+              <label><input type="radio" checked={repeatTimeModeDraft === 'SPECIFIED'} value="SPECIFIED" on:change={() => (repeatTimeModeDraft = 'SPECIFIED')} /><span>每天一个指定时间</span></label>
+            </div>
+            {#if repeatTimeModeDraft === 'DEFAULT' && repeatTimesDraft.join(',') !== repeatDefaultTimes.join(',')}
+              <button class="text-mini repeat-default-action" type="button" on:click={() => (repeatTimesDraft = [...repeatDefaultTimes])}>恢复当前默认（{repeatDefaultTimes.join('、')}）</button>
+            {/if}
+            {#if repeatTimeModeDraft === 'SPECIFIED'}<input aria-label="每天提醒时间" type="time" bind:value={repeatSpecifiedTimeDraft} />{/if}
+          </div>
+        {/if}
         {#if reminderPlanDraft === 'EMPHASIS'}<label><span>每天最多提醒</span><input type="number" min="1" max="96" bind:value={emphasisMaxDraft} /></label>{/if}
         {#if eventKindDraft === 'WARNING'}
           <label><span>发生时间</span><input type="datetime-local" bind:value={targetDraft} /></label>

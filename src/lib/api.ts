@@ -34,6 +34,7 @@ const MANAGED_STATE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800];
 
 const defaultSettings: Settings = {
   defaultDueTime: '18:00',
+  repeatDefaultTimes: ['10:00', '17:00'],
   workdays: [1, 2, 3, 4, 5],
   overtimeIntervalMinutes: 30,
   quietHoursEnabled: true,
@@ -101,6 +102,17 @@ function localTime(value: Date): string {
   return `${String(value.getHours()).padStart(2, '0')}:${String(value.getMinutes()).padStart(2, '0')}`;
 }
 
+function nextRepeatSlotIso(times: string[], now: Date): string {
+  const sorted = [...times].sort();
+  for (const time of sorted) {
+    const [hours, minutes] = time.split(':').map(Number);
+    const candidate = new Date(now);
+    candidate.setHours(hours, minutes, 0, 0);
+    if (candidate.getTime() > now.getTime()) return candidate.toISOString();
+  }
+  return localIsoAt(sorted[0], 1);
+}
+
 function mustCompleteIsoAt(settings: Settings, now: Date): string {
   const [hours, minutes] = settings.defaultDueTime.split(':').map(Number);
   const target = new Date(now);
@@ -135,6 +147,8 @@ function readPreviewItems(): Item[] {
       cadenceValue: item.cadenceValue ?? null,
       cadenceUnit: item.cadenceUnit ?? null,
       emphasisMaxPerDay: item.emphasisMaxPerDay ?? 8,
+      repeatTimeMode: item.repeatTimeMode ?? 'SPECIFIED',
+      repeatTimes: item.repeatTimes ?? (item.reminderPlan === 'REPEAT' ? [item.dueLocalTime] : []),
       tags: Array.isArray(item.tags) ? item.tags : [],
     }));
   }
@@ -176,6 +190,8 @@ function readPreviewItems(): Item[] {
       cadenceValue: null,
       cadenceUnit: null,
       emphasisMaxPerDay: 8,
+      repeatTimeMode: 'DEFAULT',
+      repeatTimes: settings.repeatDefaultTimes,
       tags: [],
     },
     {
@@ -212,6 +228,8 @@ function readPreviewItems(): Item[] {
       cadenceValue: null,
       cadenceUnit: null,
       emphasisMaxPerDay: 8,
+      repeatTimeMode: 'SPECIFIED',
+      repeatTimes: [],
       tags: [],
     },
   ];
@@ -270,7 +288,7 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
 export const api = {
   async getAppInfo(): Promise<AppInfo> {
     if (isTauri()) return call<AppInfo>('get_app_info');
-    return { name: '闪记', version: '0.6.0', copyright: '© 2026 闪记' };
+    return { name: '闪记', version: '0.7.0', copyright: '© 2026 闪记' };
   },
 
   async listItems(filter: ItemFilter = 'open'): Promise<Item[]> {
@@ -286,18 +304,20 @@ export const api = {
     const settings = readPreviewSettings();
     const now = new Date();
     const eventKind = input.event?.kind ?? (input.mustCompleteToday ? 'TODAY_MUST' : null);
+    const reminderPlan = input.event?.reminderPlan
+      ?? settings.eventKindDefaults.find((entry) => entry.eventKind === eventKind)?.reminderPlan
+      ?? 'REPEAT';
     const configuredTime = eventKind === 'WARNING'
       ? input.event?.targetAt
       : eventKind === 'CONTINUOUS'
         ? input.event?.startAt
         : input.dueAt;
-    const dueAt = configuredTime ?? (eventKind === 'TODAY_MUST'
-      ? mustCompleteIsoAt(settings, now)
-      : localIsoAt(settings.defaultDueTime, now.getHours() >= Number(settings.defaultDueTime.slice(0, 2)) ? 1 : 0));
+    const dueAt = configuredTime ?? (reminderPlan === 'REPEAT'
+      ? nextRepeatSlotIso(settings.repeatDefaultTimes, now)
+      : eventKind === 'TODAY_MUST'
+        ? mustCompleteIsoAt(settings, now)
+        : localIsoAt(settings.defaultDueTime, now.getHours() >= Number(settings.defaultDueTime.slice(0, 2)) ? 1 : 0));
     const due = new Date(dueAt);
-    const reminderPlan = input.event?.reminderPlan
-      ?? settings.eventKindDefaults.find((entry) => entry.eventKind === eventKind)?.reminderPlan
-      ?? 'REPEAT';
     const item: Item = {
       id: crypto.randomUUID(),
       title: input.title.trim(),
@@ -334,6 +354,18 @@ export const api = {
       cadenceValue: input.event?.cadenceValue ?? null,
       cadenceUnit: input.event?.cadenceUnit ?? null,
       emphasisMaxPerDay: input.event?.emphasisMaxPerDay ?? 8,
+      repeatTimeMode: reminderPlan === 'REPEAT'
+        ? input.event?.repeatTimeMode ?? (configuredTime ? 'SPECIFIED' : 'DEFAULT')
+        : 'SPECIFIED',
+      repeatTimes: reminderPlan === 'REPEAT'
+        ? input.event?.repeatTimeMode === 'DEFAULT'
+          ? settings.repeatDefaultTimes
+          : input.event?.repeatTimes.length
+            ? input.event.repeatTimes
+            : configuredTime
+              ? [localTime(due)]
+              : settings.repeatDefaultTimes
+        : [],
       tags: readPreviewTags().filter((tag) => input.tagIds?.includes(tag.id)),
     };
     writePreviewItems([item, ...readPreviewItems()]);
@@ -414,6 +446,12 @@ export const api = {
   async updateSettings(input: UpdateSettingsInput): Promise<Settings> {
     if (isTauri()) return call<Settings>('update_settings', { input });
     const { updateExistingDefaultItems: _, smtpPassword: __, ...settings } = input;
+    const repeatTimes = [...settings.repeatDefaultTimes].sort();
+    if (repeatTimes.length !== 2 || repeatTimes[0] === repeatTimes[1]
+      || repeatTimes.some((time) => !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time))) {
+      throw new Error('请设置两个不同的有效重复提醒时间。');
+    }
+    settings.repeatDefaultTimes = repeatTimes;
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
     return settings;
   },
@@ -536,6 +574,16 @@ export const api = {
     item.cadenceValue = input.event?.cadenceValue ?? null;
     item.cadenceUnit = input.event?.cadenceUnit ?? null;
     item.emphasisMaxPerDay = input.event?.emphasisMaxPerDay ?? 8;
+    item.repeatTimeMode = item.reminderPlan === 'REPEAT'
+      ? input.event?.repeatTimeMode ?? 'SPECIFIED'
+      : item.repeatTimeMode;
+    item.repeatTimes = item.reminderPlan === 'REPEAT'
+      ? item.repeatTimeMode === 'DEFAULT'
+        ? readPreviewSettings().repeatDefaultTimes
+        : input.event?.repeatTimes.length
+          ? input.event.repeatTimes.slice(0, 1)
+          : [localTime(due)]
+      : item.repeatTimes;
     item.completionPolicy = item.eventKind === 'TODAY_MUST' ? 'MUST_COMPLETE_TODAY' : 'NORMAL';
     item.repeatIntervalMinutes = item.reminderPlan === 'EMPHASIS' || item.reminderPlan === 'FORCE'
       ? input.repeatIntervalMinutes ?? 30
@@ -670,13 +718,13 @@ export const api = {
   async getOnboardingStatus(): Promise<OnboardingStatus> {
     if (isTauri()) return call<OnboardingStatus>('get_onboarding_status');
     const completedVersion = Number(localStorage.getItem(ONBOARDING_KEY) ?? 0);
-    return { required: completedVersion < 2, completedVersion, currentVersion: 2 };
+    return { required: completedVersion < 3, completedVersion, currentVersion: 3 };
   },
 
   async completeOnboarding(): Promise<OnboardingStatus> {
     if (isTauri()) return call<OnboardingStatus>('complete_onboarding');
-    localStorage.setItem(ONBOARDING_KEY, '2');
-    return { required: false, completedVersion: 2, currentVersion: 2 };
+    localStorage.setItem(ONBOARDING_KEY, '3');
+    return { required: false, completedVersion: 3, currentVersion: 3 };
   },
 
   async getNotificationStatus(): Promise<NotificationStatus> {
@@ -758,6 +806,8 @@ export const api = {
       cadenceValue: null,
       cadenceUnit: null,
       emphasisMaxPerDay: 8,
+      repeatTimeMode: 'SPECIFIED',
+      repeatTimes: [],
       tags: [],
     };
     writePreviewItems([item, ...readPreviewItems()]);
@@ -777,7 +827,7 @@ export const api = {
       current: {
         path: '浏览器预览数据',
         itemCount: items.length,
-        schemaVersion: 6,
+        schemaVersion: 7,
         updatedAt: new Date().toISOString(),
       },
       latestBackup: null,
@@ -790,7 +840,7 @@ export const api = {
     return {
       path: '浏览器预览不创建文件备份',
       itemCount: readPreviewItems().length,
-      schemaVersion: 6,
+      schemaVersion: 7,
       updatedAt: new Date().toISOString(),
     };
   },

@@ -377,6 +377,8 @@ mod tests {
             cadence_value: None,
             cadence_unit: None,
             emphasis_max_per_day: 8,
+            repeat_time_mode: "SPECIFIED".into(),
+            repeat_times: vec!["18:00".into()],
             tags: tag_id
                 .map(|id| {
                     vec![Tag {
@@ -496,6 +498,8 @@ mod tests {
             cadence_value: None,
             cadence_unit: None,
             emphasis_max_per_day: 8,
+            repeat_time_mode: "SPECIFIED".into(),
+            repeat_times: Vec::new(),
             tags: vec![Tag {
                 id: "customer".into(),
                 name: "客户".into(),

@@ -25,6 +25,7 @@ impl Clock for SystemClock {
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub default_due_time: String,
+    pub repeat_default_times: Vec<String>,
     pub workdays: Vec<u32>,
     pub overtime_interval_minutes: u32,
     pub quiet_hours_enabled: bool,
@@ -59,6 +60,7 @@ pub const EVENT_KINDS: [&str; 7] = [
 ];
 
 pub const REMINDER_PLANS: [&str; 5] = ["REPEAT", "EMPHASIS", "ONCE", "FORCE", "CUSTOM"];
+pub const REPEAT_TIME_MODES: [&str; 2] = ["DEFAULT", "SPECIFIED"];
 pub const SCHEDULE_UNITS: [&str; 4] = ["DAY", "WEEK", "MONTH", "YEAR"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,6 +93,7 @@ pub fn default_event_kind_defaults() -> Vec<EventKindDefault> {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettingsInput {
     pub default_due_time: String,
+    pub repeat_default_times: Vec<String>,
     pub workdays: Vec<u32>,
     pub overtime_interval_minutes: u32,
     pub quiet_hours_enabled: bool,
@@ -119,6 +122,7 @@ pub struct UpdateSettingsInput {
 impl UpdateSettingsInput {
     pub fn validate(&self) -> AppResult<()> {
         parse_time(&self.default_due_time)?;
+        validate_repeat_times(&self.repeat_default_times, 2, 2)?;
         parse_time(&self.quiet_start)?;
         parse_time(&self.quiet_end)?;
 
@@ -157,8 +161,11 @@ impl UpdateSettingsInput {
         let mut workdays = self.workdays.clone();
         workdays.sort_unstable();
         workdays.dedup();
+        let mut repeat_default_times = self.repeat_default_times.clone();
+        repeat_default_times.sort();
         Settings {
             default_due_time: self.default_due_time.clone(),
+            repeat_default_times,
             workdays,
             overtime_interval_minutes: self.overtime_interval_minutes,
             quiet_hours_enabled: self.quiet_hours_enabled,
@@ -287,6 +294,8 @@ pub struct Item {
     pub cadence_value: Option<u32>,
     pub cadence_unit: Option<String>,
     pub emphasis_max_per_day: u32,
+    pub repeat_time_mode: String,
+    pub repeat_times: Vec<String>,
     pub tags: Vec<Tag>,
 }
 
@@ -305,6 +314,9 @@ pub struct EventConfigurationInput {
     pub cadence_value: Option<u32>,
     pub cadence_unit: Option<String>,
     pub emphasis_max_per_day: Option<u32>,
+    pub repeat_time_mode: Option<String>,
+    #[serde(default)]
+    pub repeat_times: Vec<String>,
 }
 
 impl EventConfigurationInput {
@@ -318,6 +330,27 @@ impl EventConfigurationInput {
             && !REMINDER_PLANS.contains(&plan.as_str())
         {
             return Err(AppError::Validation("请选择有效的提醒方案".into()));
+        }
+        if let Some(mode) = &self.repeat_time_mode
+            && !REPEAT_TIME_MODES.contains(&mode.as_str())
+        {
+            return Err(AppError::Validation("请选择有效的重复时间方式".into()));
+        }
+        if !self.repeat_times.is_empty() {
+            validate_repeat_times(&self.repeat_times, 1, 2)?;
+        }
+        if self.reminder_plan.as_deref() == Some("REPEAT") {
+            match self.repeat_time_mode.as_deref() {
+                Some("DEFAULT")
+                    if !self.repeat_times.is_empty() && self.repeat_times.len() != 2 =>
+                {
+                    return Err(AppError::Validation("默认重复提醒需要两个时间".into()));
+                }
+                Some("SPECIFIED") if self.repeat_times.len() > 1 => {
+                    return Err(AppError::Validation("指定重复提醒只能设置一个时间".into()));
+                }
+                _ => {}
+            }
         }
         if self.lead_value == Some(0) || self.cadence_value == Some(0) {
             return Err(AppError::Validation("提醒周期必须大于 0".into()));
@@ -517,6 +550,48 @@ pub fn parse_time(value: &str) -> AppResult<NaiveTime> {
         .map_err(|_| AppError::Validation(format!("时间格式无效：{value}")))
 }
 
+pub fn validate_repeat_times(values: &[String], minimum: usize, maximum: usize) -> AppResult<()> {
+    if values.len() < minimum || values.len() > maximum {
+        return Err(AppError::Validation(if minimum == maximum {
+            "请设置两个重复提醒时间".into()
+        } else {
+            "重复提醒只能设置一至两个时间".into()
+        }));
+    }
+    for value in values {
+        parse_time(value)?;
+    }
+    let mut unique = values.to_vec();
+    unique.sort();
+    unique.dedup();
+    if unique.len() != values.len() {
+        return Err(AppError::Validation("两个重复提醒时间不能相同".into()));
+    }
+    Ok(())
+}
+
+pub fn next_repeat_slot_after(
+    now_utc: DateTime<Utc>,
+    values: &[String],
+) -> AppResult<DateTime<Utc>> {
+    validate_repeat_times(values, 1, 2)?;
+    let local_now = now_utc.with_timezone(&Local);
+    let mut times = values
+        .iter()
+        .map(|value| parse_time(value))
+        .collect::<AppResult<Vec<_>>>()?;
+    times.sort_unstable();
+    for time in &times {
+        let candidate =
+            resolve_local_datetime(local_now.date_naive().and_time(*time))?.with_timezone(&Utc);
+        if candidate > now_utc {
+            return Ok(candidate);
+        }
+    }
+    let tomorrow = local_now.date_naive() + Duration::days(1);
+    Ok(resolve_local_datetime(tomorrow.and_time(times[0]))?.with_timezone(&Utc))
+}
+
 pub fn next_default_due(now_utc: DateTime<Utc>, settings: &Settings) -> AppResult<DueMoment> {
     let now = now_utc.with_timezone(&Local);
     let target_time = parse_time(&settings.default_due_time)?;
@@ -683,6 +758,7 @@ mod tests {
     fn settings() -> Settings {
         Settings {
             default_due_time: "18:00".into(),
+            repeat_default_times: vec!["10:00".into(), "17:00".into()],
             workdays: vec![1, 2, 3, 4, 5],
             overtime_interval_minutes: 30,
             quiet_hours_enabled: true,
@@ -757,6 +833,33 @@ mod tests {
         assert_eq!(
             next_local.time(),
             NaiveTime::from_hms_opt(7, 30, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn repeat_slots_choose_each_remaining_time_without_catching_up() {
+        let values = vec!["10:00".into(), "17:00".into()];
+        let before_first = Local.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap();
+        let between = Local.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let after_second = Local.with_ymd_and_hms(2026, 9, 1, 22, 0, 0).unwrap();
+
+        assert_eq!(
+            next_repeat_slot_after(before_first.with_timezone(&Utc), &values)
+                .unwrap()
+                .with_timezone(&Local),
+            Local.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap()
+        );
+        assert_eq!(
+            next_repeat_slot_after(between.with_timezone(&Utc), &values)
+                .unwrap()
+                .with_timezone(&Local),
+            Local.with_ymd_and_hms(2026, 9, 1, 17, 0, 0).unwrap()
+        );
+        assert_eq!(
+            next_repeat_slot_after(after_second.with_timezone(&Utc), &values)
+                .unwrap()
+                .with_timezone(&Local),
+            Local.with_ymd_and_hms(2026, 9, 2, 10, 0, 0).unwrap()
         );
     }
 

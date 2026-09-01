@@ -157,6 +157,8 @@
           cadenceValue: eventKind === 'CONTINUOUS' ? cadenceValue : null,
           cadenceUnit: eventKind === 'CONTINUOUS' ? cadenceUnit : null,
           emphasisMaxPerDay: null,
+          repeatTimeMode: null,
+          repeatTimes: [],
         },
       });
       content = '';

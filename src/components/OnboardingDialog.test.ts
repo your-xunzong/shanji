@@ -5,6 +5,7 @@ import type { AutostartStatus, NotificationStatus, Settings } from '../lib/types
 
 const settings: Settings = {
   defaultDueTime: '18:00',
+  repeatDefaultTimes: ['10:00', '17:00'],
   workdays: [1, 2, 3, 4, 5],
   overtimeIntervalMinutes: 30,
   quietHoursEnabled: true,
@@ -101,14 +102,19 @@ describe('OnboardingDialog', () => {
     await fireEvent.click(screen.getByRole('button', { name: '继续' }));
     await fireEvent.click(screen.getByRole('button', { name: '继续' }));
 
-    const timeInput = screen.getByLabelText('默认提醒时间');
+    const timeInput = screen.getByLabelText('未指定时间的默认到期');
     expect(timeInput).toHaveValue('18:00');
+    expect(screen.getByLabelText('第一次')).toHaveValue('10:00');
+    expect(screen.getByLabelText('第二次')).toHaveValue('17:00');
     await fireEvent.click(screen.getByRole('button', { name: '17:30' }));
     expect(timeInput).toHaveValue('17:30');
 
     await fireEvent.click(screen.getByRole('button', { name: '继续' }));
     await fireEvent.click(screen.getByRole('button', { name: '完成设置' }));
-    expect(onFinish).toHaveBeenCalledWith(expect.objectContaining({ defaultDueTime: '17:30' }));
+    expect(onFinish).toHaveBeenCalledWith(expect.objectContaining({
+      defaultDueTime: '17:30',
+      repeatDefaultTimes: ['10:00', '17:00'],
+    }));
   });
 
   it('默认提醒时间为空时不能继续', async () => {
@@ -116,8 +122,8 @@ describe('OnboardingDialog', () => {
     await fireEvent.click(screen.getByRole('button', { name: '继续' }));
     await fireEvent.click(screen.getByRole('button', { name: '继续' }));
 
-    await fireEvent.input(screen.getByLabelText('默认提醒时间'), { target: { value: '' } });
-    expect(screen.getByRole('alert')).toHaveTextContent('请选择默认提醒时间');
+    await fireEvent.input(screen.getByLabelText('未指定时间的默认到期'), { target: { value: '' } });
+    expect(screen.getByRole('alert')).toHaveTextContent('请选择有效的默认到期时间');
     expect(screen.getByRole('button', { name: '继续' })).toBeDisabled();
   });
 
@@ -131,6 +137,16 @@ describe('OnboardingDialog', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('原设置仍然有效');
     await fireEvent.click(screen.getByRole('button', { name: '上一步' }));
-    expect(screen.getByLabelText('默认提醒时间')).toHaveValue('18:30');
+    expect(screen.getByLabelText('未指定时间的默认到期')).toHaveValue('18:30');
+  });
+
+  it('两次重复提醒时间相同时保留输入并禁止继续', async () => {
+    setup(true);
+    await fireEvent.click(screen.getByRole('button', { name: '继续' }));
+    await fireEvent.click(screen.getByRole('button', { name: '继续' }));
+    await fireEvent.input(screen.getByLabelText('第二次'), { target: { value: '10:00' } });
+    expect(screen.getByRole('alert')).toHaveTextContent('不能使用相同时间');
+    expect(screen.getByRole('button', { name: '继续' })).toBeDisabled();
+    expect(screen.getByLabelText('第二次')).toHaveValue('10:00');
   });
 });

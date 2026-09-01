@@ -12,6 +12,7 @@ import type { Settings } from './types';
 
 const settings: Settings = {
   defaultDueTime: '18:00',
+  repeatDefaultTimes: ['10:00', '17:00'],
   workdays: [1, 2, 3, 4, 5],
   overtimeIntervalMinutes: 30,
   quietHoursEnabled: true,

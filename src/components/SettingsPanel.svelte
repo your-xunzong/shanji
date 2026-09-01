@@ -64,6 +64,8 @@
   let smtpActionStatus = '';
   let routeBusyTagId = '';
 
+  $: repeatTimesError = validateRepeatTimes(form.repeatDefaultTimes);
+
   const weekdays = [
     { value: 1, label: '一' },
     { value: 2, label: '二' },
@@ -92,8 +94,16 @@
     form = { ...form };
   }
 
+  function validateRepeatTimes(values: string[]): string {
+    const valid = (value: string) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
+    if (values.length !== 2 || !valid(values[0] ?? '')) return '请设置有效的第一次重复提醒时间。';
+    if (!valid(values[1] ?? '')) return '请设置有效的第二次重复提醒时间。';
+    if (values[0] === values[1]) return '两次重复提醒不能使用相同时间。';
+    return '';
+  }
+
   async function save(): Promise<void> {
-    if (saving) return;
+    if (saving || repeatTimesError) return;
     saveError = '';
     try {
       await onSave({
@@ -293,6 +303,19 @@
           <small>保存前由后端校验；明确时间和今日必做事项不受影响。</small>
         </span>
       </label>
+    </section>
+
+    <section class="settings-section">
+      <div class="section-heading">
+        <h3>重复提醒默认时间</h3>
+        <p>未指定时间的新重复事项每天使用两个时点。修改只影响之后新建、转换或恢复默认的事项。</p>
+      </div>
+      <div class="time-range repeat-time-range">
+        <label><span>第一次</span><input type="time" bind:value={form.repeatDefaultTimes[0]} aria-invalid={!!repeatTimesError} /></label>
+        <span aria-hidden="true">与</span>
+        <label><span>第二次</span><input type="time" bind:value={form.repeatDefaultTimes[1]} aria-invalid={!!repeatTimesError} /></label>
+      </div>
+      {#if repeatTimesError}<p class="field-error" role="alert">{repeatTimesError}</p>{/if}
     </section>
 
     <section class="settings-section">
@@ -531,7 +554,7 @@
   <footer class="settings-footer">
     {#if saveError}<p class="settings-save-error" role="alert">{saveError}</p>{/if}
     <button class="secondary-button" on:click={onClose}>取消</button>
-    <button class="primary-button" disabled={saving || form.workdays.length === 0} on:click={save}>
+    <button class="primary-button" disabled={saving || form.workdays.length === 0 || !!repeatTimesError} on:click={save}>
       {saving ? '正在保存…' : '保存设置'}
     </button>
   </footer>
