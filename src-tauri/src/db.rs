@@ -1,11 +1,12 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
     time::SystemTime,
 };
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::Serialize;
 use uuid::Uuid;
@@ -27,11 +28,15 @@ const MIGRATION_0004: &str = include_str!("../migrations/0004_types_tags_recycle
 const MIGRATION_0005: &str = include_str!("../migrations/0005_reminder_channels.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_event_kinds.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_repeat_time_slots.sql");
-const LATEST_SCHEMA_VERSION: i64 = 7;
+const MIGRATION_0008: &str = include_str!("../migrations/0008_local_repository.sql");
+const MIGRATION_0009: &str = include_str!("../migrations/0009_email_delivery_rules.sql");
+const MIGRATION_0010: &str = include_str!("../migrations/0010_time_canvas.sql");
+const MIGRATION_0011: &str = include_str!("../migrations/0011_update_state.sql");
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 11;
 
 pub struct Database {
-    connection: Mutex<Connection>,
-    path: PathBuf,
+    pub(crate) connection: Mutex<Connection>,
+    pub(crate) path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -39,6 +44,10 @@ pub struct Database {
 pub struct DataFileSummary {
     pub path: String,
     pub item_count: u64,
+    pub reminder_history_count: u64,
+    pub has_settings: bool,
+    pub has_draft: bool,
+    pub has_custom_settings: bool,
     pub schema_version: i64,
     pub updated_at: Option<String>,
 }
@@ -49,6 +58,21 @@ pub struct DataStatus {
     pub current: DataFileSummary,
     pub latest_backup: Option<DataFileSummary>,
     pub recovery_candidates: Vec<DataFileSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateState {
+    pub auto_check_enabled: bool,
+    pub permission_prompted: bool,
+    pub last_checked_at: Option<String>,
+    pub last_check_result: Option<String>,
+    pub snoozed_version: Option<String>,
+    pub snoozed_until: Option<String>,
+    pub last_notified_version: Option<String>,
+    pub release_notes_seen_version: Option<String>,
+    pub should_auto_check: bool,
+    pub show_current_release_notes: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +108,7 @@ pub struct NotificationDelivery {
 #[derive(Debug, Clone)]
 pub struct EmailDeliveryJob {
     pub delivery_id: String,
+    pub recipient: String,
     pub notification: DueNotification,
 }
 
@@ -125,34 +150,49 @@ pub fn apply_pending_restore(database_path: &Path) -> AppResult<()> {
     if !staging.exists() {
         return Ok(());
     }
-    inspect_database_file(&staging)?;
-    let parent = database_path
-        .parent()
-        .ok_or_else(|| AppError::Validation("数据目录无效".into()))?;
-    fs::create_dir_all(parent)?;
-
-    if database_path.exists() {
-        let timestamp = Utc::now().format("%Y%m%d-%H%M%S-%3f");
-        let previous = parent.join(format!("shanji-before-restore-{timestamp}.db"));
-        fs::rename(database_path, previous)?;
+    let summary = inspect_database_file(&staging)?;
+    if summary.schema_version > LATEST_SCHEMA_VERSION {
+        return Err(AppError::Validation(
+            "待恢复数据来自更高版本的闪记，请先升级应用".into(),
+        ));
     }
-    for suffix in ["db-wal", "db-shm"] {
-        let sidecar = database_path.with_extension(suffix);
-        if sidecar.exists() {
-            fs::remove_file(sidecar)?;
-        }
-    }
-    fs::rename(staging, database_path)?;
-    Ok(())
+    activate_staged_database(&staging, database_path, "before-restore")
 }
 
 impl Database {
+    #[cfg(test)]
     pub fn open(path: &Path) -> AppResult<Self> {
+        let existed = path.exists() && fs::metadata(path)?.len() > 0;
+        let preflight_schema = if existed {
+            Some(inspect_database_file(path)?.schema_version)
+        } else {
+            None
+        };
+        Self::open_preflighted(path, preflight_schema)
+    }
+
+    pub(crate) fn open_preflighted(path: &Path, preflight_schema: Option<i64>) -> AppResult<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let existed = path.exists() && fs::metadata(path)?.len() > 0;
+        if preflight_schema.is_none() && path.exists() && fs::metadata(path)?.len() > 0 {
+            return Err(AppError::Validation(
+                "数据位置在启动检查后发生了变化，请重新启动闪记".into(),
+            ));
+        }
+
+        if let Some(schema_version) = preflight_schema {
+            if schema_version > LATEST_SCHEMA_VERSION {
+                return Err(AppError::Validation(
+                    "这份数据来自更高版本的闪记，请先升级应用".into(),
+                ));
+            }
+            if schema_version < LATEST_SCHEMA_VERSION {
+                migrate_database_safely(path, schema_version)?;
+            }
+        }
+
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(
@@ -171,49 +211,8 @@ impl Database {
             |row| row.get::<_, i64>(0),
         )?;
 
-        if existed && version < LATEST_SCHEMA_VERSION {
-            let backup = create_upgrade_backup(&connection, path, version)?;
-            let legacy_backup = path.with_extension("db.backup-before-v3");
-            if !legacy_backup.exists() {
-                fs::copy(&backup, legacy_backup)?;
-            }
-        }
-
-        if version < 1 {
-            let transaction = connection.transaction()?;
-            transaction.execute_batch(MIGRATION_0001)?;
-            transaction.commit()?;
-        }
-        if version < 2 {
-            let transaction = connection.transaction()?;
-            transaction.execute_batch(MIGRATION_0002)?;
-            transaction.commit()?;
-        }
-        if version < 3 {
-            let transaction = connection.transaction()?;
-            transaction.execute_batch(MIGRATION_0003)?;
-            transaction.commit()?;
-        }
-        if version < 4 {
-            let transaction = connection.transaction()?;
-            transaction.execute_batch(MIGRATION_0004)?;
-            transaction.commit()?;
-        }
-        if version < 5 {
-            let transaction = connection.transaction()?;
-            transaction.execute_batch(MIGRATION_0005)?;
-            transaction.commit()?;
-        }
-        if version < 6 {
-            let transaction = connection.transaction()?;
-            transaction.execute_batch(MIGRATION_0006)?;
-            transaction.commit()?;
-        }
-        if version < 7 {
-            let transaction = connection.transaction()?;
-            transaction.execute_batch(MIGRATION_0007)?;
-            transaction.commit()?;
-        }
+        run_migrations(&mut connection, version)?;
+        ensure_instance_id(&connection)?;
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -233,7 +232,12 @@ impl Database {
         transaction.execute_batch(MIGRATION_0005)?;
         transaction.execute_batch(MIGRATION_0006)?;
         transaction.execute_batch(MIGRATION_0007)?;
+        transaction.execute_batch(MIGRATION_0008)?;
+        transaction.execute_batch(MIGRATION_0009)?;
+        transaction.execute_batch(MIGRATION_0010)?;
+        transaction.execute_batch(MIGRATION_0011)?;
         transaction.commit()?;
+        ensure_instance_id(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             path: PathBuf::from(":memory:"),
@@ -256,7 +260,10 @@ impl Database {
             .iter()
             .filter(|path| path.as_path() != self.path)
             .filter_map(|path| inspect_database_file(path).ok())
-            .filter(|summary| summary.item_count > 0)
+            .filter(|summary| {
+                summary.schema_version <= LATEST_SCHEMA_VERSION
+                    && summary_has_recoverable_content(summary)
+            })
             .collect::<Vec<_>>();
         recovery_candidates.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         recovery_candidates.dedup_by(|left, right| left.path == right.path);
@@ -293,20 +300,144 @@ impl Database {
         }
 
         self.create_backup()?;
-        let staging = pending_restore_path(&self.path)?;
-        if staging.exists() {
-            fs::remove_file(&staging)?;
-        }
-        let source =
-            Connection::open_with_flags(candidate, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        source.execute("VACUUM INTO ?1", [staging.to_string_lossy().as_ref()])?;
-        inspect_database_file(&staging)?;
-        Ok(())
+        stage_database_restore(candidate, &self.path)
     }
 
     pub fn get_settings(&self) -> AppResult<Settings> {
         let connection = self.connection.lock().expect("database mutex poisoned");
         read_settings(&connection)
+    }
+
+    pub fn get_update_state(
+        &self,
+        now: DateTime<Utc>,
+        current_version: &str,
+    ) -> AppResult<UpdateState> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let mut state = read_update_state(&connection, now, current_version)?;
+
+        if state.release_notes_seen_version.is_none() {
+            let has_existing_content = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM items LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM drafts WHERE content <> '')
+                    OR (SELECT onboarding_version > 0 FROM app_settings WHERE id = 1)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            if !has_existing_content {
+                connection.execute(
+                    "UPDATE update_state
+                     SET release_notes_seen_version = ?1, updated_at = ?2
+                     WHERE id = 1",
+                    params![current_version, now.to_rfc3339()],
+                )?;
+                state.release_notes_seen_version = Some(current_version.to_string());
+                state.show_current_release_notes = false;
+            }
+        }
+
+        Ok(state)
+    }
+
+    pub fn set_auto_update_enabled(
+        &self,
+        enabled: bool,
+        now: DateTime<Utc>,
+        current_version: &str,
+    ) -> AppResult<UpdateState> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection.execute(
+            "UPDATE update_state
+             SET auto_check_enabled = ?1, permission_prompted = 1, updated_at = ?2
+             WHERE id = 1",
+            params![bool_to_int(enabled), now.to_rfc3339()],
+        )?;
+        read_update_state(&connection, now, current_version)
+    }
+
+    pub fn dismiss_update_permission(
+        &self,
+        now: DateTime<Utc>,
+        current_version: &str,
+    ) -> AppResult<UpdateState> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection.execute(
+            "UPDATE update_state SET permission_prompted = 1, updated_at = ?1 WHERE id = 1",
+            [now.to_rfc3339()],
+        )?;
+        read_update_state(&connection, now, current_version)
+    }
+
+    pub fn record_update_check(
+        &self,
+        result: &str,
+        now: DateTime<Utc>,
+        current_version: &str,
+    ) -> AppResult<UpdateState> {
+        if !matches!(result, "UP_TO_DATE" | "UPDATE_AVAILABLE" | "FAILED") {
+            return Err(AppError::Validation("更新检查结果无效".into()));
+        }
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection.execute(
+            "UPDATE update_state
+             SET last_checked_at = ?1, last_check_result = ?2, updated_at = ?1
+             WHERE id = 1",
+            params![now.to_rfc3339(), result],
+        )?;
+        read_update_state(&connection, now, current_version)
+    }
+
+    pub fn snooze_update(
+        &self,
+        version: &str,
+        now: DateTime<Utc>,
+        current_version: &str,
+    ) -> AppResult<UpdateState> {
+        validate_update_version(version)?;
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection.execute(
+            "UPDATE update_state
+             SET snoozed_version = ?1, snoozed_until = ?2, updated_at = ?3
+             WHERE id = 1",
+            params![
+                version,
+                (now + Duration::hours(24)).to_rfc3339(),
+                now.to_rfc3339()
+            ],
+        )?;
+        read_update_state(&connection, now, current_version)
+    }
+
+    pub fn mark_update_notified(
+        &self,
+        version: &str,
+        now: DateTime<Utc>,
+        current_version: &str,
+    ) -> AppResult<UpdateState> {
+        validate_update_version(version)?;
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection.execute(
+            "UPDATE update_state SET last_notified_version = ?1, updated_at = ?2 WHERE id = 1",
+            params![version, now.to_rfc3339()],
+        )?;
+        read_update_state(&connection, now, current_version)
+    }
+
+    pub fn mark_release_notes_seen(
+        &self,
+        version: &str,
+        now: DateTime<Utc>,
+        current_version: &str,
+    ) -> AppResult<UpdateState> {
+        validate_update_version(version)?;
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection.execute(
+            "UPDATE update_state
+             SET release_notes_seen_version = ?1, updated_at = ?2
+             WHERE id = 1",
+            params![version, now.to_rfc3339()],
+        )?;
+        read_update_state(&connection, now, current_version)
     }
 
     pub fn update_settings(
@@ -334,6 +465,10 @@ impl Database {
                 overlay_reminders_enabled = ?11,
                 repeat_unacknowledged_enabled = ?12,
                 unacknowledged_repeat_minutes = ?13,
+                smtp_verified_at = CASE
+                  WHEN smtp_host <> ?15 OR smtp_port <> ?16 OR smtp_security <> ?17
+                    OR smtp_from <> ?18 OR smtp_to <> ?19 OR smtp_username <> ?20
+                  THEN NULL ELSE smtp_verified_at END,
                 smtp_enabled = ?14,
                 smtp_host = ?15,
                 smtp_port = ?16,
@@ -534,8 +669,9 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()
             .map_err(AppError::from)?;
         drop(statement);
+        let mut tags_by_item = load_filtered_item_tags(&connection, condition, first_param)?;
         for item in &mut items {
-            item.tags = load_item_tags(&connection, &item.id)?;
+            item.tags = tags_by_item.remove(&item.id).unwrap_or_default();
         }
         Ok(items)
     }
@@ -1110,12 +1246,15 @@ impl Database {
         self.get_item(id)
     }
 
-    pub fn permanently_delete_item(&self, id: &str) -> AppResult<()> {
-        let connection = self.connection.lock().expect("database mutex poisoned");
-        let status = connection
-            .query_row("SELECT status FROM items WHERE id = ?1", [id], |row| {
-                row.get::<_, String>(0)
-            })
+    pub fn permanently_delete_item(&self, id: &str, now: DateTime<Utc>) -> AppResult<()> {
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let (status, revision) = transaction
+            .query_row(
+                "SELECT status, revision FROM items WHERE id = ?1",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
             .optional()?
             .ok_or(AppError::ItemNotFound)?;
         if status != "DELETED" {
@@ -1123,7 +1262,16 @@ impl Database {
                 "只有回收站中的事项可以永久删除".into(),
             ));
         }
-        connection.execute("DELETE FROM items WHERE id = ?1", [id])?;
+        let source_instance = instance_id_for_transaction(&transaction)?;
+        transaction.execute(
+            "INSERT INTO item_tombstones (item_id, revision, deleted_at, source_instance_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(item_id) DO UPDATE SET revision = MAX(revision, excluded.revision),
+               deleted_at = excluded.deleted_at, source_instance_id = excluded.source_instance_id",
+            params![id, revision + 1, now.to_rfc3339(), source_instance],
+        )?;
+        transaction.execute("DELETE FROM items WHERE id = ?1", [id])?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1254,6 +1402,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn claim_email_delivery(
         &self,
         notification: &DueNotification,
@@ -1300,9 +1449,14 @@ impl Database {
                 now.to_rfc3339(),
             ],
         )?;
+        let recipient =
+            transaction.query_row("SELECT smtp_to FROM app_settings WHERE id = 1", [], |row| {
+                row.get::<_, String>(0)
+            })?;
         transaction.commit()?;
         Ok((inserted > 0).then_some(EmailDeliveryJob {
             delivery_id,
+            recipient,
             notification: notification.clone(),
         }))
     }
@@ -1312,16 +1466,24 @@ impl Database {
         let transaction = connection.transaction()?;
         let rows = {
             let mut statement = transaction.prepare(
-                "SELECT d.id, d.reminder_event_id, i.id, i.title, i.due_local_date,
+                "SELECT d.id, COALESCE(d.recipient, (SELECT smtp_to FROM app_settings WHERE id = 1)),
+                        d.reminder_event_id, i.id, i.title, i.due_local_date,
                         i.due_local_time, i.completion_policy, i.event_kind, i.reminder_plan
                  FROM channel_deliveries d
                  JOIN items i ON i.id = d.item_id
                  WHERE d.channel = 'email' AND d.result = 'FAILED'
                    AND d.attempt_count < 3 AND d.next_attempt_at <= ?1 AND i.status = 'OPEN'
-                   AND EXISTS(
-                     SELECT 1 FROM item_tags it
-                     JOIN tag_notification_routes r ON r.tag_id = it.tag_id
-                     WHERE it.item_id = i.id AND r.channel = 'email' AND r.enabled = 1
+                   AND (
+                     (d.rule_id IS NOT NULL AND EXISTS(
+                       SELECT 1 FROM email_delivery_rules r
+                       WHERE r.id = d.rule_id AND r.enabled = 1
+                     ))
+                     OR
+                     (d.rule_id IS NULL AND EXISTS(
+                       SELECT 1 FROM item_tags it
+                       JOIN tag_notification_routes r ON r.tag_id = it.tag_id
+                       WHERE it.item_id = i.id AND r.channel = 'email' AND r.enabled = 1
+                     ))
                    )
                  ORDER BY d.next_attempt_at LIMIT 3",
             )?;
@@ -1329,15 +1491,16 @@ impl Database {
                 .query_map([now.to_rfc3339()], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
                         DueNotification {
-                            event_id: row.get(1)?,
-                            item_id: row.get(2)?,
-                            title: row.get(3)?,
-                            due_local_date: row.get(4)?,
-                            due_local_time: row.get(5)?,
-                            completion_policy: row.get(6)?,
-                            event_kind: row.get(7)?,
-                            reminder_plan: row.get(8)?,
+                            event_id: row.get(2)?,
+                            item_id: row.get(3)?,
+                            title: row.get(4)?,
+                            due_local_date: row.get(5)?,
+                            due_local_time: row.get(6)?,
+                            completion_policy: row.get(7)?,
+                            event_kind: row.get(8)?,
+                            reminder_plan: row.get(9)?,
                             tag_ids: Vec::new(),
                         },
                     ))
@@ -1345,7 +1508,7 @@ impl Database {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut jobs = Vec::with_capacity(rows.len());
-        for (delivery_id, mut notification) in rows {
+        for (delivery_id, recipient, mut notification) in rows {
             notification.tag_ids = load_item_tags(&transaction, &notification.item_id)?
                 .into_iter()
                 .map(|tag| tag.id)
@@ -1356,6 +1519,7 @@ impl Database {
             )?;
             jobs.push(EmailDeliveryJob {
                 delivery_id,
+                recipient,
                 notification,
             });
         }
@@ -1430,6 +1594,18 @@ impl Database {
         };
 
         let recycle_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
+        transaction.execute(
+            "INSERT INTO item_tombstones (item_id, revision, deleted_at, source_instance_id)
+             SELECT i.id, i.revision + 1, ?1, a.instance_id
+             FROM items i CROSS JOIN app_instance a
+             WHERE i.status = 'DELETED' AND i.deleted_at IS NOT NULL AND i.deleted_at <= ?2
+               AND a.id = 1
+             ON CONFLICT(item_id) DO UPDATE SET
+               revision = MAX(revision, excluded.revision),
+               deleted_at = excluded.deleted_at,
+               source_instance_id = excluded.source_instance_id",
+            params![now.to_rfc3339(), recycle_cutoff],
+        )?;
         result.changed |= transaction.execute(
             "DELETE FROM items WHERE status = 'DELETED' AND deleted_at IS NOT NULL AND deleted_at <= ?1",
             [&recycle_cutoff],
@@ -1901,6 +2077,16 @@ fn claimed_event_item_id(
         .map_err(AppError::from)
 }
 
+fn instance_id_for_transaction(transaction: &Transaction<'_>) -> AppResult<String> {
+    transaction
+        .query_row(
+            "SELECT instance_id FROM app_instance WHERE id = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(AppError::from)
+}
+
 fn read_settings(connection: &Connection) -> AppResult<Settings> {
     let mut settings = connection
         .query_row(
@@ -2112,6 +2298,36 @@ fn load_item_tags(connection: &Connection, item_id: &str) -> AppResult<Vec<Tag>>
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn load_filtered_item_tags(
+    connection: &Connection,
+    item_condition: &str,
+    first_param: Option<&dyn rusqlite::ToSql>,
+) -> AppResult<HashMap<String, Vec<Tag>>> {
+    let sql = format!(
+        "SELECT it.item_id, t.id, t.name, t.color
+         FROM item_tags it
+         JOIN tags t ON t.id = it.tag_id
+         JOIN items i ON i.id = it.item_id
+         WHERE {item_condition} AND t.archived = 0
+         ORDER BY it.item_id, t.position, t.name"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut rows = if let Some(value) = first_param {
+        statement.query([value])?
+    } else {
+        statement.query([])?
+    };
+    let mut tags_by_item: HashMap<String, Vec<Tag>> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        tags_by_item.entry(row.get(0)?).or_default().push(Tag {
+            id: row.get(1)?,
+            name: row.get(2)?,
+            color: row.get(3)?,
+        });
+    }
+    Ok(tags_by_item)
 }
 
 fn ensure_category_exists(connection: &Connection, id: &str) -> AppResult<()> {
@@ -2387,19 +2603,19 @@ fn next_after_delivery(
     let local_time = parse_time(&row.due_local_time)?;
     let repeat_times = repeat_times_for_row(row);
 
-    if row.event_kind.as_deref() == Some("WARNING")
-        && let Some(target) = &row.target_at
-    {
-        let target = DateTime::parse_from_rfc3339(target)
-            .map_err(|_| AppError::Validation("预警目标时间损坏".into()))?
-            .with_timezone(&Utc);
-        if scheduled < target && now < target {
-            let next = if row.reminder_plan == "REPEAT" {
-                next_repeat_slot_after(now, &repeat_times)?
-            } else {
-                crate::domain::next_daily_at(now, local_time)?
-            };
-            return Ok(Some(next.min(target)));
+    if row.event_kind.as_deref() == Some("WARNING") {
+        if let Some(target) = &row.target_at {
+            let target = DateTime::parse_from_rfc3339(target)
+                .map_err(|_| AppError::Validation("预警目标时间损坏".into()))?
+                .with_timezone(&Utc);
+            if scheduled < target && now < target {
+                let next = if row.reminder_plan == "REPEAT" {
+                    next_repeat_slot_after(now, &repeat_times)?
+                } else {
+                    crate::domain::next_daily_at(now, local_time)?
+                };
+                return Ok(Some(next.min(target)));
+            }
         }
         return Ok(None);
     }
@@ -2475,13 +2691,6 @@ fn next_after_delivery(
             (Some(value), Some(unit)) => next_calendar_after(scheduled, now, value, unit).map(Some),
             _ => Ok(None),
         },
-        _ if settings.repeat_unacknowledged_enabled && row.event_kind.is_none() => next_repeat_at(
-            now,
-            settings.unacknowledged_repeat_minutes,
-            settings,
-            row.bypass_quiet_hours,
-        )
-        .map(Some),
         _ => Ok(None),
     }
 }
@@ -2513,14 +2722,14 @@ fn should_stop_without_delivery(row: &DueRow, now: DateTime<Utc>) -> AppResult<b
             return Ok(true);
         }
     }
-    if row.event_kind.as_deref() == Some("CONTINUOUS")
-        && let Some(end) = row.end_at.as_deref()
-    {
-        let end = DateTime::parse_from_rfc3339(end)
-            .map_err(|_| AppError::Validation("持续事件的结束时间数据损坏".into()))?
-            .with_timezone(&Utc);
-        if now > end {
-            return Ok(true);
+    if row.event_kind.as_deref() == Some("CONTINUOUS") {
+        if let Some(end) = row.end_at.as_deref() {
+            let end = DateTime::parse_from_rfc3339(end)
+                .map_err(|_| AppError::Validation("持续事件的结束时间数据损坏".into()))?
+                .with_timezone(&Utc);
+            if now > end {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -2776,6 +2985,162 @@ fn bool_to_int(value: bool) -> i64 {
     i64::from(value)
 }
 
+fn read_update_state(
+    connection: &Connection,
+    now: DateTime<Utc>,
+    current_version: &str,
+) -> AppResult<UpdateState> {
+    let (
+        auto_check_enabled,
+        permission_prompted,
+        last_checked_at,
+        last_check_result,
+        snoozed_version,
+        snoozed_until,
+        last_notified_version,
+        release_notes_seen_version,
+    ) = connection.query_row(
+        "SELECT auto_check_enabled, permission_prompted, last_checked_at,
+                last_check_result, snoozed_version, snoozed_until,
+                last_notified_version, release_notes_seen_version
+         FROM update_state WHERE id = 1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)? != 0,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        },
+    )?;
+
+    let last_checked = last_checked_at
+        .as_deref()
+        .map(parse_update_timestamp)
+        .transpose()?;
+    if let Some(value) = snoozed_until.as_deref() {
+        parse_update_timestamp(value)?;
+    }
+    let should_auto_check = auto_check_enabled
+        && last_checked
+            .map(|checked| now >= checked + Duration::hours(24))
+            .unwrap_or(true);
+
+    Ok(UpdateState {
+        auto_check_enabled,
+        permission_prompted,
+        last_checked_at,
+        last_check_result,
+        snoozed_version,
+        snoozed_until,
+        last_notified_version,
+        show_current_release_notes: release_notes_seen_version.as_deref() != Some(current_version),
+        release_notes_seen_version,
+        should_auto_check,
+    })
+}
+
+fn parse_update_timestamp(value: &str) -> AppResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .map_err(|_| AppError::Validation("更新状态中的时间无法识别".into()))
+}
+
+fn validate_update_version(version: &str) -> AppResult<()> {
+    let valid = !version.is_empty()
+        && version.len() <= 64
+        && version.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(AppError::Validation("更新版本号无效".into()))
+    }
+}
+
+fn run_migrations(connection: &mut Connection, version: i64) -> AppResult<()> {
+    let migrations = [
+        (1, MIGRATION_0001),
+        (2, MIGRATION_0002),
+        (3, MIGRATION_0003),
+        (4, MIGRATION_0004),
+        (5, MIGRATION_0005),
+        (6, MIGRATION_0006),
+        (7, MIGRATION_0007),
+        (8, MIGRATION_0008),
+        (9, MIGRATION_0009),
+        (10, MIGRATION_0010),
+        (11, MIGRATION_0011),
+    ];
+    for (migration_version, sql) in migrations {
+        if version < migration_version {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(sql)?;
+            transaction.commit()?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_instance_id(connection: &Connection) -> AppResult<()> {
+    let current = connection.query_row(
+        "SELECT instance_id FROM app_instance WHERE id = 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    if current.trim().is_empty() {
+        connection.execute(
+            "UPDATE app_instance SET instance_id = ?1 WHERE id = 1",
+            [Uuid::new_v4().to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_database_safely(database_path: &Path, from_version: i64) -> AppResult<()> {
+    let source =
+        Connection::open_with_flags(database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let source_summary = summarize_connection(&source, database_path)?;
+    let backup = create_upgrade_backup(&source, database_path, from_version)?;
+    let legacy_backup = database_path.with_extension("db.backup-before-v3");
+    if !legacy_backup.exists() {
+        fs::copy(&backup, &legacy_backup)?;
+        inspect_database_file(&legacy_backup)?;
+    }
+
+    let staging = migration_staging_path(database_path)?;
+    archive_stale_staging(&staging, database_path, "abandoned-migration")?;
+    source.execute("VACUUM INTO ?1", [staging.to_string_lossy().as_ref()])?;
+    drop(source);
+
+    let mut migrated = Connection::open(&staging)?;
+    migrated.busy_timeout(std::time::Duration::from_secs(5))?;
+    migrated.execute_batch(
+        "PRAGMA foreign_keys = ON; PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL;",
+    )?;
+    run_migrations(&mut migrated, from_version)?;
+    migrated.execute_batch("PRAGMA optimize;")?;
+    drop(migrated);
+
+    let summary = inspect_database_file(&staging)?;
+    if summary.schema_version != LATEST_SCHEMA_VERSION
+        || summary.item_count != source_summary.item_count
+        || summary.reminder_history_count != source_summary.reminder_history_count
+        || summary.has_draft != source_summary.has_draft
+    {
+        return Err(AppError::Validation(
+            "数据升级校验没有完成，原数据保持不变".into(),
+        ));
+    }
+    activate_staged_database(&staging, database_path, "migration-source")
+}
+
 fn schema_version(connection: &Connection) -> AppResult<i64> {
     connection
         .query_row(
@@ -2798,6 +3163,103 @@ fn pending_restore_path(database_path: &Path) -> AppResult<PathBuf> {
         .parent()
         .ok_or_else(|| AppError::Validation("数据目录无效".into()))?;
     Ok(parent.join("shanji.restore-pending.db"))
+}
+
+fn migration_staging_path(database_path: &Path) -> AppResult<PathBuf> {
+    let parent = database_path
+        .parent()
+        .ok_or_else(|| AppError::Validation("数据目录无效".into()))?;
+    Ok(parent.join("shanji.migration-pending.db"))
+}
+
+pub(crate) fn stage_database_restore(candidate: &Path, database_path: &Path) -> AppResult<()> {
+    if candidate == database_path {
+        return Err(AppError::Validation("当前数据无需恢复".into()));
+    }
+    let summary = inspect_database_file(candidate)?;
+    if summary.schema_version > LATEST_SCHEMA_VERSION {
+        return Err(AppError::Validation(
+            "这份数据来自更高版本的闪记，请先升级应用后再恢复".into(),
+        ));
+    }
+    let parent = database_path
+        .parent()
+        .ok_or_else(|| AppError::Validation("数据目录无效".into()))?;
+    fs::create_dir_all(parent)?;
+    let staging = pending_restore_path(database_path)?;
+    archive_stale_staging(&staging, database_path, "abandoned-restore")?;
+    let source =
+        Connection::open_with_flags(candidate, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    source.execute("VACUUM INTO ?1", [staging.to_string_lossy().as_ref()])?;
+    drop(source);
+    let staged = inspect_database_file(&staging)?;
+    if staged.item_count != summary.item_count
+        || staged.reminder_history_count != summary.reminder_history_count
+        || staged.has_draft != summary.has_draft
+        || staged.has_custom_settings != summary.has_custom_settings
+        || staged.schema_version != summary.schema_version
+    {
+        return Err(AppError::Validation(
+            "恢复副本校验不一致，原数据保持不变".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn archive_stale_staging(staging: &Path, database_path: &Path, reason: &str) -> AppResult<()> {
+    if !staging.exists() {
+        return Ok(());
+    }
+    if fs::metadata(staging)?.len() == 0 {
+        fs::remove_file(staging)?;
+        return Ok(());
+    }
+    let directory = backup_directory(database_path)?;
+    fs::create_dir_all(&directory)?;
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S-%3f");
+    fs::rename(
+        staging,
+        directory.join(format!("shanji-{timestamp}-{reason}.db")),
+    )?;
+    Ok(())
+}
+
+fn activate_staged_database(staging: &Path, database_path: &Path, reason: &str) -> AppResult<()> {
+    inspect_database_file(staging)?;
+    let parent = database_path
+        .parent()
+        .ok_or_else(|| AppError::Validation("数据目录无效".into()))?;
+    fs::create_dir_all(parent)?;
+    let archive_directory = backup_directory(database_path)?;
+    fs::create_dir_all(&archive_directory)?;
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S-%3f");
+    let files = [
+        (database_path.to_path_buf(), "db"),
+        (database_path.with_extension("db-wal"), "db-wal"),
+        (database_path.with_extension("db-shm"), "db-shm"),
+    ];
+    let mut archived = Vec::new();
+    for (original, suffix) in files {
+        if original.exists() {
+            let destination =
+                archive_directory.join(format!("shanji-{timestamp}-{reason}.{suffix}"));
+            if let Err(error) = fs::rename(&original, &destination) {
+                for (moved_from, moved_to) in archived.iter().rev() {
+                    let _ = fs::rename(moved_to, moved_from);
+                }
+                return Err(error.into());
+            }
+            archived.push((original, destination));
+        }
+    }
+
+    if let Err(error) = fs::rename(staging, database_path) {
+        for (original, archived_path) in archived.iter().rev() {
+            let _ = fs::rename(archived_path, original);
+        }
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn create_upgrade_backup(
@@ -2826,6 +3288,7 @@ fn create_timestamped_backup(
         "shanji-{timestamp}-schema-{schema_version}-{reason}.db"
     ));
     connection.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
+    inspect_database_file(&path)?;
     Ok(path)
 }
 
@@ -2833,24 +3296,140 @@ fn summarize_connection(connection: &Connection, path: &Path) -> AppResult<DataF
     let item_count = connection
         .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))?
         .max(0) as u64;
-    let updated_at = file_updated_at(path);
+    let reminder_history_count = connection
+        .query_row("SELECT COUNT(*) FROM reminder_events", [], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .max(0) as u64;
+    let has_settings = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM app_settings WHERE id = 1)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    let has_draft = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM drafts WHERE id = 1)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    let has_custom_settings = settings_are_customized(connection)?;
+    let updated_at = connection
+        .query_row(
+            "SELECT MAX(value) FROM (
+                SELECT MAX(updated_at) AS value FROM items
+                UNION ALL
+                SELECT MAX(updated_at) AS value FROM drafts
+            )",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )?
+        .or_else(|| file_updated_at(path));
     Ok(DataFileSummary {
         path: path.to_string_lossy().into_owned(),
         item_count,
+        reminder_history_count,
+        has_settings,
+        has_draft,
+        has_custom_settings,
         schema_version: schema_version(connection)?,
         updated_at,
     })
 }
 
-fn inspect_database_file(path: &Path) -> AppResult<DataFileSummary> {
+pub(crate) fn summary_has_recoverable_content(summary: &DataFileSummary) -> bool {
+    summary.item_count > 0
+        || summary.reminder_history_count > 0
+        || summary.has_draft
+        || summary.has_custom_settings
+}
+
+fn settings_are_customized(connection: &Connection) -> AppResult<bool> {
+    let base_customized = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM app_settings
+            WHERE id = 1 AND (
+                default_due_time <> '18:00'
+                OR workdays <> '[1,2,3,4,5]'
+                OR overtime_interval_minutes <> 30
+                OR quiet_hours_enabled <> 1
+                OR quiet_start <> '22:30'
+                OR quiet_end <> '07:30'
+                OR global_shortcut <> 'CommandOrControl+Shift+Space'
+                OR notifications_enabled <> 1
+            )
+        )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if base_customized {
+        return Ok(true);
+    }
+
+    let settings_columns = connection
+        .prepare("PRAGMA table_info(app_settings)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if settings_columns
+        .iter()
+        .any(|column| column == "onboarding_version")
+    {
+        let onboarding_completed = connection.query_row(
+            "SELECT onboarding_version > 0 FROM app_settings WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if onboarding_completed {
+            return Ok(true);
+        }
+    }
+
+    let category_customized = connection.query_row(
+        "SELECT COUNT(*) <> 3 OR EXISTS(
+            SELECT 1 FROM categories
+            WHERE (id = 'work' AND (name <> '工作' OR color <> '#627D98' OR position <> 10 OR archived <> 0))
+               OR (id = 'personal' AND (name <> '个人' OR color <> '#6E8B74' OR position <> 20 OR archived <> 0))
+               OR (id = 'later' AND (name <> '稍后' OR color <> '#9381A8' OR position <> 30 OR archived <> 0))
+               OR id NOT IN ('work', 'personal', 'later')
+        ) FROM categories",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if category_customized {
+        return Ok(true);
+    }
+
+    let has_tags_table = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tags')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if has_tags_table {
+        return Ok(
+            connection.query_row("SELECT EXISTS(SELECT 1 FROM tags)", [], |row| {
+                row.get::<_, i64>(0)
+            })? != 0,
+        );
+    }
+    Ok(false)
+}
+
+pub(crate) fn inspect_database_file(path: &Path) -> AppResult<DataFileSummary> {
     if !path.is_file() || fs::metadata(path)?.len() == 0 {
         return Err(AppError::Validation("数据文件为空或不存在".into()));
     }
     let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
     let integrity =
-        connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?;
+        connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))?;
     if integrity != "ok" {
         return Err(AppError::Validation("数据文件未通过完整性检查".into()));
+    }
+    let foreign_key_issue = connection
+        .prepare("PRAGMA foreign_key_check")?
+        .query([])?
+        .next()?
+        .is_some();
+    if foreign_key_issue {
+        return Err(AppError::Validation("数据关系未通过一致性检查".into()));
     }
     summarize_connection(&connection, path)
 }
@@ -3215,7 +3794,7 @@ mod tests {
             )
             .unwrap();
         let current = database.get_settings().unwrap();
-        database
+        let saved_settings = database
             .update_settings(
                 &UpdateSettingsInput {
                     default_due_time: current.default_due_time,
@@ -3231,7 +3810,6 @@ mod tests {
                     update_existing_default_items: false,
                     persistent_notifications_enabled: current.persistent_notifications_enabled,
                     overlay_reminders_enabled: current.overlay_reminders_enabled,
-                    repeat_unacknowledged_enabled: current.repeat_unacknowledged_enabled,
                     unacknowledged_repeat_minutes: current.unacknowledged_repeat_minutes,
                     smtp_enabled: current.smtp_enabled,
                     smtp_host: current.smtp_host,
@@ -3247,6 +3825,7 @@ mod tests {
                 now,
             )
             .unwrap();
+        assert!(!saved_settings.repeat_unacknowledged_enabled);
         assert_eq!(
             database.get_item(&existing.id).unwrap().repeat_times,
             vec!["10:00", "17:00"]
@@ -3533,7 +4112,6 @@ mod tests {
                     update_existing_default_items: false,
                     persistent_notifications_enabled: current.persistent_notifications_enabled,
                     overlay_reminders_enabled: current.overlay_reminders_enabled,
-                    repeat_unacknowledged_enabled: current.repeat_unacknowledged_enabled,
                     unacknowledged_repeat_minutes: current.unacknowledged_repeat_minutes,
                     smtp_enabled: current.smtp_enabled,
                     smtp_host: current.smtp_host,
@@ -3754,13 +4332,14 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(version, 7);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         assert!(delivery_columns.contains(&"submitted_at".into()));
         assert!(delivery_columns.contains(&"error_code".into()));
         assert!(settings_columns.contains(&"autostart_enabled".into()));
         assert!(settings_columns.contains(&"onboarding_version".into()));
         assert!(settings_columns.contains(&"repeat_default_time_first".into()));
         assert!(settings_columns.contains(&"repeat_default_time_second".into()));
+        assert!(settings_columns.contains(&"smtp_verified_at".into()));
         let tag_table_exists = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'item_tags')",
@@ -3795,6 +4374,81 @@ mod tests {
             .unwrap();
         assert!(channel_table_exists);
         assert!(path.with_extension("db.backup-before-v3").exists());
+    }
+
+    #[test]
+    fn v7_email_tag_route_migrates_without_faking_connection_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shanji-v7.db");
+        let mut connection = Connection::open(&path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for migration in [
+            MIGRATION_0001,
+            MIGRATION_0002,
+            MIGRATION_0003,
+            MIGRATION_0004,
+            MIGRATION_0005,
+            MIGRATION_0006,
+            MIGRATION_0007,
+        ] {
+            transaction.execute_batch(migration).unwrap();
+        }
+        transaction
+            .execute(
+                "INSERT INTO tags (id, name, color, position) VALUES ('urgent', '紧急', '#d94b35', 10)",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO tag_notification_routes (tag_id, channel, enabled) VALUES ('urgent', 'email', 1)",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE app_settings SET smtp_enabled = 1, smtp_to = 'me@example.com', smtp_repeat_must_complete = 1 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        let connection = database.connection.lock().expect("database mutex poisoned");
+        let migrated = connection
+            .query_row(
+                "SELECT match_dimension, match_value, strategy, recipient, enabled FROM email_delivery_rules WHERE id = 'legacy-tag-urgent'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, bool>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            migrated,
+            (
+                "TAG".into(),
+                "urgent".into(),
+                "EACH_PLAN".into(),
+                "me@example.com".into(),
+                true,
+            )
+        );
+        let verified_at: Option<String> = connection
+            .query_row(
+                "SELECT smtp_verified_at FROM app_settings WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(verified_at.is_none());
     }
 
     #[test]
@@ -3931,7 +4585,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(database.permanently_delete_item(&item.id).is_err());
+        assert!(database.permanently_delete_item(&item.id, now).is_err());
         let deleted = database.set_item_deleted(&item.id, true, now).unwrap();
         assert_eq!(deleted.status, "DELETED");
         assert!(deleted.next_reminder_at.is_none());
@@ -3945,7 +4599,7 @@ mod tests {
         assert_eq!(restored_done.status, "DONE");
         assert!(restored_done.next_reminder_at.is_none());
         database.set_item_deleted(&item.id, true, now).unwrap();
-        database.permanently_delete_item(&item.id).unwrap();
+        database.permanently_delete_item(&item.id, now).unwrap();
         assert!(matches!(
             database.get_item(&item.id),
             Err(AppError::ItemNotFound)
@@ -4057,17 +4711,56 @@ mod tests {
         let items = restored.list_items("all", now).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "恢复后的数据");
-        assert!(
-            directory
-                .path()
-                .read_dir()
+        let preserved_original = directory
+            .path()
+            .join("backups")
+            .read_dir()
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("before-restore.db"))
+            })
+            .expect("the database used before restore should remain recoverable");
+        assert_eq!(
+            inspect_database_file(&preserved_original)
                 .unwrap()
-                .filter_map(Result::ok)
-                .any(|entry| entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("shanji-before-restore-"))
+                .item_count,
+            1
         );
+    }
+
+    #[test]
+    fn database_appearing_after_empty_preflight_is_not_opened_for_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shanji.db");
+        let now = at_local(2026, 9, 2, 9, 0);
+        let database = Database::open(&path).unwrap();
+        database
+            .create_item(
+                &CreateItemInput {
+                    title: "并发出现的数据".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(at_local(2026, 9, 2, 18, 0).to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: None,
+                    tag_ids: Vec::new(),
+                    event: None,
+                },
+                now,
+            )
+            .unwrap();
+        drop(database);
+
+        let error = match Database::open_preflighted(&path, None) {
+            Ok(_) => panic!("database should not open after the checked path changed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("发生了变化"));
+        assert_eq!(inspect_database_file(&path).unwrap().item_count, 1);
     }
 
     #[test]
@@ -4211,7 +4904,7 @@ mod tests {
     }
 
     #[test]
-    fn reminder_center_requires_an_explicit_action_and_ack_stops_normal_repeats() {
+    fn legacy_global_repeat_is_ignored_but_reminder_center_still_requires_action() {
         let database = Database::in_memory().unwrap();
         let due = at_local(2026, 8, 27, 18, 0);
         let item = database
@@ -4231,6 +4924,12 @@ mod tests {
             .unwrap();
         {
             let connection = database.connection.lock().expect("database mutex poisoned");
+            connection
+                .execute(
+                    "UPDATE items SET reminder_plan = 'ONCE' WHERE id = ?1",
+                    [&item.id],
+                )
+                .unwrap();
             connection
                 .execute(
                     "UPDATE app_settings SET repeat_unacknowledged_enabled = 1,
@@ -4255,7 +4954,7 @@ mod tests {
                 .get_item(&item.id)
                 .unwrap()
                 .next_reminder_at
-                .is_some()
+                .is_none()
         );
 
         database.acknowledge_reminder(&item.id, first_at).unwrap();
@@ -4470,5 +5169,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn update_checks_are_opt_in_and_rate_limited_across_clock_rollback() {
+        let database = Database::in_memory().unwrap();
+        let now = at_local(2026, 9, 8, 10, 0);
+
+        let initial = database.get_update_state(now, "0.12.0").unwrap();
+        assert!(!initial.auto_check_enabled);
+        assert!(!initial.should_auto_check);
+        assert!(!initial.permission_prompted);
+
+        let enabled = database
+            .set_auto_update_enabled(true, now, "0.12.0")
+            .unwrap();
+        assert!(enabled.permission_prompted);
+        assert!(enabled.should_auto_check);
+
+        let checked = database
+            .record_update_check("UP_TO_DATE", now, "0.12.0")
+            .unwrap();
+        assert!(!checked.should_auto_check);
+        assert!(
+            !database
+                .get_update_state(now - chrono::Duration::hours(2), "0.12.0")
+                .unwrap()
+                .should_auto_check
+        );
+        assert!(
+            database
+                .get_update_state(now + chrono::Duration::hours(24), "0.12.0")
+                .unwrap()
+                .should_auto_check
+        );
+    }
+
+    #[test]
+    fn update_snooze_and_release_notes_are_persisted() {
+        let database = Database::in_memory().unwrap();
+        let now = at_local(2026, 9, 8, 10, 0);
+        database
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE update_state SET release_notes_seen_version = '0.11.1' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+
+        let state = database.get_update_state(now, "0.12.0").unwrap();
+        assert!(state.show_current_release_notes);
+        let snoozed = database.snooze_update("0.12.1", now, "0.12.0").unwrap();
+        assert_eq!(snoozed.snoozed_version.as_deref(), Some("0.12.1"));
+        assert_eq!(
+            parse_update_timestamp(snoozed.snoozed_until.as_deref().unwrap()).unwrap(),
+            now + chrono::Duration::hours(24)
+        );
+        let seen = database
+            .mark_release_notes_seen("0.12.0", now, "0.12.0")
+            .unwrap();
+        assert!(!seen.show_current_release_notes);
+    }
+
+    #[test]
+    fn update_state_rejects_unknown_results_and_untrusted_version_values() {
+        let database = Database::in_memory().unwrap();
+        let now = at_local(2026, 9, 8, 10, 0);
+        assert!(
+            database
+                .record_update_check("UNKNOWN", now, "0.12.0")
+                .is_err()
+        );
+        assert!(database.snooze_update("../../bad", now, "0.12.0").is_err());
     }
 }

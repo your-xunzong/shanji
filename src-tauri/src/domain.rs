@@ -105,7 +105,6 @@ pub struct UpdateSettingsInput {
     pub update_existing_default_items: bool,
     pub persistent_notifications_enabled: bool,
     pub overlay_reminders_enabled: bool,
-    pub repeat_unacknowledged_enabled: bool,
     pub unacknowledged_repeat_minutes: u32,
     pub smtp_enabled: bool,
     pub smtp_host: String,
@@ -132,11 +131,6 @@ impl UpdateSettingsInput {
         if !(5..=240).contains(&self.overtime_interval_minutes) {
             return Err(AppError::Validation(
                 "今日必做提醒间隔必须在 5–240 分钟之间".into(),
-            ));
-        }
-        if !(5..=240).contains(&self.unacknowledged_repeat_minutes) {
-            return Err(AppError::Validation(
-                "未确认重复提醒间隔必须在 5–240 分钟之间".into(),
             ));
         }
         if !matches!(self.smtp_security.as_str(), "tls" | "starttls") {
@@ -176,7 +170,8 @@ impl UpdateSettingsInput {
             autostart_enabled: self.autostart_enabled,
             persistent_notifications_enabled: self.persistent_notifications_enabled,
             overlay_reminders_enabled: self.overlay_reminders_enabled,
-            repeat_unacknowledged_enabled: self.repeat_unacknowledged_enabled,
+            // 字段保留用于读取旧数据库，但新版只按事项提醒方案计算频率。
+            repeat_unacknowledged_enabled: false,
             unacknowledged_repeat_minutes: self.unacknowledged_repeat_minutes,
             smtp_enabled: self.smtp_enabled,
             smtp_host: self.smtp_host.trim().to_string(),

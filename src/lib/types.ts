@@ -136,6 +136,23 @@ export interface AppInfo {
   name: string;
   version: string;
   copyright: string;
+  portable: boolean;
+  updateInstallMode: 'AUTOMATIC' | 'DOWNLOAD_ONLY';
+}
+
+export type UpdateCheckResult = 'UP_TO_DATE' | 'UPDATE_AVAILABLE' | 'FAILED';
+
+export interface UpdateState {
+  autoCheckEnabled: boolean;
+  permissionPrompted: boolean;
+  lastCheckedAt: string | null;
+  lastCheckResult: UpdateCheckResult | null;
+  snoozedVersion: string | null;
+  snoozedUntil: string | null;
+  lastNotifiedVersion: string | null;
+  releaseNotesSeenVersion: string | null;
+  shouldAutoCheck: boolean;
+  showCurrentReleaseNotes: boolean;
 }
 
 export interface Category {
@@ -168,6 +185,7 @@ export interface NotificationStatus {
 
 export interface SmtpStatus {
   passwordConfigured: boolean;
+  verifiedAt: string | null;
   lastResult: 'CLAIMED' | 'SUBMITTED' | 'FAILED' | null;
   lastErrorCode: string | null;
   lastAttemptAt: string | null;
@@ -197,6 +215,10 @@ export interface OnboardingFinishInput {
 export interface DataFileSummary {
   path: string;
   itemCount: number;
+  reminderHistoryCount: number;
+  hasSettings: boolean;
+  hasDraft: boolean;
+  hasCustomSettings: boolean;
   schemaVersion: number;
   updatedAt: string | null;
 }
@@ -205,6 +227,17 @@ export interface DataStatus {
   current: DataFileSummary;
   latestBackup: DataFileSummary | null;
   recoveryCandidates: DataFileSummary[];
+}
+
+export type StartupMode = 'ready' | 'recovery_required' | 'blocked';
+
+export interface StartupStatus {
+  mode: StartupMode;
+  targetPath: string;
+  message: string;
+  current: DataFileSummary | null;
+  recoveryCandidates: DataFileSummary[];
+  diagnostic: string;
 }
 
 export interface ExportResult {
@@ -219,4 +252,151 @@ export interface ExportFilterInput {
   tagId: string | null;
   createdFrom: string | null;
   createdTo: string | null;
+}
+
+export type EmailRuleDimension = 'EVENT_KIND' | 'CATEGORY' | 'TAG';
+export type EmailDeliveryStrategy = 'FIRST_DUE' | 'DAILY_FIRST' | 'EACH_PLAN' | 'DAILY_DIGEST';
+
+export interface EmailDeliveryRule {
+  id: string;
+  matchDimension: EmailRuleDimension;
+  matchValue: string;
+  strategy: EmailDeliveryStrategy;
+  recipient: string;
+  digestLocalTime: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EmailDeliveryRuleInput {
+  id: string | null;
+  matchDimension: EmailRuleDimension;
+  matchValue: string;
+  strategy: EmailDeliveryStrategy;
+  recipient: string;
+  digestLocalTime: string;
+  enabled: boolean;
+}
+
+export interface RepositorySourcePreview {
+  sourceInstanceId: string;
+  exportedAt: string;
+  itemCount: number;
+  newItems: number;
+  unchangedItems: number;
+  conflicts: number;
+  tombstones: number;
+}
+
+export interface RepositoryPreview {
+  sources: RepositorySourcePreview[];
+  newItems: number;
+  unchangedItems: number;
+  conflicts: number;
+  tombstones: number;
+  settingsNeedReview: boolean;
+}
+
+export interface RepositoryStatus {
+  configured: boolean;
+  path: string | null;
+  available: boolean;
+  localItemCount: number;
+  packageCount: number;
+  pendingSourceCount: number;
+  conflictCount: number;
+  lastSyncedAt: string | null;
+  lastPackageAt: string | null;
+  snapshotReady: boolean;
+  lastErrorCode: string | null;
+  message: string;
+}
+
+export interface RepositorySyncResult {
+  importedItems: number;
+  unchangedItems: number;
+  conflicts: number;
+  tombstonesApplied: number;
+  packagePath: string | null;
+  packageWritten: boolean;
+  syncedAt: string;
+}
+
+export type TimelineScale = 'DAY' | 'WEEK' | 'MONTH' | 'YEAR';
+
+export interface TimelineQuery {
+  scale: TimelineScale;
+  anchorDate: string;
+  includeDone: boolean;
+  eventKinds: EventKind[];
+  categoryId: string | null;
+  tagIds: string[];
+}
+
+export interface TimelinePosition {
+  left: number;
+  width: number;
+  clippedStart: boolean;
+  clippedEnd: boolean;
+  startLabel: string;
+  endLabel: string;
+}
+
+export interface TimelineStateSegment {
+  kind: 'RECORDED' | 'ACTIVE' | 'OVERDUE' | 'COMPLETED' | 'FUTURE';
+  label: string;
+  position: TimelinePosition;
+}
+
+export interface TimelineMarker {
+  position: number;
+  label: string;
+}
+
+export interface TimelineEntry {
+  id: string;
+  itemId: string;
+  title: string;
+  status: ItemStatus;
+  eventKind: EventKind | null;
+  categoryName: string | null;
+  tagNames: string[];
+  shape: 'RANGE' | 'WARNING' | 'OCCURRENCE';
+  startDate: string;
+  endDate: string;
+  targetDate: string | null;
+  important: boolean;
+  occurrenceLabel: string | null;
+  position: TimelinePosition;
+  highlight: TimelinePosition | null;
+  stateSegments: TimelineStateSegment[];
+  deadlineMarker: TimelineMarker | null;
+  completionMarker: TimelineMarker | null;
+  overdue: boolean;
+  openEnded: boolean;
+  historyIncomplete: boolean;
+}
+
+export interface TimelineUnscheduledItem {
+  itemId: string;
+  title: string;
+  status: ItemStatus;
+  eventKind: EventKind | null;
+  reason: string;
+}
+
+export interface TimelineData {
+  scale: TimelineScale;
+  rangeStart: string;
+  rangeEnd: string;
+  today: string;
+  entries: TimelineEntry[];
+  unscheduled: TimelineUnscheduledItem[];
+  totalVisibleCount: number;
+  totalUnscheduledCount: number;
+  truncated: boolean;
+  skippedInvalidCount: number;
+  ticks: { label: string; position: number; weekend: boolean }[];
+  todayPosition: number | null;
 }

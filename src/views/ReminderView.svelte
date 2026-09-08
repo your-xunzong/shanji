@@ -6,8 +6,10 @@
 
   let queue: DueNotification[] = [];
   let busy = false;
+  let dismissing = false;
   let error = '';
   let unlisten: (() => void) | undefined;
+  let unlistenHidden: (() => void) | undefined;
   $: current = queue[0];
 
   onMount(() => {
@@ -15,6 +17,10 @@
       void import('@tauri-apps/api/event').then(async ({ listen }) => {
         unlisten = await listen<DueNotification>('overlay_reminder', ({ payload }) => {
           if (!queue.some((item) => item.eventId === payload.eventId)) queue = [...queue, payload];
+        });
+        unlistenHidden = await listen('overlay_hidden', () => {
+          queue = [];
+          error = '';
         });
       });
     } else {
@@ -30,7 +36,10 @@
         tagIds: [],
       }];
     }
-    return () => unlisten?.();
+    return () => {
+      unlisten?.();
+      unlistenHidden?.();
+    };
   });
 
   async function finish(action: 'complete' | 'snooze' | 'open'): Promise<void> {
@@ -51,19 +60,39 @@
   }
 
   async function dismissWindow(): Promise<void> {
-    queue = [];
-    await api.hideReminder();
+    if (dismissing) return;
+    dismissing = true;
+    error = '';
+    try {
+      await api.hideReminder();
+      queue = [];
+    } catch {
+      error = '提醒窗没有关闭。你可以重试，或打开闪记处理这条提醒。';
+    } finally {
+      dismissing = false;
+    }
+  }
+
+  function handleKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Escape' && !event.isComposing) {
+      event.preventDefault();
+      void dismissWindow();
+    }
   }
 </script>
 
-<main class="reminder-shell" data-tauri-drag-region>
-  {#if current}
-    <div class="reminder-topline" data-tauri-drag-region>
+<svelte:window on:keydown={handleKeydown} />
+
+<main class="reminder-shell">
+  <div class="reminder-topline">
+    <div class="reminder-drag-area" data-tauri-drag-region>
       <span class="brand-mark" aria-hidden="true"></span>
       <strong>闪记提醒</strong>
       {#if queue.length > 1}<span>{queue.length} 条待处理</span>{/if}
-      <button class="icon-button" aria-label="暂时关闭提醒窗" on:click={dismissWindow}>×</button>
     </div>
+    <button class="icon-button reminder-close" aria-label="关闭本次提醒窗" title="关闭本次提醒窗，不会完成或暂停事项" disabled={dismissing} on:click={dismissWindow}>×</button>
+  </div>
+  {#if current}
     <div class="reminder-body">
       <p>{current.completionPolicy === 'MUST_COMPLETE_TODAY' ? '今日必做 · 到期后持续提醒' : '事项已到期'}</p>
       <h1>{current.title}</h1>
@@ -76,6 +105,8 @@
       <button class="text-mini" disabled={busy} on:click={() => finish('open')}>打开闪记</button>
     </div>
   {:else}
-    <div class="reminder-waiting" data-tauri-drag-region>提醒准备就绪</div>
+    <div class="reminder-waiting" data-tauri-drag-region>
+      <span>{error || '提醒内容正在载入；如果一直没有出现，可以关闭本次提醒窗。'}</span>
+    </div>
   {/if}
 </main>
