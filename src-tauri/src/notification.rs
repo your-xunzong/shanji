@@ -22,6 +22,27 @@ const WINDOWS_PORTABLE_REGISTRY_PATH: &str =
 
 const NOTIFICATION_ICON: &[u8] = include_bytes!("../icons/128x128.png");
 
+#[cfg(any(windows, test))]
+const WINDOWS_PERSISTENT_ACTIONS: [(&str, &str); 2] =
+    [("完成", "complete"), ("15 分钟后", "snooze")];
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsNotificationAction {
+    Complete,
+    Snooze,
+    Open,
+}
+
+#[cfg(any(windows, test))]
+fn windows_notification_action(action: Option<&str>) -> WindowsNotificationAction {
+    match action {
+        Some("complete") => WindowsNotificationAction::Complete,
+        Some("snooze") => WindowsNotificationAction::Snooze,
+        _ => WindowsNotificationAction::Open,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DeliveryError {
     pub code: &'static str,
@@ -358,11 +379,10 @@ impl NotificationService {
                 Ok(())
             });
         if persistent {
-            toast = toast
-                .scenario(Scenario::Reminder)
-                .add_button("完成", "complete")
-                .add_button("15 分钟后提醒", "snooze")
-                .add_button("打开闪记", "open");
+            toast = toast.scenario(Scenario::Reminder);
+            for (label, action) in WINDOWS_PERSISTENT_ACTIONS {
+                toast = toast.add_button(label, action);
+            }
         }
         toast.show().map_err(|error| DeliveryError {
             code: "platform_submit_failed",
@@ -435,8 +455,8 @@ impl NotificationService {
 
 #[cfg(windows)]
 fn handle_notification_action(app: &AppHandle, item_id: &str, action: Option<&str>) {
-    match action {
-        Some("complete") => {
+    match windows_notification_action(action) {
+        WindowsNotificationAction::Complete => {
             if let Some(state) = app.try_state::<crate::AppState>() {
                 let now = state.clock.now_utc();
                 if state
@@ -451,7 +471,7 @@ fn handle_notification_action(app: &AppHandle, item_id: &str, action: Option<&st
                 }
             }
         }
-        Some("snooze") => {
+        WindowsNotificationAction::Snooze => {
             if let Some(state) = app.try_state::<crate::AppState>() {
                 let now = state.clock.now_utc();
                 if state.database.snooze_item(item_id, 15, now).is_ok() {
@@ -462,7 +482,7 @@ fn handle_notification_action(app: &AppHandle, item_id: &str, action: Option<&st
                 }
             }
         }
-        _ => {
+        WindowsNotificationAction::Open => {
             let _ = crate::show_main_window(app);
             let _ = app.emit("notification_opened", item_id.to_string());
         }
@@ -496,5 +516,37 @@ fn handle_classification_action(app: &AppHandle, item_id: Option<&str>, action: 
                 item_id.unwrap_or_default().to_string(),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        WINDOWS_PERSISTENT_ACTIONS, WindowsNotificationAction, windows_notification_action,
+    };
+
+    #[test]
+    fn persistent_notification_keeps_two_compact_quick_actions() {
+        assert_eq!(
+            WINDOWS_PERSISTENT_ACTIONS,
+            [("完成", "complete"), ("15 分钟后", "snooze")]
+        );
+        assert!(
+            WINDOWS_PERSISTENT_ACTIONS
+                .iter()
+                .all(|(label, _)| label.chars().count() <= 6)
+        );
+    }
+
+    #[test]
+    fn clicking_the_notification_body_still_opens_the_item() {
+        assert_eq!(
+            windows_notification_action(None),
+            WindowsNotificationAction::Open
+        );
+        assert_eq!(
+            windows_notification_action(Some("open")),
+            WindowsNotificationAction::Open
+        );
     }
 }
