@@ -31,6 +31,13 @@
 - 快捷键设置会区分格式错误、仅修饰键和系统占用，并在保存失败时保留原快捷键。
 - Svelte 管理页、快速录入、设置抽屉、IME 组合态保护和浏览器预览后端。
 - Windows NSIS 安装包与 ZIP 便携包。
+- 更新或重装启动前先只读检查数据；若当前路径为空但找到原数据，会停止进入空列表并提供校验后的恢复入口。
+- 个人数据仓库使用带 SHA-256 校验的跨平台 `.sjpack` 数据包；选择位置后立即写入本机快照，归并前检查其他设备的数据，相同修订幂等跳过，分歧内容保留完整冲突副本，运行中的 SQLite 不直接放到同步盘。
+- 邮件提醒规则可按事件类型、类型或标签选择首次到期、每天第一次、每个计划时点或每日摘要；连接必须先真实测试，密码只进入系统安全存储，多规则命中同一收件地址会去重。
+- 只读事项甘特图支持日、周、月、年范围、今日线和组合筛选；所有事项按创建至截止、完成或今天显示连续状态色段，原截止保留刻痕，未完成逾期以红色斜纹延伸到今天，周期事项仍在同一行分段。
+- 屏幕角落提醒窗在正常与空载荷状态均可关闭，支持 `Esc`；关闭只隐藏本次窗口，不会暗中完成、暂停或确认事项。
+- 可选的 GitHub 稳定版更新检查、签名验证、中文更新说明、下载进度和安装重启；默认不联网，Windows 便携版与 Linux `.deb` 只提供手动下载入口。
+- 中文界面按平台使用微软雅黑 UI、苹方或 Noto Sans CJK，正文和辅助文字采用不低于 12px 的可读字号。
 
 Windows 已完成真实编译和启动验证。macOS、Linux 共用领域与数据逻辑，并已配置对应系统的自动打包；全局快捷键、托盘、通知和分发仍需在真实设备验证。
 
@@ -50,6 +57,7 @@ pnpm install
 pnpm dev
 pnpm check
 pnpm version:check
+pnpm installer:check
 pnpm test
 pnpm build
 pnpm tauri dev
@@ -70,12 +78,16 @@ cargo clippy --all-targets --all-features -- -D warnings -A linker_messages
 cargo test
 ```
 
-生成 Windows NSIS 安装包和便携 ZIP：
+生成 Windows NSIS 安装包和便携 ZIP 前，需要指定仓库外的更新私钥：
 
 ```powershell
+$env:TAURI_SIGNING_PRIVATE_KEY = "C:\Users\你的用户名\.tauri\shanji-updater.key"
 pnpm tauri build --bundles nsis
+pnpm installer:check --generated
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1
 ```
+
+Windows 安装与卸载向导使用简体中文，无需选择语言；系统安全提示和第三方运行组件自身界面遵循各自的语言设置。`installer:check` 校验打包配置与专用中文文案，带 `--generated` 时还会核对本次生成的安装脚本。
 
 产物默认位于：
 
@@ -90,11 +102,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1
 - macOS：兼容 Apple Silicon 与 Intel 的通用 DMG；
 - Linux x64：AppImage、DEB。
 
-手动运行工作流只生成可下载的临时构建产物；推送 `v*` 标签时才创建草稿预发布，并附带 `SHA256SUMS.txt`。未配置 Apple Developer 和 Windows 代码签名凭据时，安装过程可能出现系统安全提示。这些包只用于测试，需在对应真实设备完成验证后再转为正式发布。
+手动运行工作流只生成可下载的临时构建产物；推送 `v*` 标签时使用 `TAURI_SIGNING_PRIVATE_KEY` 仓库 Secret 生成更新签名、`latest.json` 和 `SHA256SUMS.txt`，然后创建待确认的稳定版草稿。维护者在 GitHub 正式发布草稿后，已授权的客户端才会发现更新。Windows 发布者签名与 macOS 签名/公证仍是独立门槛，未配置时安装过程可能出现系统安全提示。
 
 ## 本地数据
 
 普通模式遵循系统应用数据目录；Windows 当前路径为 `%APPDATA%\com.shanji.desktop\shanji.db`。
+
+覆盖更新、相同版本重装和安装目录变化不会改变普通模式的数据位置。升级前会创建 SQLite 一致性备份并在副本上完成迁移；备份、空间或校验失败时应用停止写入并保留原文件。若出现“找到原来的数据”，请核对记录数量和时间后使用“恢复原数据并重新启动”，不要手动复制正在写入的数据库文件。
 
 便携包内含 `portable.flag`。存在该标记时，数据写入程序旁的 `data/shanji.db`。请完整移动或备份整个便携目录，不要只复制正在写入的数据库文件。
 

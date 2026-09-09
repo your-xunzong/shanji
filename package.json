@@ -1,6 +1,6 @@
 {
   "name": "shanji",
-  "version": "0.7.0",
+  "version": "0.13.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,6 +8,7 @@
     "build": "svelte-check --tsconfig ./tsconfig.app.json && vite build",
     "check": "svelte-check --tsconfig ./tsconfig.app.json",
     "version:check": "node scripts/check-version-consistency.mjs",
+    "installer:check": "node scripts/check-installer-language.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "tauri": "tauri"
@@ -15,6 +16,8 @@
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "2.7.2",
+    "@tauri-apps/plugin-process": "2.3.1",
+    "@tauri-apps/plugin-updater": "2.11.0",
     "svelte": "^5.56.10"
   },
   "devDependencies": {

@@ -56,6 +56,40 @@ const autostartStatus: AutostartStatus = {
 };
 
 describe('SettingsPanel', () => {
+  it('separates reminder display from schedule and opens the real reminder center', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const onOpenReminderCenter = vi.fn();
+    render(SettingsPanel, {
+      settings: { ...settings, repeatUnacknowledgedEnabled: true },
+      saving: false,
+      notificationStatus,
+      autostartStatus,
+      pendingReminderCount: 3,
+      onClose: vi.fn(),
+      onSave,
+      onTestNotification: vi.fn().mockResolvedValue(undefined),
+      onTestReminderMode: vi.fn().mockResolvedValue('测试已发送'),
+      onOpenReminderCenter,
+      onRegisterNotifications: vi.fn().mockResolvedValue(undefined),
+      onUnregisterNotifications: vi.fn().mockResolvedValue(undefined),
+      onOpenOnboarding: vi.fn(),
+    });
+
+    expect(screen.getByText('提醒时间与频率由事件默认方案和单条事项决定；这里仅选择提醒从哪里出现。')).toBeInTheDocument();
+    expect(screen.getByText('系统')).toBeInTheDocument();
+    expect(screen.getAllByText('闪记').length).toBeGreaterThan(0);
+    expect(screen.getByText('3 条')).toBeInTheDocument();
+    expect(screen.queryByText('普通事项未确认时重复提醒')).not.toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: '普通事项重复提醒间隔' })).not.toBeInTheDocument();
+
+    await fireEvent.click(screen.getByRole('button', { name: '打开待确认提醒' }));
+    expect(onOpenReminderCenter).toHaveBeenCalledOnce();
+    await fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
+      repeatUnacknowledgedEnabled: false,
+    }));
+  });
+
   it('显示运行时版本并保存事件默认方案', async () => {
     const onSave = vi.fn().mockResolvedValue(undefined);
     render(SettingsPanel, {
@@ -63,7 +97,7 @@ describe('SettingsPanel', () => {
       saving: false,
       notificationStatus,
       autostartStatus,
-      appInfo: { name: '闪记', version: '0.7.0', copyright: '© 2026 闪记' },
+      appInfo: { name: '闪记', version: '0.7.0', copyright: '© 2026 闪记', portable: false, updateInstallMode: 'AUTOMATIC' },
       onClose: vi.fn(),
       onSave,
       onTestNotification: vi.fn().mockResolvedValue(undefined),

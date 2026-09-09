@@ -278,6 +278,54 @@ impl NotificationService {
         }
     }
 
+    pub fn send_update_available(&self, version: &str) -> Result<(), DeliveryError> {
+        #[cfg(windows)]
+        {
+            use tauri_winrt_notification::Toast;
+
+            if self.portable && !self.windows_identity_registered() {
+                return Err(DeliveryError {
+                    code: "identity_registration_required",
+                    diagnostic: "便携版通知身份尚未注册".into(),
+                });
+            }
+            if !self.windows_identity_registered() {
+                self.register_windows_identity()?;
+            }
+
+            let app = self.app.clone();
+            Toast::new(self.windows_app_id())
+                .title("闪记 · 新版本可用")
+                .text1(&format!("可以更新到 v{version}"))
+                .text2("打开闪记查看本次变化，再决定何时安装。")
+                .on_activated(move |_| {
+                    let _ = crate::show_main_window(&app);
+                    Ok(())
+                })
+                .show()
+                .map_err(|error| DeliveryError {
+                    code: "platform_submit_failed",
+                    diagnostic: error.to_string(),
+                })
+        }
+
+        #[cfg(not(windows))]
+        {
+            use tauri_plugin_notification::NotificationExt;
+
+            self.app
+                .notification()
+                .builder()
+                .title("闪记 · 新版本可用")
+                .body(format!("可以更新到 v{version}。打开闪记查看本次变化。"))
+                .show()
+                .map_err(|error| DeliveryError {
+                    code: "platform_submit_failed",
+                    diagnostic: error.to_string(),
+                })
+        }
+    }
+
     #[cfg(windows)]
     fn send_windows(
         &self,

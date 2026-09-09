@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
@@ -47,6 +47,26 @@ if (uniqueVersions.size !== 1) {
 }
 
 const [version] = uniqueVersions;
+const releaseNotesPath = `src/release-notes/v${version}.md`;
+if (!existsSync(releaseNotesPath)) {
+  throw new Error(`Missing user-facing release notes: ${releaseNotesPath}`);
+}
+const releaseNotes = readFileSync(releaseNotesPath, "utf8");
+const releaseBullets = releaseNotes.match(/^\s*[-*]\s+\S.+$/gm) ?? [];
+if (releaseBullets.length < 3 || releaseBullets.length > 6) {
+  throw new Error(`${releaseNotesPath} must contain 3-6 user-facing bullet points.`);
+}
+
+const tauriConfig = readJson("src-tauri/tauri.conf.json");
+const updaterConfig = tauriConfig.plugins?.updater;
+if (tauriConfig.bundle?.createUpdaterArtifacts !== true) {
+  throw new Error("Tauri updater artifacts are not enabled.");
+}
+if (!updaterConfig?.pubkey || !Array.isArray(updaterConfig.endpoints)
+  || updaterConfig.endpoints.length !== 1
+  || updaterConfig.endpoints[0] !== "https://github.com/your-xunzong/shanji/releases/latest/download/latest.json") {
+  throw new Error("Tauri updater must use the signed official GitHub release endpoint.");
+}
 if (process.env.GITHUB_REF_TYPE === "tag") {
   const expectedTag = `v${version}`;
   if (process.env.GITHUB_REF_NAME !== expectedTag) {
@@ -57,3 +77,4 @@ if (process.env.GITHUB_REF_TYPE === "tag") {
 }
 
 console.log(`Application version ${version} is consistent.`);
+console.log(`Release notes contain ${releaseBullets.length} user-facing changes.`);

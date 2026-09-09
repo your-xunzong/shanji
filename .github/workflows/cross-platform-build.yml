@@ -48,6 +48,7 @@ jobs:
 
       - name: 前端检查与测试
         run: |
+          pnpm installer:check
           pnpm check
           pnpm test
           pnpm build
@@ -118,12 +119,24 @@ jobs:
       - name: 核对应用版本与标签
         run: pnpm version:check
 
+      - name: 检查更新签名密钥
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: test -n "$TAURI_SIGNING_PRIVATE_KEY"
+
       - name: 生成安装包
         uses: tauri-apps/tauri-action@v0
         env:
           APPLE_SIGNING_IDENTITY: ${{ matrix.apple_signing_identity }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           args: ${{ matrix.args }}
+
+      - name: 核对 Windows 安装器中文
+        if: runner.os == 'Windows'
+        run: pnpm installer:check --generated
 
       - name: 生成 Windows 便携包
         if: runner.os == 'Windows'
@@ -143,6 +156,7 @@ jobs:
           $taskPortable = "artifacts/shanji-$($taskVersion)-windows-x64-portable.zip"
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
           Copy-Item -LiteralPath $taskInstallers[0].FullName -Destination "release-assets/shanji-$($taskVersion)-windows-x64-setup.exe"
+          Copy-Item -LiteralPath "$($taskInstallers[0].FullName).sig" -Destination "release-assets/shanji-$($taskVersion)-windows-x64-setup.exe.sig"
           Copy-Item -LiteralPath $taskPortable -Destination release-assets
 
       - name: 汇集 macOS 安装包
@@ -151,9 +165,13 @@ jobs:
         run: |
           task_version="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json', 'utf8')).version")"
           task_dmg="$(find src-tauri/target -type f -path '*/release/bundle/dmg/*.dmg' -print -quit)"
+          task_updater="$(find src-tauri/target -type f -path '*/release/bundle/macos/*.app.tar.gz' -print -quit)"
           test -n "$task_dmg"
+          test -n "$task_updater"
           mkdir -p release-assets
           cp "$task_dmg" "release-assets/shanji-$task_version-macos-universal.dmg"
+          cp "$task_updater" "release-assets/shanji-$task_version-macos-universal.app.tar.gz"
+          cp "$task_updater.sig" "release-assets/shanji-$task_version-macos-universal.app.tar.gz.sig"
 
       - name: 汇集 Linux 安装包
         if: runner.os == 'Linux'
@@ -166,6 +184,7 @@ jobs:
           test -n "$task_deb"
           mkdir -p release-assets
           cp "$task_appimage" "release-assets/shanji-$task_version-linux-x64.AppImage"
+          cp "$task_appimage.sig" "release-assets/shanji-$task_version-linux-x64.AppImage.sig"
           cp "$task_deb" "release-assets/shanji-$task_version-linux-x64.deb"
 
       - name: 核对本平台安装包
@@ -181,8 +200,8 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
-  publish-test-release:
-    name: 创建草稿预发布
+  publish-draft-release:
+    name: 创建待确认的稳定版草稿
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-22.04
@@ -199,6 +218,19 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: 生成签名更新清单
+        shell: bash
+        run: |
+          task_version="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json', 'utf8')).version")"
+          task_notes="src/release-notes/v$task_version.md"
+          node scripts/create-update-manifest.mjs \
+            --assets release-assets \
+            --version "$task_version" \
+            --repo "$GITHUB_REPOSITORY" \
+            --notes "$task_notes" \
+            --output release-assets/latest.json
+          node -e "const m=require('./release-assets/latest.json'); if(Object.keys(m.platforms).length!==4) process.exit(1)"
+
       - name: 生成 SHA-256 校验文件
         run: |
           cd release-assets
@@ -208,18 +240,20 @@ jobs:
           test -s SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: 创建或更新草稿预发布
+      - name: 创建或更新待确认草稿
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          task_version="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json', 'utf8')).version")"
+          task_notes="src/release-notes/v$task_version.md"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
-            gh release edit "$GITHUB_REF_NAME" --draft --prerelease \
-              --title "闪记 $GITHUB_REF_NAME（跨平台测试版）" \
-              --notes-file .github/release-notes-test.md
+            gh release edit "$GITHUB_REF_NAME" --draft --prerelease=false \
+              --title "闪记 $GITHUB_REF_NAME" \
+              --notes-file "$task_notes"
           else
             gh release create "$GITHUB_REF_NAME" release-assets/* \
-              --draft --prerelease \
-              --title "闪记 $GITHUB_REF_NAME（跨平台测试版）" \
-              --notes-file .github/release-notes-test.md
+              --draft \
+              --title "闪记 $GITHUB_REF_NAME" \
+              --notes-file "$task_notes"
           fi

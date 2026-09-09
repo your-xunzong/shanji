@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "repository-picker-capability",
+  "description": "仅主窗口可通过原生选择器选择个人仓库目录",
+  "windows": ["main"],
+  "permissions": ["dialog:allow-open"]
+}

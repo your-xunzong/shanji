@@ -7,7 +7,24 @@
   import OrganizerPanel from '../components/OrganizerPanel.svelte';
   import ExportPanel from '../components/ExportPanel.svelte';
   import ReminderCenter from '../components/ReminderCenter.svelte';
+  import RepositoryPanel from '../components/RepositoryPanel.svelte';
+  import EmailRulesPanel from '../components/EmailRulesPanel.svelte';
+  import TimelineView from '../components/TimelineView.svelte';
+  import UpdatePanel from '../components/UpdatePanel.svelte';
+  import '../workbench.css';
   import { api } from '../lib/api';
+  import currentReleaseNotesRaw from '../release-notes/v0.13.1.md?raw';
+  import {
+    cancelAppUpdateDownload,
+    checkForAppUpdate,
+    clearPendingUpdate,
+    downloadAppUpdate,
+    installAppUpdate,
+    parseUserFacingNotes,
+    type AppUpdate,
+    type UpdateDownloadProgress,
+    type UpdatePhase,
+  } from '../lib/updater';
   import type {
     Item,
     ItemFilter,
@@ -25,6 +42,7 @@
     UpdateItemInput,
     ExportFilterInput,
     AppInfo,
+    UpdateState,
   } from '../lib/types';
 
   let items: Item[] = [];
@@ -56,10 +74,23 @@
   let unlistenOpenReminderCenter: (() => void) | undefined;
   let pendingReminders: Item[] = [];
   let reminderCenterOpen = false;
-  let emailRouteTagIds: string[] = [];
   let unlistenClassification: (() => void) | undefined;
   let pendingTypeCount = 0;
   let editingItemId = '';
+  let viewMode: 'items' | 'timeline' = 'items';
+  let repositoryOpen = false;
+  let emailRulesOpen = false;
+  let updateState: UpdateState | null = null;
+  let availableUpdate: AppUpdate | null = null;
+  let updatePanelOpen = false;
+  let updatePhase: UpdatePhase = 'checking';
+  let updateError = '';
+  let updateProgress: UpdateDownloadProgress = { downloadedBytes: 0, totalBytes: null, percent: null, finished: false };
+  let updateCheckTimer: ReturnType<typeof setTimeout> | undefined;
+  let unlistenOpenUpdate: (() => void) | undefined;
+  let cancellingUpdateDownload = false;
+
+  const currentReleaseNotes = parseUserFacingNotes(currentReleaseNotesRaw);
 
   const navItems: { id: ItemFilter; label: string; marker: string }[] = [
     { id: 'open', label: '待处理', marker: '○' },
@@ -73,6 +104,13 @@
   $: urgentCount = items.filter(
     (item) => item.completionPolicy === 'MUST_COMPLETE_TODAY' && item.status === 'OPEN',
   ).length;
+  $: updateSnoozed = Boolean(
+    availableUpdate
+      && updateState?.snoozedVersion === availableUpdate.version
+      && updateState.snoozedUntil
+      && new Date(updateState.snoozedUntil).getTime() > Date.now(),
+  );
+  $: showUpdateBanner = Boolean(availableUpdate && !updateSnoozed);
 
   onMount(() => {
     void initialize();
@@ -93,6 +131,14 @@
         unlistenClassification = await listen<string>('classification_opened', ({ payload }) => {
           void revealClassification(payload);
         });
+        unlistenOpenUpdate = await listen('open_update', () => {
+          if (availableUpdate) {
+            updatePhase = 'available';
+            updatePanelOpen = true;
+          } else {
+            void checkUpdates(true);
+          }
+        });
       });
     }
 
@@ -105,6 +151,9 @@
       unlistenReminderCenter?.();
       unlistenOpenReminderCenter?.();
       unlistenClassification?.();
+      unlistenOpenUpdate?.();
+      if (updateCheckTimer) clearTimeout(updateCheckTimer);
+      void clearPendingUpdate();
       if (toastTimer) clearTimeout(toastTimer);
     };
   });
@@ -124,6 +173,7 @@
         loadedCategories,
         loadedTags,
         loadedPendingReminders,
+        loadedUpdateState,
       ] = await Promise.all([
         api.getAppInfo(),
         api.getSettings(),
@@ -135,6 +185,7 @@
         api.listCategories(),
         api.listTags(),
         api.listPendingReminders(),
+        api.getUpdateState(),
       ]);
       appInfo = loadedAppInfo;
       if (loadedAutostartStatus.available) {
@@ -148,17 +199,173 @@
       categories = loadedCategories;
       tags = loadedTags;
       pendingReminders = loadedPendingReminders;
+      updateState = loadedUpdateState;
+      if (loadedUpdateState.showCurrentReleaseNotes && !loadedOnboardingStatus.required) {
+        updatePhase = 'current';
+        updatePanelOpen = true;
+      }
+      scheduleAutomaticUpdateCheck(loadedUpdateState);
       if (warning) error = warning;
     } catch (cause) {
-      error = readableError(cause, '无法打开本地数据。请检查数据目录后重试。');
+      error = readableError(cause, '事项暂时无法读取。闪记没有修改记录，请重试。');
     } finally {
       loading = false;
     }
   }
 
   function readableError(cause: unknown, fallback: string): string {
-    if (typeof cause === 'string' && cause) return cause;
-    return cause instanceof Error && cause.message ? cause.message : fallback;
+    if (fallback) return fallback;
+    const detail = typeof cause === 'string' ? cause : cause instanceof Error ? cause.message : '';
+    if (detail.includes('快捷键')) return '快捷键没有更改。请换一组组合键后重试。';
+    if (detail.includes('开机启动')) return '开机启动设置没有保存。请在后台设置中重试。';
+    return '';
+  }
+
+  function scheduleAutomaticUpdateCheck(state: UpdateState): void {
+    if (updateCheckTimer) clearTimeout(updateCheckTimer);
+    if (!state.shouldAutoCheck) return;
+    updateCheckTimer = setTimeout(() => void checkUpdates(false), 30_000);
+  }
+
+  function safeUpdateError(cause: unknown, fallback: string): string {
+    const message = cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : '';
+    if (message.includes('来源无法验证') || message.includes('签名') || message.includes('无法验证')) {
+      return '更新无法验证，当前版本和本机数据没有改变。请重新检查或打开官方发布页。';
+    }
+    if (message.includes('下载已取消')) return '下载已取消，当前版本和本机数据没有改变。';
+    return fallback;
+  }
+
+  async function checkUpdates(manual: boolean): Promise<void> {
+    if (updatePhase === 'downloading' || updatePhase === 'installing') return;
+    updateError = '';
+    if (manual) {
+      updatePhase = 'checking';
+      updatePanelOpen = true;
+      settingsOpen = false;
+    }
+    try {
+      const update = await checkForAppUpdate();
+      updateState = await api.recordUpdateCheck(update ? 'UPDATE_AVAILABLE' : 'UP_TO_DATE');
+      availableUpdate = update;
+      if (!update) {
+        await api.setTrayUpdate(null);
+        if (manual) updatePhase = 'upToDate';
+        return;
+      }
+
+      await api.setTrayUpdate(update.version);
+      const snoozed = updateState.snoozedVersion === update.version
+        && Boolean(updateState.snoozedUntil)
+        && new Date(updateState.snoozedUntil as string).getTime() > Date.now();
+      if (!snoozed && updateState.lastNotifiedVersion !== update.version) {
+        try {
+          updateState = await api.notifyUpdateAvailable(update.version);
+        } catch {
+          updateState = await api.getUpdateState();
+        }
+      }
+      if (manual) updatePhase = 'available';
+    } catch (cause) {
+      try {
+        updateState = await api.recordUpdateCheck('FAILED');
+      } catch {
+        // The visible action remains recoverable even if writing the check timestamp failed.
+      }
+      if (manual) {
+        updateError = safeUpdateError(cause, '暂时无法检查更新；事项和当前版本未受影响。');
+        updatePhase = 'failed';
+      }
+    }
+  }
+
+  async function enableAutomaticUpdates(): Promise<void> {
+    try {
+      updateState = await api.setAutoUpdateEnabled(true);
+      await checkUpdates(true);
+    } catch {
+      error = '自动检查设置没有保存。闪记仍保持离线，请稍后重试。';
+    }
+  }
+
+  async function keepUpdatesOffline(): Promise<void> {
+    try {
+      updateState = await api.dismissUpdatePermission();
+    } catch {
+      error = '暂时无法保存更新选择；闪记没有开始联网。';
+    }
+  }
+
+  async function setAutomaticUpdates(enabled: boolean): Promise<UpdateState> {
+    updateState = await api.setAutoUpdateEnabled(enabled);
+    scheduleAutomaticUpdateCheck(updateState);
+    return updateState;
+  }
+
+  async function downloadUpdate(): Promise<void> {
+    if (!availableUpdate || appInfo?.updateInstallMode !== 'AUTOMATIC') return;
+    updatePhase = 'downloading';
+    updateError = '';
+    updateProgress = { downloadedBytes: 0, totalBytes: null, percent: null, finished: false };
+    cancellingUpdateDownload = false;
+    try {
+      await downloadAppUpdate((progress) => (updateProgress = progress));
+      updatePhase = 'downloaded';
+    } catch (cause) {
+      if (cancellingUpdateDownload) {
+        updatePhase = 'cancelled';
+      } else {
+        updateError = safeUpdateError(cause, '更新包没有下载完成，当前版本和本机数据没有改变。');
+        updatePhase = 'failed';
+      }
+    }
+  }
+
+  async function cancelUpdateDownload(): Promise<void> {
+    cancellingUpdateDownload = true;
+    await cancelAppUpdateDownload();
+    updatePhase = 'cancelled';
+  }
+
+  async function installUpdate(): Promise<void> {
+    updatePhase = 'installing';
+    updateError = '';
+    try {
+      await installAppUpdate();
+    } catch (cause) {
+      updateError = safeUpdateError(cause, '更新没有安装，当前版本和本机数据仍然可用。请重试或手动下载安装包。');
+      updatePhase = 'failed';
+    }
+  }
+
+  async function snoozeAvailableUpdate(): Promise<void> {
+    if (!availableUpdate) return;
+    updateState = await api.snoozeUpdate(availableUpdate.version);
+    updatePanelOpen = false;
+  }
+
+  async function openReleasePage(): Promise<void> {
+    await api.openReleasePage(availableUpdate?.version ?? appInfo?.version ?? null);
+  }
+
+  async function closeUpdatePanel(): Promise<void> {
+    if (updatePhase === 'downloading' || updatePhase === 'installing') return;
+    if (updatePhase === 'current' && appInfo) {
+      try {
+        updateState = await api.markReleaseNotesSeen(appInfo.version);
+      } catch {
+        // Closing release notes never blocks the rest of the application.
+      }
+    }
+    updatePanelOpen = false;
+    await tick();
+    document.querySelector<HTMLElement>('.update-available-banner, .settings-entry')?.focus();
+  }
+
+  function showCurrentReleaseNotes(): void {
+    settingsOpen = false;
+    updatePhase = 'current';
+    updatePanelOpen = true;
   }
 
   async function loadItems(): Promise<void> {
@@ -205,12 +412,31 @@
   }
 
   async function selectFilter(next: ItemFilter): Promise<void> {
+    viewMode = 'items';
     filter = next;
     loading = true;
+    error = '';
     try {
       await loadItems();
     } catch (cause) {
-      error = readableError(cause, '事项列表刷新失败。');
+      error = readableError(cause, '事项列表未能刷新，记录没有被修改。请重试。');
+    } finally {
+      loading = false;
+    }
+  }
+
+  async function openTimelineItem(id: string): Promise<void> {
+    viewMode = 'items';
+    filter = 'all';
+    editingItemId = id;
+    loading = true;
+    error = '';
+    try {
+      await loadItems();
+      await tick();
+      document.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'center' });
+    } catch (cause) {
+      error = readableError(cause, '事项暂时无法打开，内容没有被修改。请重试。');
     } finally {
       loading = false;
     }
@@ -428,24 +654,31 @@
 
   async function openSettings(): Promise<void> {
     try {
-      const [latestAutostart, latestNotifications, latestDataStatus, latestSmtp, latestEmailRoutes] = await Promise.all([
+      const [latestAutostart, latestNotifications, latestDataStatus, latestSmtp] = await Promise.all([
         api.getAutostartStatus(),
         api.getNotificationStatus(),
         api.getDataStatus(),
         api.getSmtpStatus(),
-        api.listEmailRouteTagIds(),
       ]);
       autostartStatus = latestAutostart;
       notificationStatus = latestNotifications;
       dataStatus = latestDataStatus;
       smtpStatus = latestSmtp;
-      emailRouteTagIds = latestEmailRoutes;
       if (settings && latestAutostart.available) {
         settings = { ...settings, autostartEnabled: latestAutostart.enabled };
       }
       settingsOpen = true;
     } catch (cause) {
       error = readableError(cause, '无法读取系统设置状态。');
+    }
+  }
+
+  async function openEmailRules(): Promise<void> {
+    try {
+      smtpStatus = await api.getSmtpStatus();
+      emailRulesOpen = true;
+    } catch (cause) {
+      error = readableError(cause, '邮件提醒状态暂时无法读取。');
     }
   }
 
@@ -457,11 +690,6 @@
   async function refreshSmtpStatus(): Promise<SmtpStatus> {
     smtpStatus = await api.getSmtpStatus();
     return smtpStatus;
-  }
-
-  async function setEmailRoute(tagId: string, enabled: boolean): Promise<void> {
-    await api.setTagEmailRoute(tagId, enabled);
-    emailRouteTagIds = await api.listEmailRouteTagIds();
   }
 
   async function testSmtp(): Promise<string> {
@@ -505,7 +733,7 @@
       });
     } catch (cause) {
       const message = readableError(cause, '');
-      if (message.includes('快捷键') || message.includes('开机启动')) throw cause;
+      if (message.includes('快捷键') || message.includes('开机启动')) throw new Error(message);
       throw new Error('时间设置没有保存，原提醒时间仍然有效，请重试。');
     }
     autostartStatus = await api.getAutostartStatus();
@@ -526,10 +754,16 @@
     setTimeout(() => void refreshNotificationStatus(), 12_000);
   }
 
-  async function testReminderMode(mode: 'standard' | 'persistent' | 'overlay' | 'repeat' | 'center'): Promise<string> {
+  async function testReminderMode(mode: 'persistent' | 'overlay'): Promise<string> {
     const message = await api.testReminderMode(mode);
     await Promise.all([loadItems(), loadPendingReminders()]);
     return message;
+  }
+
+  function openReminderCenterFromSettings(): void {
+    settingsOpen = false;
+    reminderCenterOpen = true;
+    void loadPendingReminders();
   }
 
   async function refreshNotificationStatus(): Promise<void> {
@@ -603,7 +837,7 @@
   <title>闪记 · 事项</title>
 </svelte:head>
 
-<div class="app-shell">
+<div class="app-shell workspace">
   <aside class="sidebar">
     <div class="brand-block">
       <span class="brand-mark large" aria-hidden="true"></span>
@@ -618,8 +852,10 @@
       {#each navItems as navItem}
         <button
           class="nav-item"
-          class:active={filter === navItem.id}
-          aria-current={filter === navItem.id ? 'page' : undefined}
+          class:active={viewMode === 'items' && filter === navItem.id}
+          aria-current={viewMode === 'items' && filter === navItem.id ? 'page' : undefined}
+          aria-label={navItem.label}
+          title={navItem.label}
           on:click={() => selectFilter(navItem.id)}
         >
           <span class="nav-marker">{navItem.marker}</span>
@@ -627,19 +863,28 @@
           {#if navItem.id === 'open' && items.length > 0}<span class="nav-count">{items.length}</span>{/if}
         </button>
       {/each}
+      <button class="nav-item" class:active={viewMode === 'timeline'} aria-current={viewMode === 'timeline' ? 'page' : undefined} aria-label="事项甘特图" title="事项甘特图" on:click={() => (viewMode = 'timeline')}>
+        <span class="nav-marker">━</span><span>事项甘特图</span>
+      </button>
     </nav>
 
     <div class="sidebar-rule"></div>
-    <button class="nav-item settings-entry" on:click={() => void openSettings()}>
+    <button class="nav-item settings-entry" aria-label="后台设置" title="后台设置" on:click={() => void openSettings()}>
       <span class="nav-marker">⌘</span>
       <span>后台设置</span>
     </button>
-    <button class="nav-item settings-entry" on:click={() => (organizerOpen = true)}>
+    <button class="nav-item settings-entry" aria-label="整理方式" title="整理方式" on:click={() => (organizerOpen = true)}>
       <span class="nav-marker">◇</span><span>整理方式</span>
     </button>
-    <button class="nav-item settings-entry" on:click={() => (reminderCenterOpen = true)}>
+    <button class="nav-item settings-entry" aria-label="提醒中心" title="提醒中心" on:click={() => (reminderCenterOpen = true)}>
       <span class="nav-marker">!</span><span>提醒中心</span>
       {#if pendingReminders.length > 0}<span class="nav-count">{pendingReminders.length}</span>{/if}
+    </button>
+    <button class="nav-item settings-entry" aria-label="邮件提醒" title="邮件提醒" on:click={() => void openEmailRules()}>
+      <span class="nav-marker">↗</span><span>邮件提醒</span>
+    </button>
+    <button class="nav-item settings-entry" aria-label="个人仓库" title="个人仓库" on:click={() => (repositoryOpen = true)}>
+      <span class="nav-marker">◇</span><span>个人仓库</span>
     </button>
 
     <div class="shortcut-note">
@@ -651,6 +896,9 @@
   </aside>
 
   <main class="dashboard">
+    {#if viewMode === 'timeline'}
+      <TimelineView {categories} {tags} onOpenItem={openTimelineItem} onBackToItems={() => selectFilter('open')} />
+    {:else}
     <header class="dashboard-header">
       <div>
         <p class="eyebrow">{dateLabel}</p>
@@ -666,6 +914,26 @@
         </button>
       </div>
     </header>
+
+    {#if updateState && !updateState.permissionPrompted && !onboardingOpen}
+      <section class="update-permission-banner" aria-labelledby="update-permission-title">
+        <span class="update-banner-mark" aria-hidden="true">↗</span>
+        <span>
+          <strong id="update-permission-title">获取新版本提醒</strong>
+          <small>允许闪记每天最多连接 GitHub 一次；不会上传事项、备注或本地路径。</small>
+        </span>
+        <button class="text-button" on:click={keepUpdatesOffline}>保持离线</button>
+        <button class="secondary-button" on:click={enableAutomaticUpdates}>启用并检查</button>
+      </section>
+    {/if}
+
+    {#if showUpdateBanner && availableUpdate}
+      <button class="update-available-banner" on:click={() => { updatePhase = 'available'; updatePanelOpen = true; }}>
+        <span class="update-banner-mark" aria-hidden="true">↗</span>
+        <span><strong>新版本 v{availableUpdate.version} 可用</strong><small>{availableUpdate.notes[0]}</small></span>
+        <b>查看更新 →</b>
+      </button>
+    {/if}
 
     {#if error}
       <div class="inline-error" role="alert">
@@ -686,18 +954,18 @@
         <div class="loading-list" aria-label="正在读取事项">
           <span></span><span></span><span></span>
         </div>
-      {:else if items.length === 0}
+      {:else if items.length === 0 && !error}
         <div class="empty-state">
           <div class="empty-rail" aria-hidden="true"></div>
           <p class="eyebrow">这里暂时是空的</p>
-          <h2>{filter === 'done' ? '还没有完成记录' : '想到什么，就在原地记下'}</h2>
+          <h2>{filter === 'done' ? '还没有完成记录' : '当前列表没有事项'}</h2>
           <p>按全局快捷键打开快速输入，保存后会自动回到当前工作。</p>
           <button class="primary-button" on:click={() => api.showCapture()}>写第一条</button>
         </div>
-      {:else}
+      {:else if items.length > 0}
         <div class="stream-heading">
           <span>{items.length} 项</span>
-          <button on:click={loadItems}>刷新</button>
+          <button on:click={() => selectFilter(filter)}>刷新</button>
         </div>
         {#each items as item (item.id)}
           <ItemCard
@@ -718,6 +986,7 @@
         {/each}
       {/if}
     </section>
+    {/if}
   </main>
 
   {#if settingsOpen && settings && notificationStatus && autostartStatus && smtpStatus}
@@ -728,12 +997,15 @@
       onSave={saveSettings}
       onTestNotification={testNotification}
       onTestReminderMode={testReminderMode}
+      pendingReminderCount={pendingReminders.length}
+      onOpenReminderCenter={openReminderCenterFromSettings}
       {smtpStatus}
-      {tags}
-      {emailRouteTagIds}
-      onSetEmailRoute={setEmailRoute}
       onTestSmtp={testSmtp}
       onRefreshSmtpStatus={refreshSmtpStatus}
+      onOpenEmailRules={() => {
+        settingsOpen = false;
+        void openEmailRules();
+      }}
       {notificationStatus}
       onRegisterNotifications={registerNotifications}
       onUnregisterNotifications={unregisterNotifications}
@@ -745,6 +1017,39 @@
       onOpenDataDirectory={openDataDirectory}
       onRestoreDatabase={restoreDatabase}
       {appInfo}
+      {updateState}
+      updateChecking={updatePhase === 'checking' && updatePanelOpen}
+      onSetAutoUpdate={setAutomaticUpdates}
+      onCheckForUpdates={() => checkUpdates(true)}
+      onViewReleaseNotes={showCurrentReleaseNotes}
+    />
+  {/if}
+
+  {#if emailRulesOpen && settings && smtpStatus}
+    <EmailRulesPanel
+      {categories}
+      {tags}
+      {settings}
+      {smtpStatus}
+      onClose={() => (emailRulesOpen = false)}
+      onOpenSettings={() => {
+        emailRulesOpen = false;
+        void openSettings();
+      }}
+    />
+  {/if}
+
+  {#if repositoryOpen}
+    <RepositoryPanel
+      onClose={() => (repositoryOpen = false)}
+      onItemsChanged={async () => {
+        await Promise.all([loadItems(), refreshTaxonomies(), loadPendingReminders()]);
+        showToast('个人仓库同步完成');
+      }}
+      onShowAllItems={async () => {
+        repositoryOpen = false;
+        await selectFilter('all');
+      }}
     />
   {/if}
 
@@ -794,6 +1099,25 @@
       firstRun={onboardingStatus.required}
       onFinish={finishOnboarding}
       onSkip={skipOnboarding}
+    />
+  {/if}
+
+  {#if updatePanelOpen && appInfo}
+    <UpdatePanel
+      phase={updatePhase}
+      update={availableUpdate}
+      currentVersion={appInfo.version}
+      currentNotes={currentReleaseNotes}
+      progress={updateProgress}
+      error={updateError}
+      installMode={appInfo.updateInstallMode}
+      onClose={() => void closeUpdatePanel()}
+      onRetry={() => checkUpdates(true)}
+      onDownload={downloadUpdate}
+      onCancelDownload={cancelUpdateDownload}
+      onInstall={installUpdate}
+      onSnooze={snoozeAvailableUpdate}
+      onOpenRelease={openReleasePage}
     />
   {/if}
 

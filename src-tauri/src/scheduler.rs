@@ -9,6 +9,10 @@ use tauri::{AppHandle, Emitter};
 use crate::{
     db::{Database, EmailDeliveryJob},
     domain::{Clock, Settings},
+    email_rules::{
+        EmailDigestJob, claim_deliveries, claim_due_digests, mark_digest_failed,
+        mark_digest_submitted, smtp_verified_at,
+    },
     mail::MailService,
     notification::NotificationService,
 };
@@ -107,7 +111,14 @@ fn process_once(
                     return;
                 }
             };
-            if settings.smtp_enabled {
+            let smtp_ready = settings.smtp_enabled
+                && smtp_verified_at(database)
+                    .map(|verified_at| verified_at.is_some())
+                    .unwrap_or_else(|error| {
+                        eprintln!("邮件连接验证状态读取失败：{error}");
+                        false
+                    });
+            if smtp_ready {
                 match database.claim_due_email_retries(now) {
                     Ok(jobs) => {
                         for job in jobs {
@@ -115,6 +126,14 @@ fn process_once(
                         }
                     }
                     Err(error) => eprintln!("邮件重试领取失败：{error}"),
+                }
+                match claim_due_digests(database, now) {
+                    Ok(jobs) => {
+                        for job in jobs {
+                            deliver_digest(database, mail, &settings, job, now);
+                        }
+                    }
+                    Err(error) => eprintln!("邮件摘要领取失败：{error}"),
                 }
             }
             for notification in result.notifications {
@@ -129,14 +148,13 @@ fn process_once(
                         Err(error) => eprintln!("置顶提醒窗口暂时无法显示：{error}"),
                     }
                 }
-                if settings.smtp_enabled {
-                    match database.claim_email_delivery(
-                        &notification,
-                        settings.smtp_repeat_must_complete,
-                        now,
-                    ) {
-                        Ok(Some(job)) => deliver_email(database, mail, &settings, job, now),
-                        Ok(None) => {}
+                if smtp_ready {
+                    match claim_deliveries(database, &notification, now) {
+                        Ok(jobs) => {
+                            for job in jobs {
+                                deliver_email(database, mail, &settings, job, now);
+                            }
+                        }
                         Err(error) => eprintln!("邮件提醒领取失败：{error}"),
                     }
                 }
@@ -239,7 +257,7 @@ fn deliver_email(
     job: EmailDeliveryJob,
     now: chrono::DateTime<chrono::Utc>,
 ) {
-    match mail.send_reminder(settings, &job.notification) {
+    match mail.send_reminder(settings, &job.recipient, &job.notification) {
         Ok(()) => {
             if let Err(error) = database.mark_email_delivery_submitted(&job.delivery_id, now) {
                 eprintln!("邮件投递结果记录失败：{error}");
@@ -251,6 +269,35 @@ fn deliver_email(
                 database.mark_email_delivery_failed(&job.delivery_id, error.code, now)
             {
                 eprintln!("邮件失败结果记录失败：{database_error}");
+            }
+        }
+    }
+}
+
+fn deliver_digest(
+    database: &Database,
+    mail: &MailService,
+    settings: &Settings,
+    job: EmailDigestJob,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    match mail.send_digest(
+        settings,
+        &job.recipient,
+        &job.local_date,
+        &job.notifications,
+    ) {
+        Ok(()) => {
+            if let Err(error) = mark_digest_submitted(database, &job, now) {
+                eprintln!("邮件摘要结果记录失败：{error}");
+            }
+        }
+        Err(error) => {
+            eprintln!("邮件摘要发送失败（{}）", error.code);
+            if let Err(database_error) =
+                mark_digest_failed(database, &job.delivery_id, error.code, now)
+            {
+                eprintln!("邮件摘要失败结果记录失败：{database_error}");
             }
         }
     }

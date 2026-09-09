@@ -9,9 +9,9 @@
     DataStatus,
     DataFileSummary,
     SmtpStatus,
-    Tag,
     EventKind,
     ReminderPlan,
+    UpdateState,
   } from '../lib/types';
 
   export let settings: Settings;
@@ -19,16 +19,17 @@
   export let onClose: () => void;
   export let onSave: (input: UpdateSettingsInput) => Promise<void>;
   export let onTestNotification: () => Promise<void>;
-  export let onTestReminderMode: (mode: 'standard' | 'persistent' | 'overlay' | 'repeat' | 'center') => Promise<string>;
+  export let onTestReminderMode: (mode: 'persistent' | 'overlay') => Promise<string>;
+  export let pendingReminderCount = 0;
+  export let onOpenReminderCenter: () => void = () => {};
   export let smtpStatus: SmtpStatus = {
     passwordConfigured: false,
+    verifiedAt: null,
     lastResult: null,
     lastErrorCode: null,
     lastAttemptAt: null,
   };
-  export let tags: Tag[] = [];
-  export let emailRouteTagIds: string[] = [];
-  export let onSetEmailRoute: (tagId: string, enabled: boolean) => Promise<void> = async () => {};
+  export let onOpenEmailRules: () => void = () => {};
   export let onTestSmtp: () => Promise<string> = async () => {
     throw new Error('邮件测试暂时不可用。');
   };
@@ -48,6 +49,13 @@
   export let onOpenDataDirectory: () => Promise<void> = async () => {};
   export let onRestoreDatabase: (path: string) => Promise<void> = async () => {};
   export let appInfo: AppInfo | null = null;
+  export let updateState: UpdateState | null = null;
+  export let updateChecking = false;
+  export let onSetAutoUpdate: (enabled: boolean) => Promise<UpdateState> = async () => {
+    throw new Error('更新设置暂时不可用。');
+  };
+  export let onCheckForUpdates: () => Promise<void> = async () => {};
+  export let onViewReleaseNotes: () => void = () => {};
 
   let form: Settings = structuredClone(settings);
   let updateExistingDefaultItems = false;
@@ -62,7 +70,8 @@
   let smtpPassword = '';
   let smtpTesting = false;
   let smtpActionStatus = '';
-  let routeBusyTagId = '';
+  let updatePreferenceBusy = false;
+  let updateActionStatus = '';
 
   $: repeatTimesError = validateRepeatTimes(form.repeatDefaultTimes);
 
@@ -102,12 +111,42 @@
     return '';
   }
 
+  function updateStatusLabel(state: UpdateState): string {
+    if (!state.lastCheckedAt) return '尚未检查';
+    const checkedAt = new Date(state.lastCheckedAt);
+    const time = Number.isFinite(checkedAt.getTime())
+      ? new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(checkedAt)
+      : '时间未知';
+    const result = state.lastCheckResult === 'UP_TO_DATE'
+      ? '当前已是最新版本'
+      : state.lastCheckResult === 'UPDATE_AVAILABLE'
+        ? '发现可用更新'
+        : '上次检查未完成';
+    return `${time} · ${result}`;
+  }
+
+  async function toggleAutomaticUpdates(enabled: boolean): Promise<void> {
+    if (updatePreferenceBusy) return;
+    updatePreferenceBusy = true;
+    updateActionStatus = '';
+    try {
+      updateState = await onSetAutoUpdate(enabled);
+      updateActionStatus = enabled ? '已启用，每天最多检查一次。' : '已关闭，闪记不会自动联网检查。';
+    } catch {
+      updateActionStatus = '设置没有保存，自动检查状态保持原样。';
+    } finally {
+      updatePreferenceBusy = false;
+    }
+  }
+
   async function save(): Promise<void> {
     if (saving || repeatTimesError) return;
     saveError = '';
     try {
       await onSave({
         ...form,
+        // 旧版全局重复字段只为数据兼容保留，新版频率由事项提醒方案决定。
+        repeatUnacknowledgedEnabled: false,
         updateExistingDefaultItems,
         smtpPassword: smtpPassword || null,
       });
@@ -136,27 +175,14 @@
     }
   }
 
-  async function toggleEmailRoute(tagId: string, enabled: boolean): Promise<void> {
-    if (routeBusyTagId) return;
-    routeBusyTagId = tagId;
-    smtpActionStatus = '';
-    try {
-      await onSetEmailRoute(tagId, enabled);
-      emailRouteTagIds = enabled
-        ? [...new Set([...emailRouteTagIds, tagId])]
-        : emailRouteTagIds.filter((id) => id !== tagId);
-    } catch (cause) {
-      smtpActionStatus = cause instanceof Error && cause.message
-        ? cause.message
-        : '标签的邮件通知设置没有保存，请重试。';
-    } finally {
-      routeBusyTagId = '';
-    }
-  }
-
   function smtpDeliveryLabel(status: SmtpStatus): string {
     if (status.lastResult === 'SUBMITTED') return '最近一次邮件已被服务器接受';
-    if (status.lastResult === 'FAILED') return '最近一次邮件发送失败，后台最多重试两次';
+    if (status.lastResult === 'FAILED') {
+      if (status.lastErrorCode === 'credential_store_unavailable') return '系统安全存储暂时不可用，请稍后重试';
+      if (status.lastErrorCode === 'smtp_password_missing') return '邮件密码已缺失，请重新保存连接信息';
+      if (status.lastErrorCode === 'smtp_configuration_invalid') return '邮件地址或服务器设置需要修改';
+      return '最近一次连接失败，请检查网络和邮件服务器设置';
+    }
     if (status.lastResult === 'CLAIMED') return '最近一次邮件正在发送';
     return '尚无邮件投递记录';
   }
@@ -177,7 +203,7 @@
     }
   }
 
-  async function testReminderMode(mode: 'standard' | 'persistent' | 'overlay' | 'repeat' | 'center'): Promise<void> {
+  async function testReminderMode(mode: 'persistent' | 'overlay'): Promise<void> {
     if (reminderModeTesting) return;
     reminderModeTesting = mode;
     reminderModeStatus = '正在准备测试…';
@@ -422,26 +448,31 @@
           <p role="status">{notificationTestStatus}</p>
         {/if}
       </div>
-      <div class="reminder-mode-list">
+      <div class="section-heading reminder-display-heading">
+        <h3>提醒显示</h3>
+        <p>提醒时间与频率由事件默认方案和单条事项决定；这里仅选择提醒从哪里出现。</p>
+      </div>
+      <div class="reminder-mode-list" aria-label="提醒显示方式">
         <div class="reminder-mode-row">
-          <label class="switch-row"><span><strong>原生持续提醒</strong><small>今日必做优先使用；Windows 可显示完成和稍后提醒操作。</small></span><input class="switch" type="checkbox" bind:checked={form.persistentNotificationsEnabled} /></label>
-          <button class="text-mini" disabled={Boolean(reminderModeTesting)} on:click={() => testReminderMode('persistent')}>测试</button>
+          <span class="reminder-source">系统</span>
+          <label class="switch-row"><span><strong>持续提醒</strong><small>用于今日必做或“强制”方案；Windows 可直接完成或稍后提醒。不改变提醒频率。</small></span><input class="switch" type="checkbox" bind:checked={form.persistentNotificationsEnabled} /></label>
+          <button class="text-mini" disabled={Boolean(reminderModeTesting)} on:click={() => testReminderMode('persistent')}>发送测试</button>
         </div>
         <div class="reminder-mode-row">
-          <label class="switch-row"><span><strong>应用置顶提醒窗</strong><small>由闪记显示在屏幕角落，不主动抢走正在输入的焦点。</small></span><input class="switch" type="checkbox" bind:checked={form.overlayRemindersEnabled} /></label>
-          <button class="text-mini" disabled={Boolean(reminderModeTesting)} on:click={() => testReminderMode('overlay')}>测试</button>
-        </div>
-        <div class="reminder-mode-row reminder-mode-repeat">
-          <label class="switch-row"><span><strong>普通事项未确认时重复提醒</strong><small>今日必做始终按事项间隔持续提醒。</small></span><input class="switch" type="checkbox" bind:checked={form.repeatUnacknowledgedEnabled} /></label>
-          {#if form.repeatUnacknowledgedEnabled}<select aria-label="普通事项重复提醒间隔" bind:value={form.unacknowledgedRepeatMinutes}><option value={15}>15 分钟</option><option value={30}>30 分钟</option><option value={60}>60 分钟</option><option value={120}>2 小时</option></select>{/if}
-          <button class="text-mini" disabled={Boolean(reminderModeTesting)} on:click={() => testReminderMode('repeat')}>测试</button>
-        </div>
-        <div class="reminder-mode-row">
-          <div><strong>待确认提醒中心</strong><small>始终保留可能错过的到期事项，托盘菜单同步显示数量。</small></div>
-          <button class="text-mini" disabled={Boolean(reminderModeTesting)} on:click={() => testReminderMode('center')}>测试</button>
+          <span class="reminder-source">闪记</span>
+          <label class="switch-row"><span><strong>屏幕角落提醒窗</strong><small>每次到期时由闪记显示，不主动抢走输入焦点。不改变提醒频率。</small></span><input class="switch" type="checkbox" bind:checked={form.overlayRemindersEnabled} /></label>
+          <button class="text-mini" disabled={Boolean(reminderModeTesting)} on:click={() => testReminderMode('overlay')}>发送测试</button>
         </div>
       </div>
       {#if reminderModeStatus}<p class="reminder-mode-status" role="status">{reminderModeStatus}</p>{/if}
+      <div class="reminder-recovery-card">
+        <div>
+          <span class="reminder-recovery-eyebrow">错过提醒</span>
+          <strong>待确认提醒 <span class="reminder-count">{pendingReminderCount} 条</span></strong>
+          <small>到期后尚未完成、暂停或确认的事项会保留在这里，关闭通知不会清除。</small>
+        </div>
+        <button class="secondary-button" type="button" on:click={onOpenReminderCenter}>打开待确认提醒</button>
+      </div>
       <button class="settings-guide-button" type="button" on:click={onOpenOnboarding}>
         重新打开首次引导 <span aria-hidden="true">→</span>
       </button>
@@ -449,8 +480,8 @@
 
     <section class="settings-section smtp-section">
       <div class="section-heading">
-        <h3>邮件通知</h3>
-        <p>只向你选择的标签发送。默认关闭；事项仍会先可靠保存到本地。</p>
+        <h3>邮件发送连接</h3>
+        <p>这里只负责连接你的邮箱。哪些事项发送、何时发送，在独立的“邮件提醒”工作台中设置。</p>
       </div>
       <label class="switch-row">
         <span><strong>启用 SMTP 邮件通知</strong><small>启用后需要填写安全连接和登录信息。</small></span>
@@ -467,37 +498,13 @@
           <label class="form-field"><span>SMTP 密码</span><input type="password" bind:value={smtpPassword} placeholder={smtpStatus.passwordConfigured ? '已安全保存；留空表示不更改' : '请输入应用专用密码'} autocomplete="new-password" /></label>
         </div>
         <p class="field-help">密码只保存到操作系统凭据存储，不写入闪记数据库、日志或导出文件。</p>
-        <label class="check-row warning-check">
-          <input type="checkbox" bind:checked={form.smtpRepeatMustComplete} />
-          <span><strong>今日必做每次重复提醒都发邮件</strong><small>可能产生较多邮件；关闭时每个事项只发送首次到期邮件。</small></span>
-        </label>
-        <div class="email-route-box">
-          <strong>哪些标签发送邮件</strong>
-          <small>事项包含任一已选标签时发送；没有标签的事项不会发送。勾选后立即保存。</small>
-          {#if tags.length === 0}
-            <p>还没有标签，请先在“整理方式”中添加。</p>
-          {:else}
-            <div class="email-route-tags">
-              {#each tags as tag}
-                <label style={`--tag-color:${tag.color}`}>
-                  <input
-                    type="checkbox"
-                    checked={emailRouteTagIds.includes(tag.id)}
-                    disabled={Boolean(routeBusyTagId)}
-                    on:change={(event) => toggleEmailRoute(tag.id, event.currentTarget.checked)}
-                  />
-                  <span>{tag.name}</span>
-                </label>
-              {/each}
-            </div>
-          {/if}
-        </div>
         <div class="smtp-test-row">
-          <div><strong>{smtpStatus.passwordConfigured ? '密码已安全保存' : '尚未保存密码'}</strong><small>{smtpDeliveryLabel(smtpStatus)}</small></div>
+          <div><strong>{smtpStatus.verifiedAt ? '发送连接已验证' : smtpStatus.passwordConfigured ? '密码已保存，连接待验证' : '尚未保存密码'}</strong><small>{smtpDeliveryLabel(smtpStatus)}</small></div>
           <button class="secondary-button" disabled={smtpTesting || !settings.smtpEnabled} on:click={testSmtp}>{smtpTesting ? '正在发送…' : '发送测试邮件'}</button>
         </div>
         {#if !settings.smtpEnabled}<p class="field-help">请先保存并重新打开设置，再发送测试邮件。</p>{/if}
         {#if smtpActionStatus}<p class="reminder-mode-status" role="status">{smtpActionStatus}</p>{/if}
+        <button class="settings-guide-button" type="button" on:click={onOpenEmailRules}>打开邮件提醒规则 <span aria-hidden="true">→</span></button>
       {/if}
     </section>
 
@@ -510,7 +517,7 @@
         <div class="data-location-card">
           <strong>{dataStatus.current.itemCount} 项本地记录</strong>
           <span title={dataStatus.current.path}>{dataStatus.current.path}</span>
-          <small>最近更新：{fileDate(dataStatus.current.updatedAt)} · 数据结构 {dataStatus.current.schemaVersion}</small>
+          <small>最近记录：{fileDate(dataStatus.current.updatedAt)} · {dataStatus.current.reminderHistoryCount} 条提醒历史</small>
         </div>
         <div class="data-action-row">
           <button class="secondary-button" disabled={dataActionBusy} on:click={createBackup}>
@@ -527,7 +534,7 @@
             <p>恢复前会自动备份当前数据，不会合并两份记录。</p>
             {#each dataStatus.recoveryCandidates as candidate}
               <div>
-                <span><b>{candidate.itemCount} 项</b><small>{fileDate(candidate.updatedAt)}</small></span>
+                <span><b>{candidate.itemCount} 项</b><small>{fileDate(candidate.updatedAt)} · 已通过校验</small></span>
                 <button class="text-mini" disabled={dataActionBusy} on:click={() => restore(candidate)}>恢复这份数据</button>
               </div>
             {/each}
@@ -540,11 +547,31 @@
     </section>
 
     <section class="settings-section about-section">
-      <div class="section-heading"><h3>关于闪记</h3><p>版本信息与本地数据说明。</p></div>
+      <div class="section-heading"><h3>关于闪记</h3><p>版本、更新与本地数据说明。</p></div>
       <div class="about-card">
         <span class="brand-mark large" aria-hidden="true"></span>
         <div><strong>{appInfo?.name ?? '闪记'}</strong><small>版本 {appInfo?.version ?? '读取中'}</small><small>{appInfo?.copyright ?? '© 2026 闪记'}</small></div>
       </div>
+      {#if updateState}
+        <div class="update-preference-card">
+          <label>
+            <span><strong>自动检查更新</strong><small>启用后每天最多连接 GitHub 一次，不会自动下载或安装。</small></span>
+            <input
+              type="checkbox"
+              role="switch"
+              checked={updateState.autoCheckEnabled}
+              disabled={updatePreferenceBusy}
+              on:change={(event) => void toggleAutomaticUpdates(event.currentTarget.checked)}
+            />
+          </label>
+          <p>{updateStatusLabel(updateState)}</p>
+          {#if updateActionStatus}<p class="update-action-status" role="status">{updateActionStatus}</p>{/if}
+          <div class="data-action-row">
+            <button class="secondary-button" disabled={updateChecking} on:click={onCheckForUpdates}>{updateChecking ? '正在检查…' : '立即检查更新'}</button>
+            <button class="text-mini" on:click={onViewReleaseNotes}>查看本版更新说明</button>
+          </div>
+        </div>
+      {/if}
       <p class="field-help">闪记默认离线运行。事项正文、备注和本地草稿不会在未授权时上传。</p>
       <div class="data-action-row"><button class="text-mini" on:click={onOpenDataDirectory}>打开数据位置</button></div>
       <details class="license-details"><summary>第三方开源许可</summary><p>闪记使用第三方开源组件。各组件版权归其权利人所有，分发包中的许可文件适用。</p></details>

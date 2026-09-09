@@ -18,7 +18,18 @@ import type {
   ExportResult,
   ExportFilterInput,
   AppInfo,
+  StartupStatus,
   EventKind,
+  EmailDeliveryRule,
+  EmailDeliveryRuleInput,
+  RepositoryPreview,
+  RepositoryStatus,
+  RepositorySyncResult,
+  TimelineData,
+  TimelineEntry,
+  TimelineQuery,
+  UpdateCheckResult,
+  UpdateState,
 } from './types';
 import { localDateKey } from './presentation';
 
@@ -30,7 +41,60 @@ const CATEGORIES_KEY = 'shanji.preview.categories';
 const TAGS_KEY = 'shanji.preview.tags';
 const REMINDER_ACKS_KEY = 'shanji.preview.reminder-acks';
 const EMAIL_ROUTES_KEY = 'shanji.preview.email-routes';
+const EMAIL_RULES_KEY = 'shanji.preview.email-rules';
+const SMTP_VERIFIED_KEY = 'shanji.preview.smtp-verified-at';
+const REPOSITORY_KEY = 'shanji.preview.repository-path';
+const REPOSITORY_SYNC_KEY = 'shanji.preview.repository-sync-at';
+const UPDATE_STATE_KEY = 'shanji.preview.update-state';
 const MANAGED_STATE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800];
+
+interface PreviewUpdateState {
+  autoCheckEnabled: boolean;
+  permissionPrompted: boolean;
+  lastCheckedAt: string | null;
+  lastCheckResult: UpdateCheckResult | null;
+  snoozedVersion: string | null;
+  snoozedUntil: string | null;
+  lastNotifiedVersion: string | null;
+  releaseNotesSeenVersion: string | null;
+}
+
+function readPreviewUpdateState(): UpdateState {
+  const defaults: PreviewUpdateState = {
+    autoCheckEnabled: false,
+    permissionPrompted: false,
+    lastCheckedAt: null,
+    lastCheckResult: null,
+    snoozedVersion: null,
+    snoozedUntil: null,
+    lastNotifiedVersion: null,
+    releaseNotesSeenVersion: '0.13.1',
+  };
+  const saved = localStorage.getItem(UPDATE_STATE_KEY);
+  const state = saved ? { ...defaults, ...JSON.parse(saved) } : defaults;
+  const lastChecked = state.lastCheckedAt ? new Date(state.lastCheckedAt).getTime() : Number.NaN;
+  const shouldAutoCheck = state.autoCheckEnabled
+    && (!Number.isFinite(lastChecked) || Date.now() >= lastChecked + 24 * 60 * 60 * 1000);
+  return {
+    ...state,
+    shouldAutoCheck,
+    showCurrentReleaseNotes: state.releaseNotesSeenVersion !== '0.13.1',
+  };
+}
+
+function writePreviewUpdateState(state: UpdateState): UpdateState {
+  localStorage.setItem(UPDATE_STATE_KEY, JSON.stringify({
+    autoCheckEnabled: state.autoCheckEnabled,
+    permissionPrompted: state.permissionPrompted,
+    lastCheckedAt: state.lastCheckedAt,
+    lastCheckResult: state.lastCheckResult,
+    snoozedVersion: state.snoozedVersion,
+    snoozedUntil: state.snoozedUntil,
+    lastNotifiedVersion: state.lastNotifiedVersion,
+    releaseNotesSeenVersion: state.releaseNotesSeenVersion,
+  }));
+  return readPreviewUpdateState();
+}
 
 const defaultSettings: Settings = {
   defaultDueTime: '18:00',
@@ -237,6 +301,155 @@ function readPreviewItems(): Item[] {
   return seed;
 }
 
+function dateKey(value: Date): string {
+  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+}
+
+function addDays(value: Date, days: number): Date {
+  const result = new Date(value);
+  result.setDate(result.getDate() + days);
+  return result;
+}
+
+function previewRange(query: TimelineQuery): [Date, Date] {
+  const anchor = new Date(`${query.anchorDate}T12:00:00`);
+  if (query.scale === 'DAY') return [anchor, anchor];
+  if (query.scale === 'WEEK') {
+    const mondayOffset = (anchor.getDay() + 6) % 7;
+    return [addDays(anchor, -mondayOffset), addDays(anchor, 6 - mondayOffset)];
+  }
+  if (query.scale === 'MONTH') {
+    return [
+      new Date(anchor.getFullYear(), anchor.getMonth(), 1, 12),
+      new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0, 12),
+    ];
+  }
+  return [new Date(anchor.getFullYear(), 0, 1, 12), new Date(anchor.getFullYear(), 11, 31, 12)];
+}
+
+// Browser-only preview. Desktop always uses Rust's read-only timeline projection.
+function previewTimeline(query: TimelineQuery): TimelineData {
+  const [rangeStart, rangeEnd] = previewRange(query);
+  rangeStart.setHours(0, 0, 0, 0);
+  rangeEnd.setHours(0, 0, 0, 0);
+  const endExclusive = addDays(rangeEnd, 1);
+  const now = new Date();
+  const total = endExclusive.getTime() - rangeStart.getTime();
+  const point = (date: Date) => (date.getTime() - rangeStart.getTime()) / total * 100;
+  const label = (date: Date) => `${dateKey(date).replaceAll('-', '/')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+  const span = (start: Date, end: Date) => ({
+    left: Math.max(0, point(start)), width: Math.max(0, Math.min(100, point(end)) - Math.max(0, point(start))),
+    clippedStart: start < rangeStart, clippedEnd: end > endExclusive, startLabel: label(start), endLabel: label(end),
+  });
+  const ticks: TimelineData['ticks'] = [];
+  for (let date = new Date(rangeStart); date < endExclusive;) {
+    ticks.push({ label: query.scale === 'DAY' ? `${String(date.getHours()).padStart(2, '0')}:00` : query.scale === 'YEAR' ? `${date.getMonth() + 1}月` : String(date.getDate()).padStart(2, '0'), position: point(date), weekend: [0, 6].includes(date.getDay()) });
+    if (query.scale === 'DAY') date = new Date(date.getTime() + 3_600_000);
+    else if (query.scale === 'YEAR') date.setMonth(date.getMonth() + 1);
+    else date.setDate(date.getDate() + 1);
+  }
+  const entries: TimelineEntry[] = [];
+  const unscheduled: TimelineData['unscheduled'] = [];
+  for (const item of readPreviewItems()) {
+    if (item.status === 'DELETED' || (!query.includeDone && item.status === 'DONE')) continue;
+    if (query.eventKinds.length && (!item.eventKind || !query.eventKinds.includes(item.eventKind))) continue;
+    if (query.categoryId && item.categoryId !== query.categoryId) continue;
+    if (query.tagIds.length && !query.tagIds.every((id) => item.tags.some((tag) => tag.id === id))) continue;
+    const created = new Date(item.createdAt);
+    const endValue = item.eventKind === 'CONTINUOUS' ? item.endAt : item.eventKind === 'WARNING' ? item.targetAt : item.dueAt;
+    const plannedEnd = endValue ? new Date(endValue) : item.completedAt ? new Date(item.completedAt) : now;
+    const completed = item.completedAt ? new Date(item.completedAt) : null;
+    if (!Number.isFinite(created.getTime()) || !Number.isFinite(plannedEnd.getTime()) || plannedEnd < created || (completed && (!Number.isFinite(completed.getTime()) || completed < created))) {
+      unscheduled.push({ itemId: item.id, title: item.title, status: item.status, eventKind: item.eventKind, reason: '时间信息无法识别，请打开核对' });
+      continue;
+    }
+    const periodic = item.eventKind === 'MONTHLY' || item.eventKind === 'YEARLY';
+    function append(start: Date, finish: Date, deadline: Date | null, occurrenceLabel: string | null, futurePreview = false, allowOverdue = !periodic) {
+      if (finish < rangeStart || start >= endExclusive) return;
+      let highlight: TimelineEntry['highlight'] = null;
+      let businessStart: Date | null = null;
+      if (item.eventKind === 'CONTINUOUS' && item.startAt) {
+        businessStart = new Date(Math.max(created.getTime(), new Date(item.startAt).getTime()));
+        highlight = span(businessStart, finish);
+      } else if (item.eventKind === 'WARNING' && item.leadValue && item.leadUnit) {
+        const warningStart = new Date(finish);
+        if (item.leadUnit === 'MONTH') {
+          const day = warningStart.getDate();
+          warningStart.setDate(1); warningStart.setMonth(warningStart.getMonth() - item.leadValue);
+          warningStart.setDate(Math.min(day, new Date(warningStart.getFullYear(), warningStart.getMonth() + 1, 0).getDate()));
+        } else warningStart.setDate(warningStart.getDate() - item.leadValue * (item.leadUnit === 'WEEK' ? 7 : 1));
+        businessStart = new Date(Math.max(created.getTime(), warningStart.getTime()));
+        highlight = span(businessStart, finish);
+      }
+      const stateSegments: TimelineEntry['stateSegments'] = [];
+      const addState = (kind: TimelineEntry['stateSegments'][number]['kind'], text: string, from: Date, to: Date) => {
+        if (to <= from) return;
+        const position = span(from, to);
+        stateSegments.push({ kind, label: `${text}：${position.startLabel} 至 ${position.endLabel}`, position });
+      };
+      if (futurePreview) {
+        addState('FUTURE', '未来计划', start, finish);
+      } else if (item.status === 'DONE' && !completed) {
+        addState('COMPLETED', '已完成（完成时间未记录）', start, finish);
+      } else {
+        const activeStart = new Date(Math.min(finish.getTime(), Math.max(start.getTime(), businessStart?.getTime() ?? start.getTime())));
+        const completion = item.status === 'DONE' ? completed : null;
+        const recordedEnd = new Date(Math.min(activeStart.getTime(), completion?.getTime() ?? activeStart.getTime()));
+        addState('RECORDED', '已记录', start, recordedEnd);
+        const activeCeiling = new Date(Math.min(finish.getTime(), deadline?.getTime() ?? finish.getTime()));
+        const activeEnd = new Date(Math.min(activeCeiling.getTime(), completion?.getTime() ?? activeCeiling.getTime()));
+        addState('ACTIVE', '进行中', new Date(Math.min(activeStart.getTime(), activeEnd.getTime())), activeEnd);
+        if (allowOverdue && deadline) {
+          const overdueEnd = item.status === 'DONE' ? new Date(Math.min(finish.getTime(), completion?.getTime() ?? deadline.getTime())) : finish;
+          addState('OVERDUE', '已逾期', new Date(Math.max(start.getTime(), deadline.getTime())), overdueEnd);
+        }
+        if (completion && completion < finish) addState('COMPLETED', '已完成', new Date(Math.max(start.getTime(), completion.getTime())), finish);
+      }
+      const marker = (value: Date | null, text: string) => value && point(value) >= 0 && point(value) <= 100
+        ? { position: point(value), label: `${text}：${label(value)}` }
+        : null;
+      entries.push({
+        id: `${item.id}:${start.toISOString()}`, itemId: item.id, title: item.title, status: item.status,
+        eventKind: item.eventKind, categoryName: item.categoryName, tagNames: item.tags.map((tag) => tag.name),
+        shape: periodic ? 'OCCURRENCE' : item.eventKind === 'WARNING' ? 'WARNING' : 'RANGE',
+        startDate: dateKey(start), endDate: dateKey(finish), targetDate: deadline ? dateKey(deadline) : null,
+        important: item.important, occurrenceLabel, position: span(start, finish), highlight,
+        stateSegments, deadlineMarker: marker(deadline, '截止'), completionMarker: marker(completed, '完成'),
+        overdue: stateSegments.some((segment) => segment.kind === 'OVERDUE'), openEnded: !deadline && item.status === 'OPEN', historyIncomplete: periodic,
+      });
+    }
+    const displayEnd = periodic
+      ? plannedEnd
+      : item.status === 'DONE'
+        ? new Date(Math.max(plannedEnd.getTime(), completed?.getTime() ?? plannedEnd.getTime()))
+        : endValue && plannedEnd < now ? now : plannedEnd;
+    append(created, displayEnd, endValue ? plannedEnd : null, periodic ? '当前已知周期' : null, false, !periodic);
+    if (periodic && endValue && item.status === 'OPEN') {
+      const step = item.eventKind === 'YEARLY' ? 12 : 1;
+      let previous = plannedEnd;
+      // Preview has no persisted anchor; never presents invented past occurrences.
+      const months = (rangeStart.getFullYear() - plannedEnd.getFullYear()) * 12 + rangeStart.getMonth() - plannedEnd.getMonth();
+      const first = Math.max(1, Math.floor(months / step));
+      const occurrence = (index: number) => {
+        const next = new Date(plannedEnd); next.setDate(1); next.setMonth(plannedEnd.getMonth() + index * step);
+        next.setDate(Math.min(plannedEnd.getDate(), new Date(next.getFullYear(), next.getMonth() + 1, 0).getDate()));
+        return next;
+      };
+      if (first > 1) previous = occurrence(first - 1);
+      for (let i = first; i < first + 15 && previous < endExclusive; i++) {
+        const next = occurrence(i); append(previous, next, next, `${next.getMonth() + 1}月计划`, previous >= now, false); previous = next;
+      }
+    }
+  }
+  return {
+    scale: query.scale, rangeStart: dateKey(rangeStart), rangeEnd: dateKey(rangeEnd), today: dateKey(now),
+    ticks, todayPosition: now >= rangeStart && now < endExclusive ? point(now) : null,
+    entries: entries.slice(0, 2000), unscheduled: unscheduled.slice(0, 200),
+    totalVisibleCount: entries.length, totalUnscheduledCount: unscheduled.length,
+    truncated: entries.length > 2000 || unscheduled.length > 200, skippedInvalidCount: unscheduled.length,
+  };
+}
+
 function writePreviewItems(items: Item[]): void {
   localStorage.setItem(ITEMS_KEY, JSON.stringify(items));
 }
@@ -288,7 +501,82 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
 export const api = {
   async getAppInfo(): Promise<AppInfo> {
     if (isTauri()) return call<AppInfo>('get_app_info');
-    return { name: '闪记', version: '0.7.0', copyright: '© 2026 闪记' };
+    return {
+      name: '闪记',
+      version: '0.13.1',
+      copyright: '© 2026 闪记',
+      portable: false,
+      updateInstallMode: 'AUTOMATIC',
+    };
+  },
+
+  async getUpdateState(): Promise<UpdateState> {
+    if (isTauri()) return call<UpdateState>('get_update_state');
+    return readPreviewUpdateState();
+  },
+
+  async setAutoUpdateEnabled(enabled: boolean): Promise<UpdateState> {
+    if (isTauri()) return call<UpdateState>('set_auto_update_enabled', { enabled });
+    return writePreviewUpdateState({
+      ...readPreviewUpdateState(),
+      autoCheckEnabled: enabled,
+      permissionPrompted: true,
+    });
+  },
+
+  async dismissUpdatePermission(): Promise<UpdateState> {
+    if (isTauri()) return call<UpdateState>('dismiss_update_permission');
+    return writePreviewUpdateState({ ...readPreviewUpdateState(), permissionPrompted: true });
+  },
+
+  async recordUpdateCheck(result: UpdateCheckResult): Promise<UpdateState> {
+    if (isTauri()) return call<UpdateState>('record_update_check', { result });
+    return writePreviewUpdateState({
+      ...readPreviewUpdateState(),
+      lastCheckedAt: new Date().toISOString(),
+      lastCheckResult: result,
+    });
+  },
+
+  async snoozeUpdate(version: string): Promise<UpdateState> {
+    if (isTauri()) return call<UpdateState>('snooze_update', { version });
+    return writePreviewUpdateState({
+      ...readPreviewUpdateState(),
+      snoozedVersion: version,
+      snoozedUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    });
+  },
+
+  async markUpdateNotified(version: string): Promise<UpdateState> {
+    if (isTauri()) return call<UpdateState>('mark_update_notified', { version });
+    return writePreviewUpdateState({ ...readPreviewUpdateState(), lastNotifiedVersion: version });
+  },
+
+  async markReleaseNotesSeen(version: string): Promise<UpdateState> {
+    if (isTauri()) return call<UpdateState>('mark_release_notes_seen', { version });
+    return writePreviewUpdateState({
+      ...readPreviewUpdateState(),
+      releaseNotesSeenVersion: version,
+      showCurrentReleaseNotes: false,
+    });
+  },
+
+  async notifyUpdateAvailable(version: string): Promise<UpdateState> {
+    if (isTauri()) return call<UpdateState>('notify_update_available', { version });
+    return writePreviewUpdateState({ ...readPreviewUpdateState(), lastNotifiedVersion: version });
+  },
+
+  async openReleasePage(version: string | null = null): Promise<void> {
+    if (isTauri()) {
+      await call<void>('open_release_page', { version });
+      return;
+    }
+    const suffix = version ? `/tag/v${encodeURIComponent(version)}` : '';
+    window.open(`https://github.com/your-xunzong/shanji/releases${suffix}`, '_blank', 'noopener,noreferrer');
+  },
+
+  async setTrayUpdate(version: string | null): Promise<void> {
+    if (isTauri()) await call<void>('set_tray_update', { version });
   },
 
   async listItems(filter: ItemFilter = 'open'): Promise<Item[]> {
@@ -445,6 +733,7 @@ export const api = {
 
   async updateSettings(input: UpdateSettingsInput): Promise<Settings> {
     if (isTauri()) return call<Settings>('update_settings', { input });
+    const previous = readPreviewSettings();
     const { updateExistingDefaultItems: _, smtpPassword: __, ...settings } = input;
     const repeatTimes = [...settings.repeatDefaultTimes].sort();
     if (repeatTimes.length !== 2 || repeatTimes[0] === repeatTimes[1]
@@ -453,6 +742,14 @@ export const api = {
     }
     settings.repeatDefaultTimes = repeatTimes;
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    if (previous.smtpHost !== settings.smtpHost
+      || previous.smtpPort !== settings.smtpPort
+      || previous.smtpSecurity !== settings.smtpSecurity
+      || previous.smtpFrom !== settings.smtpFrom
+      || previous.smtpUsername !== settings.smtpUsername
+      || input.smtpPassword) {
+      localStorage.removeItem(SMTP_VERIFIED_KEY);
+    }
     return settings;
   },
 
@@ -656,6 +953,36 @@ export const api = {
     localStorage.setItem(EMAIL_ROUTES_KEY, JSON.stringify([...values]));
   },
 
+  async listEmailDeliveryRules(): Promise<EmailDeliveryRule[]> {
+    if (isTauri()) return call<EmailDeliveryRule[]>('list_email_delivery_rules');
+    return JSON.parse(localStorage.getItem(EMAIL_RULES_KEY) ?? '[]');
+  },
+
+  async saveEmailDeliveryRule(input: EmailDeliveryRuleInput): Promise<EmailDeliveryRule> {
+    if (isTauri()) return call<EmailDeliveryRule>('save_email_delivery_rule', { input });
+    if (input.enabled && !localStorage.getItem(SMTP_VERIFIED_KEY)) {
+      throw new Error('请先在后台设置中发送测试邮件，确认连接可用后再启用规则。');
+    }
+    const rules = JSON.parse(localStorage.getItem(EMAIL_RULES_KEY) ?? '[]') as EmailDeliveryRule[];
+    const now = new Date().toISOString();
+    const existing = input.id ? rules.find((rule) => rule.id === input.id) : undefined;
+    const rule: EmailDeliveryRule = {
+      ...input,
+      id: input.id ?? crypto.randomUUID(),
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    const next = existing ? rules.map((value) => value.id === rule.id ? rule : value) : [...rules, rule];
+    localStorage.setItem(EMAIL_RULES_KEY, JSON.stringify(next));
+    return rule;
+  },
+
+  async deleteEmailDeliveryRule(id: string): Promise<void> {
+    if (isTauri()) return call<void>('delete_email_delivery_rule', { id });
+    const rules = JSON.parse(localStorage.getItem(EMAIL_RULES_KEY) ?? '[]') as EmailDeliveryRule[];
+    localStorage.setItem(EMAIL_RULES_KEY, JSON.stringify(rules.filter((rule) => rule.id !== id)));
+  },
+
   async exportExcel(path: string, filter: ExportFilterInput): Promise<ExportResult> {
     if (isTauri()) return call<ExportResult>('export_excel', { path, filter });
     const items = readPreviewItems().filter((item) => {
@@ -745,6 +1072,7 @@ export const api = {
     if (isTauri()) return call<SmtpStatus>('get_smtp_status');
     return {
       passwordConfigured: false,
+      verifiedAt: localStorage.getItem(SMTP_VERIFIED_KEY),
       lastResult: null,
       lastErrorCode: null,
       lastAttemptAt: null,
@@ -755,6 +1083,7 @@ export const api = {
     if (isTauri()) return call<string>('test_smtp');
     const settings = readPreviewSettings();
     if (!settings.smtpEnabled) throw new Error('请先启用邮件通知并保存设置。');
+    localStorage.setItem(SMTP_VERIFIED_KEY, new Date().toISOString());
     return `浏览器预览不会连接邮件服务器；桌面版将发送到 ${settings.smtpTo}。`;
   },
 
@@ -814,7 +1143,7 @@ export const api = {
     return item;
   },
 
-  async testReminderMode(mode: 'standard' | 'persistent' | 'overlay' | 'repeat' | 'center'): Promise<string> {
+  async testReminderMode(mode: 'persistent' | 'overlay'): Promise<string> {
     if (isTauri()) return call<string>('test_reminder_mode', { mode });
     if (mode === 'overlay') return '置顶提醒窗测试需要在桌面版中查看。';
     return `${mode} 测试已准备。`;
@@ -827,7 +1156,11 @@ export const api = {
       current: {
         path: '浏览器预览数据',
         itemCount: items.length,
-        schemaVersion: 7,
+        reminderHistoryCount: 0,
+        hasSettings: true,
+        hasDraft: false,
+        hasCustomSettings: false,
+        schemaVersion: 10,
         updatedAt: new Date().toISOString(),
       },
       latestBackup: null,
@@ -840,7 +1173,11 @@ export const api = {
     return {
       path: '浏览器预览不创建文件备份',
       itemCount: readPreviewItems().length,
-      schemaVersion: 7,
+      reminderHistoryCount: 0,
+      hasSettings: true,
+      hasDraft: false,
+      hasCustomSettings: false,
+      schemaVersion: 10,
       updatedAt: new Date().toISOString(),
     };
   },
@@ -849,8 +1186,152 @@ export const api = {
     if (isTauri()) await call<void>('open_data_directory');
   },
 
+  async getRepositoryStatus(): Promise<RepositoryStatus> {
+    if (isTauri()) return call<RepositoryStatus>('get_repository_status');
+    const path = localStorage.getItem(REPOSITORY_KEY);
+    return {
+      configured: Boolean(path),
+      path,
+      available: Boolean(path),
+      localItemCount: readPreviewItems().length,
+      packageCount: path ? 2 : 0,
+      pendingSourceCount: path ? 1 : 0,
+      conflictCount: 0,
+      lastSyncedAt: localStorage.getItem(REPOSITORY_SYNC_KEY),
+      lastPackageAt: path ? localStorage.getItem(REPOSITORY_SYNC_KEY) ?? new Date().toISOString() : null,
+      snapshotReady: Boolean(path),
+      lastErrorCode: null,
+      message: path ? '个人仓库可用，可以预览并汇入其他设备的记录。' : '尚未选择个人仓库位置。',
+    };
+  },
+
+  async configureDataRepository(path: string): Promise<RepositoryStatus> {
+    if (isTauri()) return call<RepositoryStatus>('configure_data_repository', { path });
+    localStorage.setItem(REPOSITORY_KEY, `${path.replace(/[\\/]$/, '')}\\shanji-repository`);
+    return this.getRepositoryStatus();
+  },
+
+  async disableDataRepository(): Promise<RepositoryStatus> {
+    if (isTauri()) return call<RepositoryStatus>('disable_data_repository');
+    localStorage.removeItem(REPOSITORY_KEY);
+    return this.getRepositoryStatus();
+  },
+
+  async previewRepositoryMerge(): Promise<RepositoryPreview> {
+    if (isTauri()) return call<RepositoryPreview>('preview_repository_merge');
+    if (!localStorage.getItem(REPOSITORY_KEY)) throw new Error('请先选择个人仓库位置。');
+    return {
+      sources: [{
+        sourceInstanceId: '另一台设备',
+        exportedAt: new Date(Date.now() - 3_600_000).toISOString(),
+        itemCount: 6,
+        newItems: 2,
+        unchangedItems: 3,
+        conflicts: 1,
+        tombstones: 0,
+      }],
+      newItems: 2,
+      unchangedItems: 3,
+      conflicts: 1,
+      tombstones: 0,
+      settingsNeedReview: false,
+    };
+  },
+
+  async publishDataRepositorySnapshot(): Promise<RepositoryStatus> {
+    if (isTauri()) return call<RepositoryStatus>('publish_data_repository_snapshot');
+    if (!localStorage.getItem(REPOSITORY_KEY)) throw new Error('请先选择个人仓库位置。');
+    localStorage.setItem(REPOSITORY_SYNC_KEY, new Date().toISOString());
+    return this.getRepositoryStatus();
+  },
+
+  async syncDataRepository(): Promise<RepositorySyncResult> {
+    if (isTauri()) return call<RepositorySyncResult>('sync_data_repository');
+    if (!localStorage.getItem(REPOSITORY_KEY)) throw new Error('请先选择个人仓库位置。');
+    const syncedAt = new Date().toISOString();
+    localStorage.setItem(REPOSITORY_SYNC_KEY, syncedAt);
+    return {
+      importedItems: 2,
+      unchangedItems: 3,
+      conflicts: 1,
+      tombstonesApplied: 0,
+      packagePath: `${localStorage.getItem(REPOSITORY_KEY)}\\preview.sjpack`,
+      packageWritten: true,
+      syncedAt,
+    };
+  },
+
+  async openRepositoryDirectory(): Promise<void> {
+    if (isTauri()) await call<void>('open_repository_directory');
+  },
+
+  async getTimeline(query: TimelineQuery): Promise<TimelineData> {
+    if (isTauri()) return call<TimelineData>('get_timeline', { query });
+    return previewTimeline(query);
+  },
+
+  async saveTimelineView(scale: TimelineQuery['scale'], includeDone: boolean): Promise<void> {
+    if (isTauri()) await call<void>('save_timeline_view', { scale, includeDone });
+  },
+
   async restoreDatabase(candidatePath: string): Promise<void> {
     if (isTauri()) return call<void>('restore_database', { candidatePath });
     throw new Error('浏览器预览不能恢复桌面数据。');
+  },
+
+  async getStartupStatus(): Promise<StartupStatus> {
+    if (isTauri()) return call<StartupStatus>('get_startup_status');
+    const recoveryPreview = new URLSearchParams(window.location.search).get('previewRecovery');
+    if (recoveryPreview === 'found') {
+      return {
+        mode: 'recovery_required',
+        targetPath: 'C:\\Users\\Lin\\AppData\\Roaming\\com.shanji.desktop\\shanji.db',
+        message: '当前数据位置没有记录，但找到了以前保存的内容。恢复前不会写入空数据。',
+        current: null,
+        recoveryCandidates: [{
+          path: 'D:\\闪记旧版\\data\\shanji.db',
+          itemCount: 128,
+          reminderHistoryCount: 346,
+          hasSettings: true,
+          hasDraft: true,
+          hasCustomSettings: true,
+          schemaVersion: 10,
+          updatedAt: '2026-09-01T10:20:00Z',
+        }],
+        diagnostic: 'startup_state=legacy_data_found; target_exists=false; target_bytes=0; current_schema=unknown; candidates=1; app_schema=10',
+      };
+    }
+    if (recoveryPreview === 'blocked') {
+      return {
+        mode: 'blocked',
+        targetPath: 'C:\\Users\\Lin\\AppData\\Roaming\\com.shanji.desktop\\shanji.db',
+        message: '原数据仍在，但可用空间不足，无法安全完成备份或升级。释放空间后可以重试。',
+        current: null,
+        recoveryCandidates: [],
+        diagnostic: 'startup_state=disk_full; target_exists=true; target_bytes=8421376; current_schema=10; candidates=0; app_schema=10',
+      };
+    }
+    return {
+      mode: 'ready',
+      targetPath: '浏览器预览数据',
+      message: '',
+      current: null,
+      recoveryCandidates: [],
+      diagnostic: 'startup_state=ready; preview=true',
+    };
+  },
+
+  async restoreStartupDatabase(candidatePath: string): Promise<void> {
+    if (isTauri()) return call<void>('restore_startup_database', { candidatePath });
+    throw new Error('浏览器预览不能恢复桌面数据。');
+  },
+
+  async openStartupDataDirectory(path: string): Promise<void> {
+    if (isTauri()) await call<void>('open_startup_data_directory', { path });
+  },
+
+  async retryStartup(): Promise<void> {
+    if (isTauri()) return call<void>('retry_startup');
+    window.location.reload();
   },
 };
