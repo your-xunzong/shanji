@@ -74,7 +74,7 @@ jobs:
             apple_signing_identity: ""
           - name: macOS Universal
             os: macos-latest
-            args: --target universal-apple-darwin --bundles dmg
+            args: --target universal-apple-darwin --bundles app,dmg
             artifact: shanji-macos-universal
             apple_signing_identity: "-"
           - name: Linux x64
