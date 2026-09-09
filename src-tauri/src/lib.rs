@@ -564,8 +564,6 @@ pub(crate) fn show_main_window(app: &AppHandle) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::resolve_database_path_from;
 
     #[test]
@@ -579,21 +577,25 @@ mod tests {
 
     #[test]
     fn installed_database_path_does_not_follow_the_executable() {
-        let first_executable = Path::new(r"C:\Program Files\Shanji\shanji.exe");
-        let moved_executable = Path::new(r"D:\Apps\Shanji\shanji.exe");
-        let app_data = Path::new(r"C:\Users\tester\AppData\Roaming\com.shanji.desktop");
+        let sandbox = tempfile::tempdir().expect("create test directory");
+        let first_executable = sandbox.path().join("installed/Shanji/shanji.exe");
+        let moved_executable = sandbox.path().join("moved/Shanji/shanji.exe");
+        let app_data = sandbox.path().join("app-data/com.shanji.desktop");
 
         assert_eq!(
-            resolve_database_path_from(first_executable, false, app_data),
+            resolve_database_path_from(&first_executable, false, &app_data),
             app_data.join("shanji.db")
         );
         assert_eq!(
-            resolve_database_path_from(moved_executable, false, app_data),
+            resolve_database_path_from(&moved_executable, false, &app_data),
             app_data.join("shanji.db")
         );
         assert_eq!(
-            resolve_database_path_from(moved_executable, true, app_data),
-            Path::new(r"D:\Apps\Shanji\data\shanji.db")
+            resolve_database_path_from(&moved_executable, true, &app_data),
+            moved_executable
+                .parent()
+                .expect("executable has parent directory")
+                .join("data/shanji.db")
         );
     }
 }
