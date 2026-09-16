@@ -13,7 +13,7 @@
   import UpdatePanel from '../components/UpdatePanel.svelte';
   import '../workbench.css';
   import { api } from '../lib/api';
-  import currentReleaseNotesRaw from '../release-notes/v0.13.2.md?raw';
+  import currentReleaseNotesRaw from '../release-notes/v0.13.3.md?raw';
   import {
     cancelAppUpdateDownload,
     checkForAppUpdate,

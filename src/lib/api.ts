@@ -74,7 +74,7 @@ function readPreviewUpdateState(): UpdateState {
     snoozedVersion: null,
     snoozedUntil: null,
     lastNotifiedVersion: null,
-    releaseNotesSeenVersion: '0.13.2',
+    releaseNotesSeenVersion: '0.13.3',
   };
   const saved = localStorage.getItem(UPDATE_STATE_KEY);
   const state = saved ? { ...defaults, ...JSON.parse(saved) } : defaults;
@@ -84,7 +84,7 @@ function readPreviewUpdateState(): UpdateState {
   return {
     ...state,
     shouldAutoCheck,
-    showCurrentReleaseNotes: state.releaseNotesSeenVersion !== '0.13.2',
+    showCurrentReleaseNotes: state.releaseNotesSeenVersion !== '0.13.3',
   };
 }
 
@@ -514,7 +514,7 @@ export const api = {
     if (isTauri()) return call<AppInfo>('get_app_info');
     return {
       name: '闪记',
-      version: '0.13.2',
+      version: '0.13.3',
       copyright: '© 2026 闪记',
       portable: false,
       updateInstallMode: 'AUTOMATIC',

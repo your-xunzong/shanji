@@ -1,4 +1,4 @@
-# 0.13.2 提醒、恢复、小结与仓库去重验收
+# 0.13.3 提醒、恢复、小结与仓库去重验收
 
 > 本清单用于安装包和真实数据副本验收。开始前先备份数据；Word 与仓库步骤使用测试副本，不直接处理唯一文件。
 
@@ -45,4 +45,4 @@
 - 从 schema 11 的数据副本升级，确认自动备份、schema 12、旧事项“旧数据保留”和失败恢复。
 - 运行 `pnpm check`、`pnpm test`、`pnpm build`、`pnpm version:check`、`pnpm installer:check`，以及 Rust 格式、Clippy 和测试。
 - Windows 安装版、Windows 便携版、macOS、Linux 至少各完成一次启动、保存、恢复、提醒与小结生成。
-- 只有安装包、签名、SHA-256、远端标签与 GitHub Release 只读校验全部通过后，才把 `Unreleased` 内容归档为正式 v0.13.2 发布记录。
+- 只有安装包、签名、SHA-256、远端标签与 GitHub Release 只读校验全部通过后，才把 `Unreleased` 内容归档为正式 v0.13.3 发布记录。

@@ -33,7 +33,10 @@ for (const [, key, value] of entries) {
 }
 
 if (process.argv.includes("--generated")) {
-  const script = readFileSync("src-tauri/target/release/nsis/x64/installer.nsi", "utf8");
+  const targetRoot = process.env.CARGO_TARGET_DIR
+    ? resolve(process.env.CARGO_TARGET_DIR)
+    : resolve("src-tauri", "target");
+  const script = readFileSync(resolve(targetRoot, "release", "nsis", "x64", "installer.nsi"), "utf8");
   const languages = [...script.matchAll(/^\s*!insertmacro MUI_LANGUAGE "([^"]+)"/gm)].map((entry) => entry[1]);
   assert.deepEqual(languages, ["SimpChinese"], "生成的安装脚本未使用简体中文。");
   assert.ok(script.includes(`!define VERSION "${config.version}"`), "安装脚本不是当前版本。");
