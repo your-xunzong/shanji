@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     db::{Database, LATEST_SCHEMA_VERSION},
+    domain::Item,
     error::{AppError, AppResult},
 };
 
@@ -22,7 +23,7 @@ const PACKAGE_VERSION: u32 = 1;
 const PACKAGE_EXTENSION: &str = "sjpack";
 const REPOSITORY_DIRECTORY: &str = "shanji-repository";
 const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
-const SNAPSHOT_TABLES: [&str; 13] = [
+const SNAPSHOT_TABLES: [&str; 14] = [
     "app_settings",
     "categories",
     "tags",
@@ -36,6 +37,7 @@ const SNAPSHOT_TABLES: [&str; 13] = [
     "item_tombstones",
     "email_delivery_rules",
     "timeline_view_preferences",
+    "repository_conflict_resolutions",
 ];
 
 type PackageRow = BTreeMap<String, JsonValue>;
@@ -66,6 +68,7 @@ pub struct RepositorySourcePreview {
     pub item_count: u64,
     pub new_items: u64,
     pub unchanged_items: u64,
+    pub exact_duplicates: u64,
     pub conflicts: u64,
     pub tombstones: u64,
 }
@@ -76,6 +79,7 @@ pub struct RepositoryPreview {
     pub sources: Vec<RepositorySourcePreview>,
     pub new_items: u64,
     pub unchanged_items: u64,
+    pub exact_duplicates: u64,
     pub conflicts: u64,
     pub tombstones: u64,
     pub settings_need_review: bool,
@@ -108,6 +112,24 @@ pub struct RepositorySyncResult {
     pub package_path: Option<String>,
     pub package_written: bool,
     pub synced_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryConflict {
+    pub id: String,
+    pub detected_at: String,
+    pub original: Item,
+    pub conflict: Item,
+    pub differing_fields: Vec<String>,
+    pub identical: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictCleanupResult {
+    pub merged_duplicates: u64,
+    pub remaining_conflicts: u64,
 }
 
 #[derive(Default)]
@@ -264,6 +286,7 @@ pub fn preview_repository(database: &Database) -> AppResult<RepositoryPreview> {
         sources: Vec::new(),
         new_items: 0,
         unchanged_items: 0,
+        exact_duplicates: 0,
         conflicts: 0,
         tombstones: 0,
         settings_need_review: false,
@@ -275,6 +298,7 @@ pub fn preview_repository(database: &Database) -> AppResult<RepositoryPreview> {
         let source = preview_package(&connection, &package.payload)?;
         preview.new_items += source.new_items;
         preview.unchanged_items += source.unchanged_items;
+        preview.exact_duplicates += source.exact_duplicates;
         preview.conflicts += source.conflicts;
         preview.tombstones += source.tombstones;
         preview.settings_need_review |= package
@@ -313,6 +337,7 @@ pub fn sync_repository(database: &Database, now: DateTime<Utc>) -> AppResult<Rep
         )?;
         transaction.commit()?;
     }
+    apply_saved_conflict_resolutions(database, now)?;
 
     let package_path = match write_snapshot_and_record(database, &root, now) {
         Ok(path) => Some(path.to_string_lossy().into_owned()),
@@ -344,6 +369,294 @@ pub fn publish_repository_snapshot(
             Err(error)
         }
     }
+}
+
+pub fn list_repository_conflicts(database: &Database) -> AppResult<Vec<RepositoryConflict>> {
+    let records = {
+        let connection = database.connection.lock().expect("database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, original_item_id, conflict_item_id, detected_at
+             FROM merge_conflicts WHERE resolved_at IS NULL ORDER BY detected_at",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    records
+        .into_iter()
+        .map(|(id, original_id, conflict_id, detected_at)| {
+            let original = database.get_item(&original_id)?;
+            let conflict = database.get_item(&conflict_id)?;
+            let differing_fields = differing_item_fields(&original, &conflict);
+            Ok(RepositoryConflict {
+                id,
+                detected_at,
+                original,
+                conflict,
+                identical: differing_fields.is_empty(),
+                differing_fields,
+            })
+        })
+        .collect()
+}
+
+pub fn resolve_repository_conflict(
+    database: &Database,
+    conflict_id: &str,
+    resolution: &str,
+    now: DateTime<Utc>,
+) -> AppResult<ConflictCleanupResult> {
+    if !matches!(resolution, "KEEP_ORIGINAL" | "KEEP_CONFLICT" | "KEEP_BOTH") {
+        return Err(AppError::Validation("请选择如何保留这组冲突".into()));
+    }
+    let conflict = list_repository_conflicts(database)?
+        .into_iter()
+        .find(|entry| entry.id == conflict_id)
+        .ok_or_else(|| AppError::Validation("这组冲突已处理或不存在".into()))?;
+    backup_repository_change(database)?;
+    let fingerprint = conflict_fingerprint(&conflict.original, &conflict.conflict);
+    let kept_content_hash = match resolution {
+        "KEEP_ORIGINAL" => Some(semantic_item_hash(&conflict.original)),
+        "KEEP_CONFLICT" => Some(semantic_item_hash(&conflict.conflict)),
+        _ => None,
+    };
+    let mut connection = database.connection.lock().expect("database mutex poisoned");
+    let transaction = connection.transaction()?;
+    apply_conflict_resolution(
+        &transaction,
+        &conflict.id,
+        &conflict.original.id,
+        &conflict.conflict.id,
+        resolution,
+        &fingerprint,
+        kept_content_hash.as_deref(),
+        now,
+    )?;
+    transaction.commit()?;
+    drop(connection);
+    conflict_cleanup_counts(database, 0)
+}
+
+pub fn deduplicate_repository_conflicts(
+    database: &Database,
+    now: DateTime<Utc>,
+) -> AppResult<ConflictCleanupResult> {
+    let duplicates = list_repository_conflicts(database)?
+        .into_iter()
+        .filter(|conflict| conflict.identical)
+        .collect::<Vec<_>>();
+    if duplicates.is_empty() {
+        return conflict_cleanup_counts(database, 0);
+    }
+    backup_repository_change(database)?;
+    let mut connection = database.connection.lock().expect("database mutex poisoned");
+    let transaction = connection.transaction()?;
+    for conflict in &duplicates {
+        let fingerprint = conflict_fingerprint(&conflict.original, &conflict.conflict);
+        let kept_content_hash = semantic_item_hash(&conflict.original);
+        apply_conflict_resolution(
+            &transaction,
+            &conflict.id,
+            &conflict.original.id,
+            &conflict.conflict.id,
+            "AUTO_DUPLICATE",
+            &fingerprint,
+            Some(&kept_content_hash),
+            now,
+        )?;
+    }
+    transaction.commit()?;
+    drop(connection);
+    conflict_cleanup_counts(database, duplicates.len() as u64)
+}
+
+fn backup_repository_change(database: &Database) -> AppResult<()> {
+    if database.path() != Path::new(":memory:") {
+        database.create_backup()?;
+    }
+    Ok(())
+}
+
+fn conflict_cleanup_counts(
+    database: &Database,
+    merged_duplicates: u64,
+) -> AppResult<ConflictCleanupResult> {
+    let connection = database.connection.lock().expect("database mutex poisoned");
+    let remaining_conflicts = connection.query_row(
+        "SELECT COUNT(*) FROM merge_conflicts WHERE resolved_at IS NULL",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    Ok(ConflictCleanupResult {
+        merged_duplicates,
+        remaining_conflicts,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_conflict_resolution(
+    transaction: &Transaction<'_>,
+    conflict_id: &str,
+    original_item_id: &str,
+    conflict_item_id: &str,
+    resolution: &str,
+    fingerprint: &str,
+    kept_content_hash: Option<&str>,
+    now: DateTime<Utc>,
+) -> AppResult<()> {
+    let hidden_item = match resolution {
+        "KEEP_ORIGINAL" | "AUTO_DUPLICATE" => Some(conflict_item_id),
+        "KEEP_CONFLICT" => Some(original_item_id),
+        "KEEP_BOTH" => None,
+        _ => return Err(AppError::Validation("冲突处理方式无效".into())),
+    };
+    if let Some(item_id) = hidden_item {
+        transaction.execute(
+            "UPDATE items SET status = 'DELETED', deleted_at = ?1, next_reminder_at = NULL,
+               reminder_paused = 1, updated_at = ?1, revision = revision + 1 WHERE id = ?2",
+            params![now.to_rfc3339(), item_id],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE merge_conflicts SET resolved_at = ?1 WHERE id = ?2 AND resolved_at IS NULL",
+        params![now.to_rfc3339(), conflict_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO repository_conflict_resolutions
+           (fingerprint, conflict_id, original_item_id, conflict_item_id, resolution, kept_content_hash, resolved_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(fingerprint) DO UPDATE SET resolution = excluded.resolution,
+           kept_content_hash = excluded.kept_content_hash, resolved_at = excluded.resolved_at",
+        params![fingerprint, conflict_id, original_item_id, conflict_item_id, resolution, kept_content_hash, now.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn normalized_title(title: &str) -> &str {
+    title.strip_suffix("（冲突副本）").unwrap_or(title)
+}
+
+fn semantic_item_value(item: &Item) -> JsonValue {
+    let mut tags = item
+        .tags
+        .iter()
+        .map(|tag| tag.id.as_str())
+        .collect::<Vec<_>>();
+    tags.sort_unstable();
+    serde_json::json!({
+        "title": normalized_title(&item.title), "notes": item.notes, "status": item.status,
+        "categoryId": item.category_id, "dueAt": item.due_at, "dueLocalDate": item.due_local_date,
+        "dueLocalTime": item.due_local_time, "dueSource": item.due_source,
+        "rolloverPolicy": item.rollover_policy, "rolloverCount": item.rollover_count,
+        "completionPolicy": item.completion_policy, "repeatIntervalMinutes": item.repeat_interval_minutes,
+        "reminderPaused": item.reminder_paused, "bypassAppQuietHours": item.bypass_app_quiet_hours,
+        "completedAt": item.completed_at, "eventKind": item.event_kind, "reminderPlan": item.reminder_plan,
+        "important": item.important, "timeMode": item.time_mode, "startAt": item.start_at,
+        "endAt": item.end_at, "targetAt": item.target_at, "leadValue": item.lead_value,
+        "leadUnit": item.lead_unit, "cadenceValue": item.cadence_value, "cadenceUnit": item.cadence_unit,
+        "emphasisMaxPerDay": item.emphasis_max_per_day, "repeatTimeMode": item.repeat_time_mode,
+        "repeatTimes": item.repeat_times, "tags": tags
+    })
+}
+
+fn semantic_item_hash(item: &Item) -> String {
+    hex::encode(Sha256::digest(
+        semantic_item_value(item).to_string().as_bytes(),
+    ))
+}
+
+fn conflict_fingerprint(original: &Item, conflict: &Item) -> String {
+    let mut values = [semantic_item_hash(original), semantic_item_hash(conflict)];
+    values.sort();
+    hex::encode(Sha256::digest(values.join(":").as_bytes()))
+}
+
+fn differing_item_fields(original: &Item, conflict: &Item) -> Vec<String> {
+    let mut fields = Vec::new();
+    if normalized_title(&original.title) != normalized_title(&conflict.title) {
+        fields.push("标题".into());
+    }
+    if original.notes != conflict.notes {
+        fields.push("备注".into());
+    }
+    if original.status != conflict.status || original.completed_at != conflict.completed_at {
+        fields.push("完成状态".into());
+    }
+    if original.due_at != conflict.due_at {
+        fields.push("时间".into());
+    }
+    if original.event_kind != conflict.event_kind {
+        fields.push("事件类型".into());
+    }
+    if original.category_id != conflict.category_id {
+        fields.push("类型".into());
+    }
+    if original.reminder_plan != conflict.reminder_plan
+        || original.repeat_interval_minutes != conflict.repeat_interval_minutes
+    {
+        fields.push("提醒方式".into());
+    }
+    if original.important != conflict.important {
+        fields.push("重要标记".into());
+    }
+    let mut original_tags = original.tags.iter().map(|tag| &tag.id).collect::<Vec<_>>();
+    let mut conflict_tags = conflict.tags.iter().map(|tag| &tag.id).collect::<Vec<_>>();
+    original_tags.sort();
+    conflict_tags.sort();
+    if original_tags != conflict_tags {
+        fields.push("标签".into());
+    }
+    fields
+}
+
+fn apply_saved_conflict_resolutions(database: &Database, now: DateTime<Utc>) -> AppResult<()> {
+    for conflict in list_repository_conflicts(database)? {
+        let fingerprint = conflict_fingerprint(&conflict.original, &conflict.conflict);
+        let saved = {
+            let connection = database.connection.lock().expect("database mutex poisoned");
+            connection
+                .query_row(
+                    "SELECT resolution, kept_content_hash FROM repository_conflict_resolutions WHERE fingerprint = ?1",
+                    [&fingerprint],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?
+        };
+        let Some((saved_resolution, kept_hash)) = saved else {
+            continue;
+        };
+        let resolution = if saved_resolution == "KEEP_BOTH" {
+            "KEEP_BOTH"
+        } else if kept_hash.as_deref() == Some(semantic_item_hash(&conflict.original).as_str()) {
+            "KEEP_ORIGINAL"
+        } else if kept_hash.as_deref() == Some(semantic_item_hash(&conflict.conflict).as_str()) {
+            "KEEP_CONFLICT"
+        } else {
+            // 无法证明应隐藏哪一份时宁可两份都保留。
+            "KEEP_BOTH"
+        };
+        let mut connection = database.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction()?;
+        apply_conflict_resolution(
+            &transaction,
+            &conflict.id,
+            &conflict.original.id,
+            &conflict.conflict.id,
+            resolution,
+            &fingerprint,
+            kept_hash.as_deref(),
+            now,
+        )?;
+        transaction.commit()?;
+    }
+    Ok(())
 }
 
 fn write_snapshot_and_record(
@@ -569,6 +882,7 @@ fn preview_package(
         item_count: 0,
         new_items: 0,
         unchanged_items: 0,
+        exact_duplicates: 0,
         conflicts: 0,
         tombstones: payload
             .tables
@@ -595,7 +909,17 @@ fn preview_package(
         match local {
             None => result.new_items += 1,
             Some((_, local_hash)) if local_hash == incoming_hash => result.unchanged_items += 1,
-            Some(_) => result.conflicts += 1,
+            Some(_) => {
+                let local_row = export_single_row(connection, "items", "id", id)?;
+                if local_row
+                    .as_ref()
+                    .is_some_and(|local| semantic_package_item(local) == semantic_package_item(row))
+                {
+                    result.exact_duplicates += 1;
+                } else {
+                    result.conflicts += 1;
+                }
+            }
         }
     }
     Ok(result)
@@ -685,32 +1009,39 @@ fn merge_package(
                     source_id.clone()
                 }
                 Some(_) => {
-                    let conflict_id = Uuid::new_v4().to_string();
-                    let mut imported = row.clone();
-                    imported.insert("id".into(), JsonValue::String(conflict_id.clone()));
-                    let title = row_text(row, "title")?;
-                    imported.insert(
-                        "title".into(),
-                        JsonValue::String(format!("{title}（冲突副本）")),
-                    );
-                    imported.insert("revision".into(), JsonValue::from(1));
-                    imported.insert("updated_at".into(), JsonValue::String(now.to_rfc3339()));
-                    remap_category(&mut imported, &category_map)?;
-                    insert_row(transaction, "items", &imported, false)?;
-                    transaction.execute(
-                        "INSERT INTO merge_conflicts
+                    let local_row = export_single_row(transaction, "items", "id", &source_id)?
+                        .ok_or(AppError::ItemNotFound)?;
+                    if semantic_package_item(&local_row) == semantic_package_item(row) {
+                        counts.unchanged += 1;
+                        source_id.clone()
+                    } else {
+                        let conflict_id = Uuid::new_v4().to_string();
+                        let mut imported = row.clone();
+                        imported.insert("id".into(), JsonValue::String(conflict_id.clone()));
+                        let title = row_text(row, "title")?;
+                        imported.insert(
+                            "title".into(),
+                            JsonValue::String(format!("{title}（冲突副本）")),
+                        );
+                        imported.insert("revision".into(), JsonValue::from(1));
+                        imported.insert("updated_at".into(), JsonValue::String(now.to_rfc3339()));
+                        remap_category(&mut imported, &category_map)?;
+                        insert_row(transaction, "items", &imported, false)?;
+                        transaction.execute(
+                            "INSERT INTO merge_conflicts
                        (id, original_item_id, conflict_item_id, source_instance_id, detected_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![
-                            Uuid::new_v4().to_string(),
-                            source_id,
-                            conflict_id,
-                            payload.source_instance_id,
-                            now.to_rfc3339()
-                        ],
-                    )?;
-                    counts.conflicts += 1;
-                    conflict_id
+                            params![
+                                Uuid::new_v4().to_string(),
+                                source_id,
+                                conflict_id,
+                                payload.source_instance_id,
+                                now.to_rfc3339()
+                            ],
+                        )?;
+                        counts.conflicts += 1;
+                        conflict_id
+                    }
                 }
             })
         };
@@ -775,6 +1106,14 @@ fn merge_package(
         merge_singleton_settings(transaction, payload)?;
     }
     merge_email_rules(transaction, payload, now)?;
+    for row in payload
+        .tables
+        .get("repository_conflict_resolutions")
+        .into_iter()
+        .flatten()
+    {
+        insert_row(transaction, "repository_conflict_resolutions", row, true)?;
+    }
     Ok(())
 }
 
@@ -1120,6 +1459,24 @@ fn row_checksum(row: &PackageRow) -> AppResult<String> {
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+fn semantic_package_item(row: &PackageRow) -> JsonValue {
+    let mut value = row.clone();
+    for field in [
+        "id",
+        "revision",
+        "created_at",
+        "updated_at",
+        "next_reminder_at",
+        "reminder_plan_source",
+    ] {
+        value.remove(field);
+    }
+    if let Some(JsonValue::String(title)) = value.get_mut("title") {
+        *title = normalized_title(title).to_string();
+    }
+    JsonValue::Object(value.into_iter().collect())
+}
+
 fn instance_id(connection: &rusqlite::Connection) -> AppResult<String> {
     connection
         .query_row(
@@ -1224,6 +1581,91 @@ mod tests {
         let repeated = sync_repository(&target, now + Duration::seconds(2)).unwrap();
         assert_eq!(repeated.conflicts, 0);
         assert_eq!(target.list_items("all", now).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn metadata_only_difference_is_previewed_as_an_exact_duplicate() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = Database::open(&directory.path().join("source.db")).unwrap();
+        let target = Database::open(&directory.path().join("target.db")).unwrap();
+        let now = Utc::now();
+        let item_id = add_item(&source, "同一份内容", now);
+        let source_connection = source.connection.lock().unwrap();
+        let mut row = export_single_row(&source_connection, "items", "id", &item_id)
+            .unwrap()
+            .unwrap();
+        row.insert("revision".into(), JsonValue::from(9));
+        row.insert(
+            "updated_at".into(),
+            JsonValue::String((now + Duration::minutes(3)).to_rfc3339()),
+        );
+        let target_connection = target.connection.lock().unwrap();
+        let transaction = target_connection.unchecked_transaction().unwrap();
+        insert_row(&transaction, "items", &row, false).unwrap();
+        transaction.commit().unwrap();
+        drop(target_connection);
+        drop(source_connection);
+
+        configure_repository(&source, directory.path(), now).unwrap();
+        configure_repository(&target, directory.path(), now).unwrap();
+        let preview = preview_repository(&target).unwrap();
+        assert_eq!(preview.exact_duplicates, 1);
+        assert_eq!(preview.conflicts, 0);
+        let result = sync_repository(&target, now + Duration::seconds(1)).unwrap();
+        assert_eq!(result.conflicts, 0);
+        assert_eq!(target.list_items("all", now).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn resolving_conflict_hides_only_the_rejected_copy_and_records_the_choice() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("data.db")).unwrap();
+        let now = Utc::now();
+        let original_id = add_item(&database, "本机版本", now);
+        let connection = database.connection.lock().unwrap();
+        let mut row = export_single_row(&connection, "items", "id", &original_id)
+            .unwrap()
+            .unwrap();
+        let conflict_item_id = Uuid::new_v4().to_string();
+        row.insert("id".into(), JsonValue::String(conflict_item_id.clone()));
+        row.insert(
+            "title".into(),
+            JsonValue::String("仓库版本（冲突副本）".into()),
+        );
+        let transaction = connection.unchecked_transaction().unwrap();
+        insert_row(&transaction, "items", &row, false).unwrap();
+        let conflict_id = Uuid::new_v4().to_string();
+        transaction.execute(
+            "INSERT INTO merge_conflicts (id, original_item_id, conflict_item_id, source_instance_id, detected_at)
+             VALUES (?1, ?2, ?3, 'remote', ?4)",
+            params![conflict_id, original_id, conflict_item_id, now.to_rfc3339()],
+        ).unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let result = resolve_repository_conflict(
+            &database,
+            &conflict_id,
+            "KEEP_ORIGINAL",
+            now + Duration::minutes(1),
+        )
+        .unwrap();
+
+        assert_eq!(result.remaining_conflicts, 0);
+        assert_eq!(database.get_item(&original_id).unwrap().status, "OPEN");
+        assert_eq!(
+            database.get_item(&conflict_item_id).unwrap().status,
+            "DELETED"
+        );
+        let connection = database.connection.lock().unwrap();
+        let resolution_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM repository_conflict_resolutions",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+        assert_eq!(resolution_count, 1);
     }
 
     #[test]

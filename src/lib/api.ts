@@ -17,6 +17,9 @@ import type {
   UpdateItemInput,
   ExportResult,
   ExportFilterInput,
+  SummaryRequest,
+  SummaryResult,
+  SummaryTemplatePreview,
   AppInfo,
   StartupStatus,
   EventKind,
@@ -25,6 +28,9 @@ import type {
   RepositoryPreview,
   RepositoryStatus,
   RepositorySyncResult,
+  RepositoryConflict,
+  RepositoryConflictResolution,
+  ConflictCleanupResult,
   TimelineData,
   TimelineEntry,
   TimelineQuery,
@@ -68,7 +74,7 @@ function readPreviewUpdateState(): UpdateState {
     snoozedVersion: null,
     snoozedUntil: null,
     lastNotifiedVersion: null,
-    releaseNotesSeenVersion: '0.13.1',
+    releaseNotesSeenVersion: '0.13.2',
   };
   const saved = localStorage.getItem(UPDATE_STATE_KEY);
   const state = saved ? { ...defaults, ...JSON.parse(saved) } : defaults;
@@ -78,7 +84,7 @@ function readPreviewUpdateState(): UpdateState {
   return {
     ...state,
     shouldAutoCheck,
-    showCurrentReleaseNotes: state.releaseNotesSeenVersion !== '0.13.1',
+    showCurrentReleaseNotes: state.releaseNotesSeenVersion !== '0.13.2',
   };
 }
 
@@ -119,6 +125,8 @@ const defaultSettings: Settings = {
   smtpTo: '',
   smtpUsername: '',
   smtpRepeatMustComplete: false,
+  importantDefaultReminderPlan: 'EMPHASIS',
+  repeatDetailedNotificationsEnabled: false,
   eventKindDefaults: [
     { eventKind: 'ORDINARY', reminderPlan: 'REPEAT' },
     { eventKind: 'ONE_TIME', reminderPlan: 'ONCE' },
@@ -201,6 +209,7 @@ function readPreviewItems(): Item[] {
           ? 'TODAY_MUST'
           : null,
       reminderPlan: item.reminderPlan ?? (item.completionPolicy === 'MUST_COMPLETE_TODAY' ? 'EMPHASIS' : 'ONCE'),
+      reminderPlanSource: item.reminderPlanSource ?? 'MIGRATED',
       important: item.important ?? false,
       timeMode: item.timeMode ?? (item.dueSource === 'EXPLICIT' ? 'SPECIFIED' : 'DEFAULT'),
       startAt: item.startAt ?? null,
@@ -244,6 +253,7 @@ function readPreviewItems(): Item[] {
       deletedAt: null,
       eventKind: 'ORDINARY',
       reminderPlan: 'REPEAT',
+      reminderPlanSource: 'EVENT_KIND_DEFAULT',
       important: false,
       timeMode: 'DEFAULT',
       startAt: null,
@@ -282,6 +292,7 @@ function readPreviewItems(): Item[] {
       deletedAt: null,
       eventKind: 'TODAY_MUST',
       reminderPlan: 'EMPHASIS',
+      reminderPlanSource: 'IMPORTANT_DEFAULT',
       important: true,
       timeMode: 'SPECIFIED',
       startAt: null,
@@ -503,7 +514,7 @@ export const api = {
     if (isTauri()) return call<AppInfo>('get_app_info');
     return {
       name: '闪记',
-      version: '0.13.1',
+      version: '0.13.2',
       copyright: '© 2026 闪记',
       portable: false,
       updateInstallMode: 'AUTOMATIC',
@@ -593,6 +604,7 @@ export const api = {
     const now = new Date();
     const eventKind = input.event?.kind ?? (input.mustCompleteToday ? 'TODAY_MUST' : null);
     const reminderPlan = input.event?.reminderPlan
+      ?? (input.event?.important ? settings.importantDefaultReminderPlan : null)
       ?? settings.eventKindDefaults.find((entry) => entry.eventKind === eventKind)?.reminderPlan
       ?? 'REPEAT';
     const configuredTime = eventKind === 'WARNING'
@@ -632,6 +644,8 @@ export const api = {
       deletedAt: null,
       eventKind,
       reminderPlan,
+      reminderPlanSource: input.event?.reminderPlanSource
+        ?? (input.event?.reminderPlan ? 'ITEM_OVERRIDE' : input.event?.important ? 'IMPORTANT_DEFAULT' : 'EVENT_KIND_DEFAULT'),
       important: input.event?.important ?? false,
       timeMode: configuredTime ? 'SPECIFIED' : 'DEFAULT',
       startAt: input.event?.startAt ?? null,
@@ -668,7 +682,9 @@ export const api = {
     if (!target) throw new Error('事项不存在');
     target.status = completed ? 'DONE' : 'OPEN';
     target.completedAt = completed ? new Date().toISOString() : null;
-    target.nextReminderAt = completed ? null : target.dueAt;
+    target.nextReminderAt = completed || (target.reminderPlan === 'ONCE' && new Date(target.dueAt).getTime() < Date.now())
+      ? null
+      : target.dueAt;
     target.updatedAt = new Date().toISOString();
     writePreviewItems(items);
     return target;
@@ -859,8 +875,11 @@ export const api = {
     item.rolloverPolicy = 'NONE';
     item.eventKind = input.event?.kind ?? (input.mustCompleteToday ? 'TODAY_MUST' : null);
     item.reminderPlan = input.event?.reminderPlan
+      ?? (input.event?.important ? readPreviewSettings().importantDefaultReminderPlan : null)
       ?? readPreviewSettings().eventKindDefaults.find((entry) => entry.eventKind === item.eventKind)?.reminderPlan
       ?? 'ONCE';
+    item.reminderPlanSource = input.event?.reminderPlanSource
+      ?? (input.event?.reminderPlan ? 'ITEM_OVERRIDE' : input.event?.important ? 'IMPORTANT_DEFAULT' : 'EVENT_KIND_DEFAULT');
     item.important = input.event?.important ?? false;
     item.timeMode = 'SPECIFIED';
     item.startAt = input.event?.startAt ?? null;
@@ -998,6 +1017,35 @@ export const api = {
     return { path, itemCount: items.length };
   },
 
+  async validateSummaryTemplate(path: string): Promise<SummaryTemplatePreview> {
+    if (isTauri()) return call<SummaryTemplatePreview>('validate_summary_template', { path });
+    const valid = path.toLowerCase().endsWith('.docx');
+    return {
+      templatePath: path,
+      placeholders: ['report_title', 'period_summary', 'open_item.title'],
+      unsupportedPlaceholders: [],
+      valid,
+      message: valid ? '已识别 3 个占位符，可以生成小结。' : '请选择有效的 Word 模板（.docx）。',
+    };
+  },
+
+  async generateWordSummary(request: SummaryRequest): Promise<SummaryResult> {
+    if (isTauri()) return call<SummaryResult>('generate_word_summary', { request });
+    const items = readPreviewItems().filter((item) => item.status !== 'DELETED');
+    const completedCount = items.filter((item) => item.status === 'DONE').length;
+    return {
+      path: request.outputPath,
+      itemCount: items.length,
+      completedCount,
+      openCount: items.length - completedCount,
+      overdueCount: items.filter((item) => item.status === 'OPEN' && new Date(item.dueAt).getTime() < Date.now()).length,
+      importantCount: items.filter((item) => item.important).length,
+      periodLabel: request.period === 'MONTH'
+        ? `${request.year} 年 ${request.month} 月`
+        : `${request.year} 年第 ${request.quarter} 季度`,
+    };
+  },
+
   async loadDraft(): Promise<string> {
     if (isTauri()) return call<string>('load_draft');
     return localStorage.getItem(DRAFT_KEY) ?? '';
@@ -1125,6 +1173,7 @@ export const api = {
       deletedAt: null,
       eventKind: 'ONE_TIME',
       reminderPlan: 'ONCE',
+      reminderPlanSource: 'ITEM_OVERRIDE',
       important: false,
       timeMode: 'SPECIFIED',
       startAt: null,
@@ -1160,7 +1209,7 @@ export const api = {
         hasSettings: true,
         hasDraft: false,
         hasCustomSettings: false,
-        schemaVersion: 10,
+        schemaVersion: 12,
         updatedAt: new Date().toISOString(),
       },
       latestBackup: null,
@@ -1177,7 +1226,7 @@ export const api = {
       hasSettings: true,
       hasDraft: false,
       hasCustomSettings: false,
-      schemaVersion: 10,
+      schemaVersion: 12,
       updatedAt: new Date().toISOString(),
     };
   },
@@ -1232,6 +1281,7 @@ export const api = {
       }],
       newItems: 2,
       unchangedItems: 3,
+      exactDuplicates: 0,
       conflicts: 1,
       tombstones: 0,
       settingsNeedReview: false,
@@ -1265,6 +1315,26 @@ export const api = {
     if (isTauri()) await call<void>('open_repository_directory');
   },
 
+  async listRepositoryConflicts(): Promise<RepositoryConflict[]> {
+    if (isTauri()) return call<RepositoryConflict[]>('list_repository_conflict_items');
+    return [];
+  },
+
+  async deduplicateDataRepository(): Promise<ConflictCleanupResult> {
+    if (isTauri()) return call<ConflictCleanupResult>('deduplicate_data_repository');
+    return { mergedDuplicates: 0, remainingConflicts: 0 };
+  },
+
+  async resolveDataRepositoryConflict(
+    conflictId: string,
+    resolution: RepositoryConflictResolution,
+  ): Promise<ConflictCleanupResult> {
+    if (isTauri()) {
+      return call<ConflictCleanupResult>('resolve_data_repository_conflict', { conflictId, resolution });
+    }
+    return { mergedDuplicates: 0, remainingConflicts: 0 };
+  },
+
   async getTimeline(query: TimelineQuery): Promise<TimelineData> {
     if (isTauri()) return call<TimelineData>('get_timeline', { query });
     return previewTimeline(query);
@@ -1295,7 +1365,7 @@ export const api = {
           hasSettings: true,
           hasDraft: true,
           hasCustomSettings: true,
-          schemaVersion: 10,
+          schemaVersion: 12,
           updatedAt: '2026-09-01T10:20:00Z',
         }],
         diagnostic: 'startup_state=legacy_data_found; target_exists=false; target_bytes=0; current_schema=unknown; candidates=1; app_schema=10',

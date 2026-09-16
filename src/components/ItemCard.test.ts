@@ -12,7 +12,7 @@ const item: Item = {
   nextReminderAt: '2026-08-28T10:00:00.000Z', reminderPaused: false,
   bypassAppQuietHours: false, createdAt: '2026-08-28T09:00:00.000Z',
   updatedAt: '2026-08-28T09:00:00.000Z', completedAt: null, deletedAt: null,
-  eventKind: 'ORDINARY', reminderPlan: 'REPEAT', important: false, timeMode: 'SPECIFIED',
+  eventKind: 'ORDINARY', reminderPlan: 'REPEAT', reminderPlanSource: 'MIGRATED', important: false, timeMode: 'SPECIFIED',
   startAt: null, endAt: null, targetAt: null, leadValue: null, leadUnit: null,
   cadenceValue: null, cadenceUnit: null, emphasisMaxPerDay: 8,
   repeatTimeMode: 'SPECIFIED', repeatTimes: ['18:00'],
@@ -72,5 +72,41 @@ describe('ItemCard', () => {
     expect(onUpdate).toHaveBeenCalledWith(existing, expect.objectContaining({
       event: expect.objectContaining({ repeatTimes: ['10:00', '17:00'] }),
     }));
+  });
+
+  it('switching event kind applies its latest default until the item is manually overridden', async () => {
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    render(ItemCard, { props: {
+      item,
+      eventKindDefaults: [
+        { eventKind: 'ORDINARY', reminderPlan: 'FORCE' },
+        { eventKind: 'ONE_TIME', reminderPlan: 'ONCE' },
+      ],
+      categories: [], tags: [],
+      onComplete: vi.fn(), onPause: vi.fn(), onReschedule: vi.fn(),
+      onUpdate, onDelete: vi.fn(), onPermanentDelete: vi.fn(),
+    } });
+    await fireEvent.click(screen.getByRole('button', { name: '编辑' }));
+    await fireEvent.change(screen.getByLabelText('事件类型'), { target: { value: 'ONE_TIME' } });
+    await fireEvent.change(screen.getByLabelText('事件类型'), { target: { value: 'ORDINARY' } });
+    expect(screen.getByText(/跟随“普通”默认 → 强制/)).toBeInTheDocument();
+    await fireEvent.change(screen.getByLabelText('提醒方案'), { target: { value: 'REPEAT' } });
+    expect(screen.getByText(/已为此事项单独设置 → 重复/)).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: '保存修改' }));
+    expect(onUpdate).toHaveBeenCalledWith(item, expect.objectContaining({
+      event: expect.objectContaining({ reminderPlan: 'REPEAT', reminderPlanSource: 'ITEM_OVERRIDE' }),
+    }));
+  });
+
+  it('shows an explicit restore action for completed items', async () => {
+    const onComplete = vi.fn();
+    render(ItemCard, { props: {
+      item: { ...item, status: 'DONE' as const, completedAt: '2026-09-15T09:00:00Z', nextReminderAt: null },
+      categories: [], tags: [],
+      onComplete, onPause: vi.fn(), onReschedule: vi.fn(),
+      onUpdate: vi.fn(), onDelete: vi.fn(), onPermanentDelete: vi.fn(),
+    } });
+    await fireEvent.click(screen.getByRole('button', { name: '恢复为未完成' }));
+    expect(onComplete).toHaveBeenCalledWith(expect.objectContaining({ id: item.id }), false);
   });
 });

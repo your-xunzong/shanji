@@ -32,6 +32,7 @@ const baseItem: Item = {
   deletedAt: null,
   eventKind: null,
   reminderPlan: 'ONCE',
+  reminderPlanSource: 'MIGRATED',
   important: false,
   timeMode: 'DEFAULT',
   startAt: null,

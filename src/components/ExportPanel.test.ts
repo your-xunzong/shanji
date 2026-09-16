@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/svelte';
 import { describe, expect, it, vi } from 'vitest';
 import ExportPanel from './ExportPanel.svelte';
+import { api } from '../lib/api';
 
 describe('ExportPanel', () => {
   it('submits status, type and tag filters before choosing a file', async () => {
@@ -26,5 +27,29 @@ describe('ExportPanel', () => {
       createdFrom: null,
       createdTo: null,
     });
+  });
+
+  it('validates a Word template before generating a monthly summary', async () => {
+    vi.spyOn(api, 'validateSummaryTemplate').mockResolvedValue({
+      templatePath: 'D:\\模板\\月报.docx',
+      placeholders: ['report_title', 'open_item.title'],
+      unsupportedPlaceholders: [],
+      valid: true,
+      message: '已识别 2 个占位符，可以生成小结。',
+    });
+    const onGenerateSummary = vi.fn(async () => {});
+    render(ExportPanel, { props: {
+      categories: [], tags: [],
+      onClose: vi.fn(), onExport: vi.fn(),
+      onChooseSummaryTemplate: vi.fn(async () => 'D:\\模板\\月报.docx'),
+      onGenerateSummary,
+    } });
+    await fireEvent.click(screen.getByRole('tab', { name: 'Word 小结' }));
+    await fireEvent.click(screen.getByRole('button', { name: '选择模板' }));
+    expect(await screen.findByText(/已识别 2 个占位符/)).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: '选择位置并生成' }));
+    expect(onGenerateSummary).toHaveBeenCalledWith(expect.objectContaining({
+      period: 'MONTH', templatePath: 'D:\\模板\\月报.docx', outputPath: '',
+    }));
   });
 });

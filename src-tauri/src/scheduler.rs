@@ -136,7 +136,14 @@ fn process_once(
                     Err(error) => eprintln!("邮件摘要领取失败：{error}"),
                 }
             }
-            for notification in result.notifications {
+            for mut notification in result.notifications {
+                if settings.repeat_detailed_notifications_enabled
+                    && notification.reminder_plan == "REPEAT"
+                {
+                    if let Ok(item) = database.get_item(&notification.item_id) {
+                        notification.detail_lines = repeat_notification_details(&item);
+                    }
+                }
                 if settings.overlay_reminders_enabled {
                     match crate::show_overlay_reminder(app, &notification) {
                         Ok(()) => {
@@ -241,6 +248,42 @@ fn process_once(
     }
 }
 
+fn repeat_notification_details(item: &crate::domain::Item) -> Vec<String> {
+    let kind = match item.event_kind.as_deref() {
+        Some("ORDINARY") => "普通",
+        Some("ONE_TIME") => "一次性",
+        Some("TODAY_MUST") => "今日必做",
+        Some("WARNING") => "预警",
+        Some("CONTINUOUS") => "持续",
+        Some("MONTHLY") => "月度",
+        Some("YEARLY") => "年度",
+        _ => "待选择事件类型",
+    };
+    let mut lines = vec![format!("事件类型：{kind}")];
+    if let Some(category) = &item.category_name {
+        lines.push(format!("类型：{category}"));
+    }
+    if !item.tags.is_empty() {
+        lines.push(format!(
+            "标签：{}",
+            item.tags
+                .iter()
+                .map(|tag| tag.name.as_str())
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    if let Some(next) = &item.next_reminder_at {
+        if let Ok(value) = chrono::DateTime::parse_from_rfc3339(next) {
+            lines.push(format!(
+                "下次：{}",
+                value.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+            ));
+        }
+    }
+    lines
+}
+
 fn should_use_persistent_notification(
     settings: &Settings,
     notification: &crate::db::DueNotification,
@@ -332,6 +375,8 @@ mod tests {
             smtp_to: String::new(),
             smtp_username: String::new(),
             smtp_repeat_must_complete: false,
+            important_default_reminder_plan: "EMPHASIS".into(),
+            repeat_detailed_notifications_enabled: false,
             event_kind_defaults: crate::domain::default_event_kind_defaults(),
         }
     }
@@ -351,6 +396,7 @@ mod tests {
                 "ONCE".into()
             },
             tag_ids: Vec::new(),
+            detail_lines: Vec::new(),
         }
     }
 

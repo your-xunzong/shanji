@@ -207,10 +207,7 @@ impl NotificationService {
                 .notification()
                 .builder()
                 .title("闪记提醒")
-                .body(format!(
-                    "{}\n到期：{} {}",
-                    notification.title, notification.due_local_date, notification.due_local_time
-                ))
+                .body(notification_body(notification))
                 .show()
                 .map(|()| persistent.then_some("persistent_not_supported"))
                 .map_err(|error| DeliveryError {
@@ -370,10 +367,7 @@ impl NotificationService {
         let mut toast = Toast::new(self.windows_app_id())
             .title("闪记提醒")
             .text1(&notification.title)
-            .text2(&format!(
-                "到期：{} {}",
-                notification.due_local_date, notification.due_local_time
-            ))
+            .text2(&notification_detail_text(notification))
             .on_activated(move |action| {
                 handle_notification_action(&app, &item_id, action.as_deref());
                 Ok(())
@@ -451,6 +445,24 @@ impl NotificationService {
             WINDOWS_INSTALLED_REGISTRY_PATH
         }
     }
+}
+
+fn notification_detail_text(notification: &DueNotification) -> String {
+    let mut lines = vec![format!(
+        "到期：{} {}",
+        notification.due_local_date, notification.due_local_time
+    )];
+    lines.extend(notification.detail_lines.iter().cloned());
+    lines.join("\n")
+}
+
+#[cfg(not(windows))]
+fn notification_body(notification: &DueNotification) -> String {
+    format!(
+        "{}\n{}",
+        notification.title,
+        notification_detail_text(notification)
+    )
 }
 
 #[cfg(windows)]

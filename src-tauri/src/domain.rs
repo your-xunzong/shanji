@@ -46,6 +46,8 @@ pub struct Settings {
     pub smtp_to: String,
     pub smtp_username: String,
     pub smtp_repeat_must_complete: bool,
+    pub important_default_reminder_plan: String,
+    pub repeat_detailed_notifications_enabled: bool,
     pub event_kind_defaults: Vec<EventKindDefault>,
 }
 
@@ -60,6 +62,12 @@ pub const EVENT_KINDS: [&str; 7] = [
 ];
 
 pub const REMINDER_PLANS: [&str; 5] = ["REPEAT", "EMPHASIS", "ONCE", "FORCE", "CUSTOM"];
+pub const REMINDER_PLAN_SOURCES: [&str; 4] = [
+    "EVENT_KIND_DEFAULT",
+    "IMPORTANT_DEFAULT",
+    "ITEM_OVERRIDE",
+    "MIGRATED",
+];
 pub const REPEAT_TIME_MODES: [&str; 2] = ["DEFAULT", "SPECIFIED"];
 pub const SCHEDULE_UNITS: [&str; 4] = ["DAY", "WEEK", "MONTH", "YEAR"];
 
@@ -114,6 +122,8 @@ pub struct UpdateSettingsInput {
     pub smtp_to: String,
     pub smtp_username: String,
     pub smtp_repeat_must_complete: bool,
+    pub important_default_reminder_plan: String,
+    pub repeat_detailed_notifications_enabled: bool,
     pub smtp_password: Option<String>,
     pub event_kind_defaults: Vec<EventKindDefault>,
 }
@@ -148,6 +158,11 @@ impl UpdateSettingsInput {
         }
         validate_global_shortcut(&self.global_shortcut)?;
         validate_event_kind_defaults(&self.event_kind_defaults)?;
+        if !REMINDER_PLANS.contains(&self.important_default_reminder_plan.as_str()) {
+            return Err(AppError::Validation(
+                "请选择有效的重要事项默认提醒方案".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -181,6 +196,8 @@ impl UpdateSettingsInput {
             smtp_to: self.smtp_to.trim().to_string(),
             smtp_username: self.smtp_username.trim().to_string(),
             smtp_repeat_must_complete: self.smtp_repeat_must_complete,
+            important_default_reminder_plan: self.important_default_reminder_plan.clone(),
+            repeat_detailed_notifications_enabled: self.repeat_detailed_notifications_enabled,
             event_kind_defaults: self.event_kind_defaults.clone(),
         }
     }
@@ -279,6 +296,7 @@ pub struct Item {
     pub deleted_at: Option<String>,
     pub event_kind: Option<String>,
     pub reminder_plan: String,
+    pub reminder_plan_source: String,
     pub important: bool,
     pub time_mode: String,
     pub start_at: Option<String>,
@@ -299,6 +317,7 @@ pub struct Item {
 pub struct EventConfigurationInput {
     pub kind: Option<String>,
     pub reminder_plan: Option<String>,
+    pub reminder_plan_source: Option<String>,
     #[serde(default)]
     pub important: bool,
     pub start_at: Option<String>,
@@ -325,6 +344,11 @@ impl EventConfigurationInput {
             && !REMINDER_PLANS.contains(&plan.as_str())
         {
             return Err(AppError::Validation("请选择有效的提醒方案".into()));
+        }
+        if let Some(source) = &self.reminder_plan_source
+            && !REMINDER_PLAN_SOURCES.contains(&source.as_str())
+        {
+            return Err(AppError::Validation("提醒方案来源无效，请重新选择".into()));
         }
         if let Some(mode) = &self.repeat_time_mode
             && !REPEAT_TIME_MODES.contains(&mode.as_str())
@@ -774,6 +798,8 @@ mod tests {
             smtp_to: String::new(),
             smtp_username: String::new(),
             smtp_repeat_must_complete: false,
+            important_default_reminder_plan: "EMPHASIS".into(),
+            repeat_detailed_notifications_enabled: false,
             event_kind_defaults: default_event_kind_defaults(),
         }
     }

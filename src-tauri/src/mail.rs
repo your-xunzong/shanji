@@ -368,6 +368,7 @@ mod tests {
             event_kind: Some("ORDINARY".into()),
             reminder_plan: "ONCE".into(),
             tag_ids: Vec::new(),
+            detail_lines: Vec::new(),
         }];
         let html = digest_html("2026-09-03", &notifications);
         assert!(html.contains("role=\"presentation\""));

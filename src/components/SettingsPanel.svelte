@@ -349,6 +349,13 @@
         <h3>事件默认提醒</h3>
         <p>选择事件类型时自动使用；只影响新记录和之后主动转换的记录。</p>
       </div>
+      <label class="form-field">
+        <span>重要事项默认方案</span>
+        <select bind:value={form.importantDefaultReminderPlan}>
+          {#each REMINDER_PLAN_OPTIONS as plan}<option value={plan.value}>{plan.label}</option>{/each}
+        </select>
+      </label>
+      <p class="field-help">勾选“重要”时优先使用；单条事项仍可随后修改。</p>
       <div class="event-default-grid">
         {#each EVENT_KIND_OPTIONS as option}
           <label>
@@ -453,6 +460,10 @@
         <p>提醒时间与频率由事件默认方案和单条事项决定；这里仅选择提醒从哪里出现。</p>
       </div>
       <div class="reminder-mode-list" aria-label="提醒显示方式">
+        <div class="reminder-mode-row">
+          <span class="reminder-source">内容</span>
+          <label class="switch-row"><span><strong>重复提醒显示完整事项信息</strong><small>增加事件类型、类型、标签和下次提醒；不显示备注，也不改变提醒频率。</small></span><input class="switch" type="checkbox" bind:checked={form.repeatDetailedNotificationsEnabled} /></label>
+        </div>
         <div class="reminder-mode-row">
           <span class="reminder-source">系统</span>
           <label class="switch-row"><span><strong>持续提醒</strong><small>用于今日必做或“强制”方案；Windows 可直接完成或稍后提醒。不改变提醒频率。</small></span><input class="switch" type="checkbox" bind:checked={form.persistentNotificationsEnabled} /></label>

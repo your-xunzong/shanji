@@ -580,6 +580,7 @@ fn digest_notifications(
                 event_kind: row.get(6)?,
                 reminder_plan: row.get(7)?,
                 tag_ids: Vec::new(),
+                detail_lines: Vec::new(),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -614,6 +615,7 @@ mod tests {
             event_kind: Some("ORDINARY".into()),
             reminder_plan: "REPEAT".into(),
             tag_ids: Vec::new(),
+            detail_lines: Vec::new(),
         }
     }
 

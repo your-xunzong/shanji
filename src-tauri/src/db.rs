@@ -32,7 +32,8 @@ const MIGRATION_0008: &str = include_str!("../migrations/0008_local_repository.s
 const MIGRATION_0009: &str = include_str!("../migrations/0009_email_delivery_rules.sql");
 const MIGRATION_0010: &str = include_str!("../migrations/0010_time_canvas.sql");
 const MIGRATION_0011: &str = include_str!("../migrations/0011_update_state.sql");
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 11;
+const MIGRATION_0012: &str = include_str!("../migrations/0012_reminder_summary_conflicts.sql");
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 12;
 
 pub struct Database {
     pub(crate) connection: Mutex<Connection>,
@@ -87,6 +88,7 @@ pub struct DueNotification {
     pub event_kind: Option<String>,
     pub reminder_plan: String,
     pub tag_ids: Vec<String>,
+    pub detail_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +238,7 @@ impl Database {
         transaction.execute_batch(MIGRATION_0009)?;
         transaction.execute_batch(MIGRATION_0010)?;
         transaction.execute_batch(MIGRATION_0011)?;
+        transaction.execute_batch(MIGRATION_0012)?;
         transaction.commit()?;
         ensure_instance_id(&connection)?;
         Ok(Self {
@@ -478,7 +481,9 @@ impl Database {
                 smtp_username = ?20,
                 smtp_repeat_must_complete = ?21,
                 repeat_default_time_first = ?22,
-                repeat_default_time_second = ?23
+                repeat_default_time_second = ?23,
+                important_default_reminder_plan = ?24,
+                repeat_detailed_notifications_enabled = ?25
              WHERE id = 1",
             params![
                 settings.default_due_time,
@@ -504,6 +509,8 @@ impl Database {
                 bool_to_int(settings.smtp_repeat_must_complete),
                 settings.repeat_default_times[0],
                 settings.repeat_default_times[1],
+                settings.important_default_reminder_plan,
+                bool_to_int(settings.repeat_detailed_notifications_enabled),
             ],
         )?;
 
@@ -587,10 +594,10 @@ impl Database {
                 next_reminder_at, created_at, updated_at, event_kind, reminder_plan, important,
                 time_mode, start_at, end_at, target_at, lead_value, lead_unit,
                 cadence_value, cadence_unit, emphasis_max_per_day, classification_next_reminder_at,
-                repeat_time_mode, repeat_time_first, repeat_time_second
+                repeat_time_mode, repeat_time_first, repeat_time_second, reminder_plan_source
              ) VALUES (?1, ?2, ?3, 'OPEN', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13,
                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
-                ?27, ?28, ?29)",
+                ?27, ?28, ?29, ?30)",
             params![
                 id,
                 input.title.trim(),
@@ -621,6 +628,7 @@ impl Database {
                 repeat_time_mode,
                 repeat_times.first(),
                 repeat_times.get(1),
+                event.reminder_plan_source,
             ],
         )?;
         transaction.execute(
@@ -695,10 +703,8 @@ impl Database {
         let now_text = now.to_rfc3339();
         let next_reminder = if completed {
             None
-        } else if existing.due_at <= now_text {
-            Some(now_text.clone())
         } else {
-            Some(existing.due_at.clone())
+            next_future_reminder_after_reopen(&existing, now)?
         };
         let classification_next = if completed || existing.event_kind.is_some() {
             None
@@ -761,6 +767,7 @@ impl Database {
         };
         transaction.execute(
             "UPDATE items SET event_kind = 'ORDINARY', reminder_plan = ?1,
+                reminder_plan_source = 'EVENT_KIND_DEFAULT',
                 completion_policy = 'NORMAL', rollover_policy = 'NONE',
                 classification_next_reminder_at = NULL, next_reminder_at = ?2,
                 updated_at = ?3, revision = revision + 1 WHERE id = ?4",
@@ -1151,7 +1158,8 @@ impl Database {
                 emphasis_count_local_date = NULL,
                 classification_next_reminder_at = ?23,
                 series_occurrence_pending = 0, repeat_time_mode = ?24,
-                repeat_time_first = ?25, repeat_time_second = ?26 WHERE id = ?27",
+                repeat_time_first = ?25, repeat_time_second = ?26,
+                reminder_plan_source = ?28 WHERE id = ?27",
             params![
                 input.title.trim(),
                 input.notes,
@@ -1180,6 +1188,7 @@ impl Database {
                 repeat_times.first(),
                 repeat_times.get(1),
                 id,
+                event.reminder_plan_source,
             ],
         )?;
         let (series_anchor_month, series_anchor_day) =
@@ -1502,6 +1511,7 @@ impl Database {
                             event_kind: row.get(8)?,
                             reminder_plan: row.get(9)?,
                             tag_ids: Vec::new(),
+                            detail_lines: Vec::new(),
                         },
                     ))
                 })?
@@ -1636,6 +1646,7 @@ impl Database {
                     event_kind: row.get(6)?,
                     reminder_plan: row.get(7)?,
                     tag_ids: Vec::new(),
+                    detail_lines: Vec::new(),
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
@@ -1803,6 +1814,7 @@ impl Database {
                     event_kind: row.event_kind,
                     reminder_plan: row.reminder_plan,
                     tag_ids,
+                    detail_lines: Vec::new(),
                 });
             }
             result.changed = true;
@@ -2097,7 +2109,8 @@ fn read_settings(connection: &Connection) -> AppResult<Settings> {
                     repeat_unacknowledged_enabled, unacknowledged_repeat_minutes,
                     smtp_enabled, smtp_host, smtp_port, smtp_security,
                     smtp_from, smtp_to, smtp_username, smtp_repeat_must_complete,
-                    repeat_default_time_first, repeat_default_time_second
+                    repeat_default_time_first, repeat_default_time_second,
+                    important_default_reminder_plan, repeat_detailed_notifications_enabled
              FROM app_settings WHERE id = 1",
             [],
             |row| {
@@ -2132,6 +2145,8 @@ fn read_settings(connection: &Connection) -> AppResult<Settings> {
                     smtp_to: row.get(18)?,
                     smtp_username: row.get(19)?,
                     smtp_repeat_must_complete: row.get::<_, i64>(20)? != 0,
+                    important_default_reminder_plan: row.get(23)?,
+                    repeat_detailed_notifications_enabled: row.get::<_, i64>(24)? != 0,
                     event_kind_defaults: Vec::new(),
                 })
             },
@@ -2168,7 +2183,8 @@ fn item_select() -> &'static str {
             i.deleted_at, i.event_kind, i.reminder_plan, i.important, i.time_mode,
             i.start_at, i.end_at, i.target_at, i.lead_value, i.lead_unit,
             i.cadence_value, i.cadence_unit, i.emphasis_max_per_day,
-            i.repeat_time_mode, i.repeat_time_first, i.repeat_time_second
+            i.repeat_time_mode, i.repeat_time_first, i.repeat_time_second,
+            i.reminder_plan_source
      FROM items i LEFT JOIN categories c ON c.id = i.category_id"
 }
 
@@ -2215,6 +2231,7 @@ fn row_to_item(row: &Row<'_>) -> rusqlite::Result<Item> {
         .into_iter()
         .flatten()
         .collect(),
+        reminder_plan_source: row.get(36)?,
         tags: Vec::new(),
     })
 }
@@ -2406,6 +2423,7 @@ fn insert_item_event(
 struct ResolvedEventConfig {
     kind: Option<String>,
     reminder_plan: String,
+    reminder_plan_source: String,
     important: bool,
     start_at: Option<String>,
     end_at: Option<String>,
@@ -2424,6 +2442,7 @@ impl ResolvedEventConfig {
         Self {
             kind: item.event_kind.clone(),
             reminder_plan: item.reminder_plan.clone(),
+            reminder_plan_source: item.reminder_plan_source.clone(),
             important: item.important,
             start_at: item.start_at.clone(),
             end_at: item.end_at.clone(),
@@ -2452,6 +2471,12 @@ fn resolve_event_config(
         .or_else(|| legacy_must_complete.then(|| "TODAY_MUST".to_string()));
     let reminder_plan = if let Some(plan) = input.and_then(|event| event.reminder_plan.clone()) {
         plan
+    } else if input.is_some_and(|event| event.important) {
+        connection.query_row(
+            "SELECT important_default_reminder_plan FROM app_settings WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?
     } else if let Some(kind) = &kind {
         connection.query_row(
             "SELECT reminder_plan FROM event_kind_defaults WHERE event_kind = ?1",
@@ -2462,6 +2487,15 @@ fn resolve_event_config(
         "REPEAT".into()
     };
     let input = input.cloned().unwrap_or_default();
+    let reminder_plan_source = input.reminder_plan_source.clone().unwrap_or_else(|| {
+        if input.reminder_plan.is_some() {
+            "ITEM_OVERRIDE".into()
+        } else if input.important {
+            "IMPORTANT_DEFAULT".into()
+        } else {
+            "EVENT_KIND_DEFAULT".into()
+        }
+    });
     let cadence_value = input
         .cadence_value
         .or_else(|| (reminder_plan == "CUSTOM").then_some(1));
@@ -2471,6 +2505,7 @@ fn resolve_event_config(
     Ok(ResolvedEventConfig {
         kind,
         reminder_plan,
+        reminder_plan_source,
         important: input.important,
         start_at: input.start_at,
         end_at: input.end_at,
@@ -2590,6 +2625,25 @@ fn initial_next_reminder(
         due_at
     };
     Ok(candidate.max(now).to_rfc3339())
+}
+
+fn next_future_reminder_after_reopen(item: &Item, now: DateTime<Utc>) -> AppResult<Option<String>> {
+    let due = DateTime::parse_from_rfc3339(&item.due_at)
+        .map_err(|_| AppError::Validation("原提醒时间无法识别，请先调整时间".into()))?
+        .with_timezone(&Utc);
+    if due > now {
+        return Ok(Some(due.to_rfc3339()));
+    }
+    let next = match item.reminder_plan.as_str() {
+        "REPEAT" => Some(next_repeat_slot_after(now, &item.repeat_times)?),
+        "EMPHASIS" | "FORCE" => {
+            Some(now + Duration::minutes(i64::from(item.repeat_interval_minutes.unwrap_or(30))))
+        }
+        "CUSTOM" => Some(next_daily_at(now, parse_time(&item.due_local_time)?)?),
+        "ONCE" => None,
+        _ => None,
+    };
+    Ok(next.map(|value| value.to_rfc3339()))
 }
 
 fn next_after_delivery(
@@ -3077,6 +3131,7 @@ fn run_migrations(connection: &mut Connection, version: i64) -> AppResult<()> {
         (9, MIGRATION_0009),
         (10, MIGRATION_0010),
         (11, MIGRATION_0011),
+        (12, MIGRATION_0012),
     ];
     for (migration_version, sql) in migrations {
         if version < migration_version {
@@ -3474,6 +3529,7 @@ mod tests {
         EventConfigurationInput {
             kind: Some(kind.into()),
             reminder_plan: Some(reminder_plan.into()),
+            reminder_plan_source: Some("ITEM_OVERRIDE".into()),
             important: false,
             start_at: None,
             end_at: None,
@@ -3819,6 +3875,9 @@ mod tests {
                     smtp_to: current.smtp_to,
                     smtp_username: current.smtp_username,
                     smtp_repeat_must_complete: current.smtp_repeat_must_complete,
+                    important_default_reminder_plan: current.important_default_reminder_plan,
+                    repeat_detailed_notifications_enabled: current
+                        .repeat_detailed_notifications_enabled,
                     smtp_password: None,
                     event_kind_defaults: current.event_kind_defaults,
                 },
@@ -4077,6 +4136,62 @@ mod tests {
     }
 
     #[test]
+    fn event_kind_and_important_items_resolve_their_configured_defaults() {
+        let database = Database::in_memory().unwrap();
+        let now = at_local(2026, 9, 15, 10, 0);
+        let mut ordinary = event("ORDINARY", "ONCE");
+        ordinary.reminder_plan = None;
+        ordinary.reminder_plan_source = None;
+        let ordinary_item = create_configured_item(
+            &database,
+            "普通默认",
+            now + chrono::Duration::hours(1),
+            ordinary,
+            now,
+        );
+        assert_eq!(ordinary_item.reminder_plan, "REPEAT");
+        assert_eq!(ordinary_item.reminder_plan_source, "EVENT_KIND_DEFAULT");
+
+        let mut important = event("ORDINARY", "ONCE");
+        important.reminder_plan = None;
+        important.reminder_plan_source = None;
+        important.important = true;
+        let important_item = create_configured_item(
+            &database,
+            "重要默认",
+            now + chrono::Duration::hours(2),
+            important,
+            now,
+        );
+        assert_eq!(important_item.reminder_plan, "EMPHASIS");
+        assert_eq!(important_item.reminder_plan_source, "IMPORTANT_DEFAULT");
+    }
+
+    #[test]
+    fn reopening_completed_item_never_backfills_an_expired_once_reminder() {
+        let database = Database::in_memory().unwrap();
+        let due = at_local(2026, 9, 15, 9, 0);
+        let item = create_configured_item(
+            &database,
+            "已过期的一次提醒",
+            due,
+            event("ONE_TIME", "ONCE"),
+            due - chrono::Duration::hours(1),
+        );
+        database
+            .set_item_completed(&item.id, true, due - chrono::Duration::minutes(30))
+            .unwrap();
+
+        let reopened = database
+            .set_item_completed(&item.id, false, due + chrono::Duration::hours(2))
+            .unwrap();
+
+        assert_eq!(reopened.status, "OPEN");
+        assert!(reopened.completed_at.is_none());
+        assert!(reopened.next_reminder_at.is_none());
+    }
+
+    #[test]
     fn changing_default_time_for_new_items_keeps_existing_due_time() {
         let database = Database::in_memory().unwrap();
         let now = at_local(2026, 8, 27, 10, 0);
@@ -4121,6 +4236,9 @@ mod tests {
                     smtp_to: current.smtp_to,
                     smtp_username: current.smtp_username,
                     smtp_repeat_must_complete: current.smtp_repeat_must_complete,
+                    important_default_reminder_plan: current.important_default_reminder_plan,
+                    repeat_detailed_notifications_enabled: current
+                        .repeat_detailed_notifications_enabled,
                     smtp_password: None,
                     event_kind_defaults: current.event_kind_defaults,
                 },

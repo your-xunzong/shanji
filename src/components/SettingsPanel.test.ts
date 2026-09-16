@@ -26,6 +26,8 @@ const settings: Settings = {
   smtpTo: '',
   smtpUsername: '',
   smtpRepeatMustComplete: false,
+  importantDefaultReminderPlan: 'EMPHASIS',
+  repeatDetailedNotificationsEnabled: false,
   eventKindDefaults: [
     { eventKind: 'ORDINARY', reminderPlan: 'REPEAT' },
     { eventKind: 'ONE_TIME', reminderPlan: 'ONCE' },
@@ -111,6 +113,8 @@ describe('SettingsPanel', () => {
     await fireEvent.change(screen.getByLabelText(/^今日必做/), { target: { value: 'FORCE' } });
     await fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
+      importantDefaultReminderPlan: 'EMPHASIS',
+      repeatDetailedNotificationsEnabled: false,
       eventKindDefaults: expect.arrayContaining([
         { eventKind: 'TODAY_MUST', reminderPlan: 'FORCE' },
       ]),

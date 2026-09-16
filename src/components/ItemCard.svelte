@@ -8,7 +8,7 @@
     nextReminderLabel,
     toLocalDateTimeInput,
   } from '../lib/presentation';
-  import type { Category, EventKind, Item, ReminderPlan, RepeatTimeMode, ScheduleUnit, Tag, UpdateItemInput } from '../lib/types';
+  import type { Category, EventKind, EventKindDefault, Item, ReminderPlan, ReminderPlanSource, RepeatTimeMode, ScheduleUnit, Tag, UpdateItemInput } from '../lib/types';
 
   export let item: Item;
   export let busy = false;
@@ -18,6 +18,8 @@
   export let categories: Category[] = [];
   export let tags: Tag[] = [];
   export let repeatDefaultTimes: string[] = ['10:00', '17:00'];
+  export let eventKindDefaults: EventKindDefault[] = [];
+  export let importantDefaultReminderPlan: ReminderPlan = 'EMPHASIS';
   export let onUpdate: (item: Item, input: UpdateItemInput) => Promise<void>;
   export let onDelete: (item: Item, deleted: boolean) => Promise<void>;
   export let onPermanentDelete: (item: Item) => Promise<void>;
@@ -35,6 +37,7 @@
   let repeatDraft = 30;
   let eventKindDraft: EventKind | '' = '';
   let reminderPlanDraft: ReminderPlan = 'ONCE';
+  let reminderPlanSourceDraft: ReminderPlanSource = 'MIGRATED';
   let importantDraft = false;
   let startDraft = '';
   let endDraft = '';
@@ -91,6 +94,7 @@
     repeatDraft = item.repeatIntervalMinutes ?? 30;
     eventKindDraft = item.eventKind ?? '';
     reminderPlanDraft = item.reminderPlan;
+    reminderPlanSourceDraft = item.reminderPlanSource;
     importantDraft = item.important;
     startDraft = item.startAt ? toLocalDateTimeInput(item.startAt) : '';
     endDraft = item.endAt ? toLocalDateTimeInput(item.endAt) : '';
@@ -117,6 +121,49 @@
   function useDefaultRepeatTimes(): void {
     if (repeatTimeModeDraft !== 'DEFAULT') repeatTimesDraft = [...repeatDefaultTimes];
     repeatTimeModeDraft = 'DEFAULT';
+  }
+
+  function defaultPlan(kind: EventKind | '', important: boolean): ReminderPlan {
+    if (important) return importantDefaultReminderPlan;
+    if (!kind) return 'REPEAT';
+    return eventKindDefaults.find((entry) => entry.eventKind === kind)?.reminderPlan ?? 'ONCE';
+  }
+
+  function applyReminderDefault(kind = eventKindDraft, important = importantDraft): void {
+    reminderPlanDraft = defaultPlan(kind, important);
+    reminderPlanSourceDraft = important ? 'IMPORTANT_DEFAULT' : 'EVENT_KIND_DEFAULT';
+    if (reminderPlanDraft === 'REPEAT') {
+      repeatTimeModeDraft = 'DEFAULT';
+      repeatTimesDraft = [...repeatDefaultTimes];
+    }
+  }
+
+  function changeEventKind(value: string): void {
+    const next = value as EventKind | '';
+    if (next === eventKindDraft) return;
+    eventKindDraft = next;
+    applyReminderDefault(next, importantDraft);
+  }
+
+  function changeImportant(checked: boolean): void {
+    if (checked === importantDraft) return;
+    importantDraft = checked;
+    applyReminderDefault(eventKindDraft, checked);
+  }
+
+  function changeReminderPlan(value: string): void {
+    reminderPlanDraft = value as ReminderPlan;
+    reminderPlanSourceDraft = 'ITEM_OVERRIDE';
+  }
+
+  function reminderSourceLabel(source: ReminderPlanSource, kind: EventKind | ''): string {
+    if (source === 'ITEM_OVERRIDE') return '已为此事项单独设置';
+    if (source === 'IMPORTANT_DEFAULT') return '跟随“重要事项”默认';
+    if (source === 'EVENT_KIND_DEFAULT') {
+      const label = EVENT_KIND_OPTIONS.find((entry) => entry.value === kind)?.label ?? '待选择事件';
+      return `跟随“${label}”默认`;
+    }
+    return '沿用升级前设置';
   }
 
   async function saveItem(): Promise<void> {
@@ -154,6 +201,7 @@
         event: {
           kind: eventKindDraft || null,
           reminderPlan: reminderPlanDraft,
+          reminderPlanSource: reminderPlanSourceDraft,
           important: importantDraft,
           startAt: localInputToIso(startDraft),
           endAt: localInputToIso(endDraft),
@@ -231,12 +279,13 @@
       <div class="item-editor">
         <label class="editor-wide"><span>事项内容</span><input type="text" maxlength="4000" bind:value={titleDraft} /></label>
         <label class="editor-wide"><span>备注</span><textarea rows="2" bind:value={notesDraft}></textarea></label>
-        <label><span>事件类型</span><select bind:value={eventKindDraft}><option value="">稍后选择事件类型</option>{#each EVENT_KIND_OPTIONS as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
+        <label><span>事件类型</span><select value={eventKindDraft} on:change={(event) => changeEventKind(event.currentTarget.value)}><option value="">稍后选择事件类型</option>{#each EVENT_KIND_OPTIONS as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
         <label><span>类型</span><select bind:value={categoryDraft}><option value={null}>未分类</option>{#each categories as category}<option value={category.id}>{category.name}</option>{/each}</select></label>
-        <label><span>提醒方案</span><select bind:value={reminderPlanDraft}>{#each REMINDER_PLAN_OPTIONS as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
+        <label><span>提醒方案</span><select value={reminderPlanDraft} on:change={(event) => changeReminderPlan(event.currentTarget.value)}>{#each REMINDER_PLAN_OPTIONS as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
+        <div class="editor-wide reminder-source-track"><span>{reminderSourceLabel(reminderPlanSourceDraft, eventKindDraft)} → {REMINDER_PLAN_OPTIONS.find((entry) => entry.value === reminderPlanDraft)?.label}</span>{#if reminderPlanSourceDraft === 'ITEM_OVERRIDE' || reminderPlanSourceDraft === 'MIGRATED'}<button class="text-mini" type="button" on:click={() => applyReminderDefault()}>恢复默认</button>{/if}</div>
         <label><span>提醒时间</span><input type="datetime-local" bind:value={dueDraft} /></label>
         <div class="editor-wide tag-picker"><span>标签</span><div>{#each tags as tag}<button type="button" class:active={tagDrafts.includes(tag.id)} style={`--tag-color:${tag.color}`} on:click={() => toggleTag(tag.id)}>{tag.name}</button>{/each}{#if tags.length === 0}<small>可在“整理方式”中添加</small>{/if}</div></div>
-        <label class="editor-check editor-wide"><input type="checkbox" bind:checked={importantDraft} /><span>标记为重要</span></label>
+        <label class="editor-check editor-wide"><input type="checkbox" checked={importantDraft} on:change={(event) => changeImportant(event.currentTarget.checked)} /><span>标记为重要</span></label>
         {#if reminderPlanDraft === 'EMPHASIS' || reminderPlanDraft === 'FORCE'}<label><span>再次提醒间隔</span><select bind:value={repeatDraft}><option value={15}>15 分钟</option><option value={30}>30 分钟</option><option value={60}>60 分钟</option><option value={120}>2 小时</option></select></label>{/if}
         {#if reminderPlanDraft === 'REPEAT'}
           <div class="editor-wide repeat-plan-editor">
@@ -278,6 +327,7 @@
     </div>
   {:else}
     <div class="item-actions">
+      {#if item.status === 'DONE'}<button class="time-action" disabled={busy} on:click={() => onComplete(item, false)}>恢复为未完成</button>{/if}
       <button class="time-action" disabled={busy} on:click={beginEdit}>编辑</button>
       {#if item.status === 'OPEN' && new Date(item.dueAt).getTime() >= Date.now()}<button class="time-action" disabled={busy} on:click={beginReschedule}>调整时间</button>{/if}
       {#if item.status === 'OPEN' && matchesSeries(item)}<button class="time-action" disabled={busy} on:click={() => onCompleteOccurrence(item)}>完成本次</button>{/if}

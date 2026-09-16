@@ -13,7 +13,7 @@
   import UpdatePanel from '../components/UpdatePanel.svelte';
   import '../workbench.css';
   import { api } from '../lib/api';
-  import currentReleaseNotesRaw from '../release-notes/v0.13.1.md?raw';
+  import currentReleaseNotesRaw from '../release-notes/v0.13.2.md?raw';
   import {
     cancelAppUpdateDownload,
     checkForAppUpdate,
@@ -41,6 +41,7 @@
     TaxonomyInput,
     UpdateItemInput,
     ExportFilterInput,
+    SummaryRequest,
     AppInfo,
     UpdateState,
   } from '../lib/types';
@@ -448,11 +449,17 @@
     busyItemId = item.id;
     error = '';
     try {
-      await api.setItemCompleted(item.id, completed);
+      const updated = await api.setItemCompleted(item.id, completed);
       await loadItems();
-      showToast(completed ? '事项已完成，提醒已停止' : '事项已恢复');
+      showToast(completed
+        ? '事项已完成，提醒已停止'
+        : !updated.nextReminderAt && new Date(updated.dueAt).getTime() < Date.now()
+          ? '已恢复为未完成；原提醒时间已过，可调整时间重新提醒'
+          : '已恢复为未完成，未来提醒已重新计算');
     } catch (cause) {
-      error = readableError(cause, '状态没有保存，事项保持原样。');
+      error = readableError(cause, completed
+        ? '状态没有保存，事项保持原样。'
+        : '没有恢复，事项仍是已完成；可以重试。');
     } finally {
       busyItemId = '';
     }
@@ -630,6 +637,44 @@
       showToast(`已导出 ${result.itemCount} 项：${result.path}`, 5000);
     } catch (cause) {
       error = readableError(cause, 'Excel 报表没有生成，请重新选择保存位置。');
+    } finally {
+      exporting = false;
+    }
+  }
+
+  async function chooseSummaryTemplate(): Promise<string | null> {
+    if (!isTauri()) return '闪记小结模板.docx';
+    const { open } = await import('@tauri-apps/plugin-dialog');
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      title: '选择 Word 小结模板',
+      filters: [{ name: 'Word 模板', extensions: ['docx'] }],
+    });
+    return typeof selected === 'string' ? selected : null;
+  }
+
+  async function generateWordSummary(request: SummaryRequest): Promise<void> {
+    if (exporting) return;
+    exporting = true;
+    error = '';
+    try {
+      const periodName = request.period === 'MONTH'
+        ? `${request.year}-${String(request.month).padStart(2, '0')}`
+        : `${request.year}-Q${request.quarter}`;
+      const defaultName = `闪记小结-${periodName}.docx`;
+      let path = defaultName;
+      if (isTauri()) {
+        const { save } = await import('@tauri-apps/plugin-dialog');
+        const selected = await save({ defaultPath: defaultName, filters: [{ name: 'Word 文档', extensions: ['docx'] }] });
+        if (!selected) return;
+        path = selected.toLowerCase().endsWith('.docx') ? selected : `${selected}.docx`;
+      }
+      const result = await api.generateWordSummary({ ...request, outputPath: path });
+      exportOpen = false;
+      showToast(`已生成${result.periodLabel}小结，共纳入 ${result.itemCount} 项：${result.path}`, 6000);
+    } catch (cause) {
+      error = readableError(cause, 'Word 小结没有生成，模板和已有文件没有改变。请检查模板后重试。');
     } finally {
       exporting = false;
     }
@@ -908,7 +953,7 @@
         {#if urgentCount > 0}
           <span class="urgent-summary"><span></span>{urgentCount} 项今日必做</span>
         {/if}
-        <button class="secondary-button export-button" disabled={exporting} on:click={() => (exportOpen = true)}>{exporting ? '正在导出…' : '导出 Excel'}</button>
+        <button class="secondary-button export-button" disabled={exporting} on:click={() => (exportOpen = true)}>{exporting ? '正在生成…' : '导出与小结'}</button>
         <button class="new-item-button" on:click={() => api.showCapture()}>
           <span aria-hidden="true">＋</span> 快速记录
         </button>
@@ -977,6 +1022,8 @@
             {categories}
             {tags}
             repeatDefaultTimes={settings?.repeatDefaultTimes ?? ['10:00', '17:00']}
+            eventKindDefaults={settings?.eventKindDefaults ?? []}
+            importantDefaultReminderPlan={settings?.importantDefaultReminderPlan ?? 'EMPHASIS'}
             onUpdate={updateItem}
             onDelete={deleteItem}
             onPermanentDelete={permanentlyDeleteItem}
@@ -1076,6 +1123,8 @@
       {exporting}
       onClose={() => (exportOpen = false)}
       onExport={exportExcel}
+      onChooseSummaryTemplate={chooseSummaryTemplate}
+      onGenerateSummary={generateWordSummary}
     />
   {/if}
 

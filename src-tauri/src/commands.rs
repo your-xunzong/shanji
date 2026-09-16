@@ -21,11 +21,16 @@ use crate::{
     export::{ExportFilterInput, export_items, filter_items},
     notification::NotificationStatus,
     repository::{
-        RepositoryPreview, RepositoryStatus, RepositorySyncResult, configure_repository,
-        disable_repository, preview_repository, publish_repository_snapshot, repository_status,
+        ConflictCleanupResult, RepositoryConflict, RepositoryPreview, RepositoryStatus,
+        RepositorySyncResult, configure_repository, deduplicate_repository_conflicts,
+        disable_repository, list_repository_conflicts, preview_repository,
+        publish_repository_snapshot, repository_status, resolve_repository_conflict,
         sync_repository,
     },
     startup::{StartupMode, StartupState, StartupStatus, ensure_recovery_candidate_allowed},
+    summary::{
+        SummaryRequest, SummaryResult, SummaryTemplatePreview, generate_summary, validate_template,
+    },
     timeline::{TimelineData, TimelineQuery, project_timeline, save_timeline_preference},
 };
 
@@ -86,6 +91,19 @@ pub fn list_items(filter: String, state: State<'_, AppState>) -> Result<Vec<Item
         .database
         .list_items(&filter, state.clock.now_utc())
         .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn validate_summary_template(path: String) -> Result<SummaryTemplatePreview, String> {
+    validate_template(std::path::Path::new(&path)).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn generate_word_summary(
+    request: SummaryRequest,
+    state: State<'_, AppState>,
+) -> Result<SummaryResult, String> {
+    generate_summary(&state.database, &request, state.clock.now_utc()).map_err(Into::into)
 }
 
 #[tauri::command]
@@ -898,6 +916,7 @@ pub fn test_reminder_mode(
                 event_kind: Some("TODAY_MUST".into()),
                 reminder_plan: "FORCE".into(),
                 tag_ids: Vec::new(),
+                detail_lines: Vec::new(),
             };
             let service = Arc::clone(&state.notifications);
             std::thread::spawn(move || {
@@ -922,6 +941,7 @@ pub fn test_reminder_mode(
                 event_kind: item.event_kind,
                 reminder_plan: item.reminder_plan,
                 tag_ids: Vec::new(),
+                detail_lines: Vec::new(),
             };
             crate::show_overlay_reminder(&app, &notification).map_err(String::from)?;
             Ok("置顶提醒窗已显示；关闭窗口不会把事项标记完成。".into())
@@ -1063,6 +1083,35 @@ pub fn sync_data_repository(
 }
 
 #[tauri::command]
+pub fn list_repository_conflict_items(
+    state: State<'_, AppState>,
+) -> Result<Vec<RepositoryConflict>, String> {
+    list_repository_conflicts(&state.database).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn deduplicate_data_repository(
+    state: State<'_, AppState>,
+) -> Result<ConflictCleanupResult, String> {
+    deduplicate_repository_conflicts(&state.database, state.clock.now_utc()).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn resolve_data_repository_conflict(
+    conflict_id: String,
+    resolution: String,
+    state: State<'_, AppState>,
+) -> Result<ConflictCleanupResult, String> {
+    resolve_repository_conflict(
+        &state.database,
+        &conflict_id,
+        &resolution,
+        state.clock.now_utc(),
+    )
+    .map_err(Into::into)
+}
+
+#[tauri::command]
 pub fn open_repository_directory(state: State<'_, AppState>) -> Result<(), String> {
     let status = repository_status(&state.database, state.clock.now_utc()).map_err(String::from)?;
     let path = status
@@ -1180,6 +1229,7 @@ pub(crate) fn insert_notification_test_item(
             event: Some(EventConfigurationInput {
                 kind: Some("ONE_TIME".into()),
                 reminder_plan: Some("ONCE".into()),
+                reminder_plan_source: Some("ITEM_OVERRIDE".into()),
                 important: false,
                 start_at: None,
                 end_at: None,

@@ -4,6 +4,7 @@ export type CompletionPolicy = 'NORMAL' | 'MUST_COMPLETE_TODAY';
 export type ItemFilter = 'open' | 'today' | 'overdue' | 'done' | 'deleted' | 'all';
 export type EventKind = 'ORDINARY' | 'ONE_TIME' | 'TODAY_MUST' | 'WARNING' | 'CONTINUOUS' | 'MONTHLY' | 'YEARLY';
 export type ReminderPlan = 'REPEAT' | 'EMPHASIS' | 'ONCE' | 'FORCE' | 'CUSTOM';
+export type ReminderPlanSource = 'EVENT_KIND_DEFAULT' | 'IMPORTANT_DEFAULT' | 'ITEM_OVERRIDE' | 'MIGRATED';
 export type ScheduleUnit = 'DAY' | 'WEEK' | 'MONTH' | 'YEAR';
 export type RepeatTimeMode = 'DEFAULT' | 'SPECIFIED';
 
@@ -15,6 +16,7 @@ export interface EventKindDefault {
 export interface EventConfigurationInput {
   kind: EventKind | null;
   reminderPlan: ReminderPlan | null;
+  reminderPlanSource?: ReminderPlanSource | null;
   important: boolean;
   startAt: string | null;
   endAt: string | null;
@@ -52,6 +54,7 @@ export interface Item {
   deletedAt: string | null;
   eventKind: EventKind | null;
   reminderPlan: ReminderPlan;
+  reminderPlanSource: ReminderPlanSource;
   important: boolean;
   timeMode: 'DEFAULT' | 'SPECIFIED';
   startAt: string | null;
@@ -90,6 +93,8 @@ export interface Settings {
   smtpTo: string;
   smtpUsername: string;
   smtpRepeatMustComplete: boolean;
+  importantDefaultReminderPlan: ReminderPlan;
+  repeatDetailedNotificationsEnabled: boolean;
   eventKindDefaults: EventKindDefault[];
 }
 
@@ -245,6 +250,35 @@ export interface ExportResult {
   itemCount: number;
 }
 
+export type SummaryPeriod = 'MONTH' | 'QUARTER';
+
+export interface SummaryRequest {
+  period: SummaryPeriod;
+  year: number;
+  month: number | null;
+  quarter: number | null;
+  templatePath: string;
+  outputPath: string;
+}
+
+export interface SummaryTemplatePreview {
+  templatePath: string;
+  placeholders: string[];
+  unsupportedPlaceholders: string[];
+  valid: boolean;
+  message: string;
+}
+
+export interface SummaryResult {
+  path: string;
+  itemCount: number;
+  completedCount: number;
+  openCount: number;
+  overdueCount: number;
+  importantCount: number;
+  periodLabel: string;
+}
+
 export interface ExportFilterInput {
   status: 'all' | 'open' | 'done';
   eventKind: EventKind | null;
@@ -285,6 +319,7 @@ export interface RepositorySourcePreview {
   itemCount: number;
   newItems: number;
   unchangedItems: number;
+  exactDuplicates?: number;
   conflicts: number;
   tombstones: number;
 }
@@ -293,9 +328,26 @@ export interface RepositoryPreview {
   sources: RepositorySourcePreview[];
   newItems: number;
   unchangedItems: number;
+  exactDuplicates?: number;
   conflicts: number;
   tombstones: number;
   settingsNeedReview: boolean;
+}
+
+export interface RepositoryConflict {
+  id: string;
+  detectedAt: string;
+  original: Item;
+  conflict: Item;
+  differingFields: string[];
+  identical: boolean;
+}
+
+export type RepositoryConflictResolution = 'KEEP_ORIGINAL' | 'KEEP_CONFLICT' | 'KEEP_BOTH';
+
+export interface ConflictCleanupResult {
+  mergedDuplicates: number;
+  remainingConflicts: number;
 }
 
 export interface RepositoryStatus {

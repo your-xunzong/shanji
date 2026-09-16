@@ -9,6 +9,7 @@ mod notification;
 mod repository;
 mod scheduler;
 mod startup;
+mod summary;
 mod timeline;
 
 use std::{
@@ -263,6 +264,8 @@ pub fn run() {
             commands::list_email_route_tag_ids,
             commands::set_tag_email_route,
             commands::export_excel,
+            commands::validate_summary_template,
+            commands::generate_word_summary,
             commands::load_draft,
             commands::save_draft,
             commands::hide_capture,
@@ -297,6 +300,9 @@ pub fn run() {
             commands::preview_repository_merge,
             commands::publish_data_repository_snapshot,
             commands::sync_data_repository,
+            commands::list_repository_conflict_items,
+            commands::deduplicate_data_repository,
+            commands::resolve_data_repository_conflict,
             commands::open_repository_directory,
             commands::open_release_page,
             commands::get_timeline,

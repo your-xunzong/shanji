@@ -2,7 +2,13 @@
   import { onMount } from 'svelte';
   import { isTauri } from '@tauri-apps/api/core';
   import { api } from '../lib/api';
-  import type { RepositoryPreview, RepositoryStatus, RepositorySyncResult } from '../lib/types';
+  import type {
+    RepositoryConflict,
+    RepositoryConflictResolution,
+    RepositoryPreview,
+    RepositoryStatus,
+    RepositorySyncResult,
+  } from '../lib/types';
 
   export let onClose: () => void;
   export let onItemsChanged: () => Promise<void> = async () => {};
@@ -17,6 +23,7 @@
   let retryChoose = false;
   let retrySnapshot = false;
   let statusMessage = '';
+  let conflicts: RepositoryConflict[] = [];
 
   onMount(() => void loadStatus());
 
@@ -27,6 +34,7 @@
     retrySnapshot = false;
     try {
       repository = await api.getRepositoryStatus();
+      conflicts = repository.conflictCount > 0 ? await api.listRepositoryConflicts() : [];
     } catch (cause) {
       error = readableError(cause, '个人仓库状态暂时无法读取。本机记录不受影响。');
     } finally {
@@ -119,6 +127,7 @@
     try {
       result = await api.syncDataRepository();
       repository = await api.getRepositoryStatus();
+      conflicts = repository.conflictCount > 0 ? await api.listRepositoryConflicts() : [];
       preview = null;
       await onItemsChanged();
       if (result.packageWritten) {
@@ -134,6 +143,51 @@
     } finally {
       busy = '';
     }
+  }
+
+  async function organizeConflicts(): Promise<void> {
+    if (busy) return;
+    busy = 'deduplicate';
+    error = '';
+    statusMessage = '';
+    try {
+      const cleanup = await api.deduplicateDataRepository();
+      conflicts = await api.listRepositoryConflicts();
+      repository = await api.getRepositoryStatus();
+      statusMessage = cleanup.mergedDuplicates > 0
+        ? `已自动收束 ${cleanup.mergedDuplicates} 组完全相同的内容；还有 ${cleanup.remainingConflicts} 组差异需要选择。`
+        : cleanup.remainingConflicts > 0 ? `没有完全相同的副本；还有 ${cleanup.remainingConflicts} 组差异需要选择。` : '没有需要整理的仓库冲突。';
+      if (cleanup.mergedDuplicates > 0) await onItemsChanged();
+    } catch {
+      error = '已有冲突没有改变。本机记录仍然安全，请重试。';
+    } finally {
+      busy = '';
+    }
+  }
+
+  async function resolveConflict(conflict: RepositoryConflict, resolution: RepositoryConflictResolution): Promise<void> {
+    if (busy) return;
+    const wording = resolution === 'KEEP_ORIGINAL' ? '保留本机版本并隐藏仓库副本'
+      : resolution === 'KEEP_CONFLICT' ? '保留仓库版本并隐藏本机版本'
+      : '两份都保留';
+    if (resolution !== 'KEEP_BOTH' && !confirm(`${wording}？被隐藏的记录仍保留在回收站和冲突解决记录中。`)) return;
+    busy = conflict.id;
+    error = '';
+    try {
+      const cleanup = await api.resolveDataRepositoryConflict(conflict.id, resolution);
+      conflicts = await api.listRepositoryConflicts();
+      repository = await api.getRepositoryStatus();
+      statusMessage = `这组冲突已处理；还有 ${cleanup.remainingConflicts} 组待选择。`;
+      await onItemsChanged();
+    } catch {
+      error = '这组冲突没有改变。本机内容仍然保留，请重试。';
+    } finally {
+      busy = '';
+    }
+  }
+
+  function reminderLabel(value: string): string {
+    return ({ REPEAT: '重复', EMPHASIS: '强调', ONCE: '一次', FORCE: '强制', CUSTOM: '自定义' } as Record<string, string>)[value] ?? value;
   }
 
   async function disableRepository(): Promise<void> {
@@ -198,12 +252,32 @@
           <div><strong>{repository.pendingSourceCount}</strong><span>待汇入来源</span></div><div><strong>{repository.conflictCount}</strong><span>待查看冲突</span></div><div><strong>{repository.packageCount}</strong><span>仓库数据包</span></div>
         </div>
 
+        {#if repository.conflictCount > 0 || conflicts.length > 0}
+          <section class="repository-conflicts" aria-labelledby="repository-conflicts-title">
+            <div class="repository-conflict-heading"><div><p class="eyebrow">不会静默删除差异</p><h3 id="repository-conflicts-title">处理仓库冲突</h3></div><button class="secondary-button" disabled={Boolean(busy)} on:click={organizeConflicts}>{busy === 'deduplicate' ? '正在整理…' : '整理已有冲突'}</button></div>
+            {#if conflicts.length === 0}
+              <p class="conflict-empty">状态显示有待处理冲突，但明细暂时无法读取。点击“整理已有冲突”重新检查。</p>
+            {/if}
+            {#each conflicts as conflict}
+              <article class="repository-conflict-card">
+                <header><strong>{conflict.original.title.replace('（冲突副本）', '')}</strong><span>{conflict.identical ? '内容完全相同' : `${conflict.differingFields.length} 个字段不同`}</span></header>
+                {#if conflict.differingFields.length > 0}<p>差异：{conflict.differingFields.join('、')}</p>{/if}
+                <div class="conflict-versions">
+                  <div><b>本机版本</b><span>{conflict.original.dueLocalDate} {conflict.original.dueLocalTime}</span><small>{reminderLabel(conflict.original.reminderPlan)}提醒</small></div>
+                  <div><b>仓库版本</b><span>{conflict.conflict.dueLocalDate} {conflict.conflict.dueLocalTime}</span><small>{reminderLabel(conflict.conflict.reminderPlan)}提醒</small></div>
+                </div>
+                <footer><button class="text-mini" disabled={Boolean(busy)} on:click={() => resolveConflict(conflict, 'KEEP_ORIGINAL')}>保留本机</button><button class="text-mini" disabled={Boolean(busy)} on:click={() => resolveConflict(conflict, 'KEEP_CONFLICT')}>保留仓库</button><button class="text-mini" disabled={Boolean(busy)} on:click={() => resolveConflict(conflict, 'KEEP_BOTH')}>两份都保留</button></footer>
+              </article>
+            {/each}
+          </section>
+        {/if}
+
         <button class="primary-button repository-preview-button" disabled={Boolean(busy) || !repository.available} on:click={previewMerge}>{busy === 'preview' ? '正在检查…' : '检查其他设备的数据'}</button>
 
         {#if preview}
           <section class="merge-preview" aria-labelledby="merge-preview-title">
             <div><p class="eyebrow">尚未改变本机记录</p><h3 id="merge-preview-title">本次同步预览</h3></div>
-            <div class="merge-counts"><span><strong>{preview.newItems}</strong> 新增</span><span><strong>{preview.unchangedItems}</strong> 已有</span><span class:has-conflict={preview.conflicts > 0}><strong>{preview.conflicts}</strong> 冲突</span><span><strong>{preview.tombstones}</strong> 删除记录</span></div>
+            <div class="merge-counts"><span><strong>{preview.newItems}</strong> 新增</span><span><strong>{preview.unchangedItems}</strong> 已有</span><span><strong>{preview.exactDuplicates ?? 0}</strong> 完全重复</span><span class:has-conflict={preview.conflicts > 0}><strong>{preview.conflicts}</strong> 有差异</span><span><strong>{preview.tombstones}</strong> 删除记录</span></div>
             {#each preview.sources as source}
               <div class="repository-source"><div><strong>{source.sourceInstanceId === '另一台设备' ? source.sourceInstanceId : `设备 ${source.sourceInstanceId.slice(0, 8)}`}</strong><small>{formatDate(source.exportedAt)} · 共 {source.itemCount} 条</small></div><span>+{source.newItems} / 冲突 {source.conflicts}</span></div>
             {/each}
