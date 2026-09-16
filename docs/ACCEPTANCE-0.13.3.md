@@ -40,7 +40,13 @@
 3. 强调、一次性、强制和自定义通知不得因此改变内容或频率。
 4. Windows、macOS、Linux 分别记录系统通知中心的折叠或截断情况；若详情不可见，正文点击与既有操作仍必须可用。
 
-## F. 发布门槛
+## F. 开机启动
+
+1. 在 Windows 启用开机启动并保存，确认 `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run` 中出现闪记启动项；注销并重新登录后，闪记以后台模式启动。
+2. 保留数据库中的启用偏好但手动移除测试环境的系统启动项，再次勾选并保存：启动项必须重建，不得只显示“设置已保存”。
+3. 关闭开机启动并保存：启动项应移除；模拟系统拒绝写入时，界面应说明没有保存，数据库偏好和系统状态保持原样。
+
+## G. 发布门槛
 
 - 从 schema 11 的数据副本升级，确认自动备份、schema 12、旧事项“旧数据保留”和失败恢复。
 - 运行 `pnpm check`、`pnpm test`、`pnpm build`、`pnpm version:check`、`pnpm installer:check`，以及 Rust 格式、Clippy 和测试。

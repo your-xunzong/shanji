@@ -342,12 +342,11 @@ pub fn update_settings(
         return Err("启用邮件通知前，请填写 SMTP 密码并保存。".into());
     }
     let shortcut_changed = previous.global_shortcut != next.global_shortcut;
-    let autostart_changed = previous.autostart_enabled != next.autostart_enabled;
-    let autostart_before = if autostart_changed {
-        Some(read_autostart(&app)?)
-    } else {
-        None
-    };
+    let autostart_before = autostart_reconciliation(
+        previous.autostart_enabled,
+        read_autostart(&app),
+        next.autostart_enabled,
+    )?;
 
     if shortcut_changed {
         let shortcuts = app.global_shortcut();
@@ -444,6 +443,19 @@ fn read_autostart(app: &AppHandle) -> Result<bool, String> {
     app.autolaunch()
         .is_enabled()
         .map_err(|error| format!("无法读取系统开机启动状态：{error}"))
+}
+
+fn autostart_reconciliation(
+    persisted: bool,
+    actual: Result<bool, String>,
+    desired: bool,
+) -> Result<Option<bool>, String> {
+    match actual {
+        Ok(actual) if actual != desired => Ok(Some(actual)),
+        Ok(_) => Ok(None),
+        Err(error) if persisted != desired => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 fn set_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
@@ -1245,4 +1257,34 @@ pub(crate) fn insert_notification_test_item(
         },
         now,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::autostart_reconciliation;
+
+    #[test]
+    fn autostart_reconciles_the_system_even_when_the_saved_preference_already_matches() {
+        assert_eq!(
+            autostart_reconciliation(true, Ok(false), true).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            autostart_reconciliation(false, Ok(false), true).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            autostart_reconciliation(true, Ok(true), true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn autostart_read_failure_only_blocks_an_explicit_preference_change() {
+        assert!(autostart_reconciliation(false, Err("unavailable".into()), true).is_err());
+        assert_eq!(
+            autostart_reconciliation(true, Err("unavailable".into()), true).unwrap(),
+            None
+        );
+    }
 }
