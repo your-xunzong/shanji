@@ -23,14 +23,18 @@ const WINDOWS_PORTABLE_REGISTRY_PATH: &str =
 const NOTIFICATION_ICON: &[u8] = include_bytes!("../icons/128x128.png");
 
 #[cfg(any(windows, test))]
-const WINDOWS_PERSISTENT_ACTIONS: [(&str, &str); 2] =
-    [("完成", "complete"), ("15 分钟后", "snooze")];
+fn windows_persistent_actions(minutes: u32) -> [(String, String); 2] {
+    [
+        ("完成".into(), "complete".into()),
+        (format!("{minutes} 分钟后"), format!("snooze:{minutes}")),
+    ]
+}
 
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowsNotificationAction {
     Complete,
-    Snooze,
+    Snooze(u32),
     Open,
 }
 
@@ -38,7 +42,13 @@ enum WindowsNotificationAction {
 fn windows_notification_action(action: Option<&str>) -> WindowsNotificationAction {
     match action {
         Some("complete") => WindowsNotificationAction::Complete,
-        Some("snooze") => WindowsNotificationAction::Snooze,
+        Some("snooze") => WindowsNotificationAction::Snooze(15),
+        Some(action) if action.starts_with("snooze:") => action[7..]
+            .parse::<u32>()
+            .ok()
+            .filter(|minutes| (5..=240).contains(minutes))
+            .map(WindowsNotificationAction::Snooze)
+            .unwrap_or(WindowsNotificationAction::Open),
         _ => WindowsNotificationAction::Open,
     }
 }
@@ -374,8 +384,8 @@ impl NotificationService {
             });
         if persistent {
             toast = toast.scenario(Scenario::Reminder);
-            for (label, action) in WINDOWS_PERSISTENT_ACTIONS {
-                toast = toast.add_button(label, action);
+            for (label, action) in windows_persistent_actions(notification.snooze_minutes) {
+                toast = toast.add_button(&label, &action);
             }
         }
         toast.show().map_err(|error| DeliveryError {
@@ -483,10 +493,10 @@ fn handle_notification_action(app: &AppHandle, item_id: &str, action: Option<&st
                 }
             }
         }
-        WindowsNotificationAction::Snooze => {
+        WindowsNotificationAction::Snooze(minutes) => {
             if let Some(state) = app.try_state::<crate::AppState>() {
                 let now = state.clock.now_utc();
-                if state.database.snooze_item(item_id, 15, now).is_ok() {
+                if state.database.snooze_item(item_id, minutes, now).is_ok() {
                     state.scheduler.wake();
                     crate::update_tray_reminder_count(app, &state.database, now);
                     let _ = app.emit("items_changed", ());
@@ -534,19 +544,23 @@ fn handle_classification_action(app: &AppHandle, item_id: Option<&str>, action: 
 #[cfg(test)]
 mod tests {
     use super::{
-        WINDOWS_PERSISTENT_ACTIONS, WindowsNotificationAction, windows_notification_action,
+        WindowsNotificationAction, windows_notification_action, windows_persistent_actions,
     };
 
     #[test]
     fn persistent_notification_keeps_two_compact_quick_actions() {
+        let actions = windows_persistent_actions(45);
         assert_eq!(
-            WINDOWS_PERSISTENT_ACTIONS,
-            [("完成", "complete"), ("15 分钟后", "snooze")]
+            actions,
+            [
+                ("完成".into(), "complete".into()),
+                ("45 分钟后".into(), "snooze:45".into())
+            ]
         );
-        assert!(
-            WINDOWS_PERSISTENT_ACTIONS
-                .iter()
-                .all(|(label, _)| label.chars().count() <= 6)
+        assert!(actions.iter().all(|(label, _)| label.chars().count() <= 6));
+        assert_eq!(
+            windows_notification_action(Some("snooze:45")),
+            WindowsNotificationAction::Snooze(45)
         );
     }
 

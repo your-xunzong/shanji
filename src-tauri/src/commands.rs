@@ -8,7 +8,7 @@ use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 use crate::{
     AppState, candidate_database_paths,
-    db::{DataFileSummary, DataStatus, Database, UpdateState, stage_database_restore},
+    db::{DataFileSummary, DataStatus, Database, ItemCounts, UpdateState, stage_database_restore},
     domain::{
         Category, CreateItemInput, EventConfigurationInput, Item, Settings, Tag, TaxonomyInput,
         UpdateItemInput, UpdateSettingsInput,
@@ -90,6 +90,14 @@ pub fn list_items(filter: String, state: State<'_, AppState>) -> Result<Vec<Item
     state
         .database
         .list_items(&filter, state.clock.now_utc())
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn get_item_counts(state: State<'_, AppState>) -> Result<ItemCounts, String> {
+    state
+        .database
+        .item_counts(state.clock.now_utc())
         .map_err(Into::into)
 }
 
@@ -927,6 +935,7 @@ pub fn test_reminder_mode(
                 completion_policy: "MUST_COMPLETE_TODAY".into(),
                 event_kind: Some("TODAY_MUST".into()),
                 reminder_plan: "FORCE".into(),
+                snooze_minutes: 30,
                 tag_ids: Vec::new(),
                 detail_lines: Vec::new(),
             };
@@ -952,6 +961,7 @@ pub fn test_reminder_mode(
                 completion_policy: item.completion_policy,
                 event_kind: item.event_kind,
                 reminder_plan: item.reminder_plan,
+                snooze_minutes: 30,
                 tag_ids: Vec::new(),
                 detail_lines: Vec::new(),
             };
@@ -1133,13 +1143,18 @@ pub fn open_repository_directory(state: State<'_, AppState>) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub fn open_release_page(version: Option<String>) -> Result<(), String> {
+pub fn open_release_page(version: Option<String>, source: Option<String>) -> Result<(), String> {
+    let release_root = match source.as_deref().unwrap_or("GITHUB") {
+        "GITHUB" => "https://github.com/your-xunzong/shanji/releases",
+        "GITEE" => "https://gitee.com/wu_-ji/shanji/releases",
+        _ => return Err("无法识别更新来源。".into()),
+    };
     let url = match version {
         Some(version) if valid_release_version(&version) => {
-            format!("https://github.com/your-xunzong/shanji/releases/tag/v{version}")
+            format!("{release_root}/tag/v{version}")
         }
         Some(_) => return Err("无法识别要打开的版本。".into()),
-        None => "https://github.com/your-xunzong/shanji/releases".into(),
+        None => release_root.into(),
     };
     open_web_url(&url)
 }

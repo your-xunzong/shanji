@@ -223,13 +223,23 @@ jobs:
         run: |
           task_version="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json', 'utf8')).version")"
           task_notes="src/release-notes/v$task_version.md"
+          cp -R release-assets release-assets-gitee
           node scripts/create-update-manifest.mjs \
             --assets release-assets \
             --version "$task_version" \
             --repo "$GITHUB_REPOSITORY" \
+            --provider github \
             --notes "$task_notes" \
             --output release-assets/latest.json
+          node scripts/create-update-manifest.mjs \
+            --assets release-assets-gitee \
+            --version "$task_version" \
+            --repo "wu_-ji/shanji" \
+            --provider gitee \
+            --notes "$task_notes" \
+            --output release-assets-gitee/latest.json
           node -e "const m=require('./release-assets/latest.json'); if(Object.keys(m.platforms).length!==4) process.exit(1)"
+          node -e "const m=require('./release-assets-gitee/latest.json'); if(Object.keys(m.platforms).length!==4) process.exit(1)"
 
       - name: 生成 SHA-256 校验文件
         run: |
@@ -239,6 +249,14 @@ jobs:
             | xargs -0 sha256sum > SHA256SUMS.txt
           test -s SHA256SUMS.txt
           cat SHA256SUMS.txt
+
+      - name: 生成 Gitee SHA-256 校验文件
+        run: |
+          cd release-assets-gitee
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS.txt
+          test -s SHA256SUMS.txt
 
       - name: 创建或更新待确认草稿
         env:
@@ -257,3 +275,40 @@ jobs:
               --title "闪记 $GITHUB_REF_NAME" \
               --notes-file "$task_notes"
           fi
+
+      - name: 检查 Gitee 发布凭据
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_USERNAME: ${{ secrets.GITEE_USERNAME }}
+        run: test -n "$GITEE_TOKEN" && test -n "$GITEE_USERNAME"
+
+      - name: 同步源码与标签到 Gitee
+        shell: bash
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_USERNAME: ${{ secrets.GITEE_USERNAME }}
+        run: |
+          task_askpass="$RUNNER_TEMP/gitee-askpass.sh"
+          printf '#!/usr/bin/env bash\ncase "$1" in *Username*) printf "%%s" "$GITEE_USERNAME" ;; *) printf "%%s" "$GITEE_TOKEN" ;; esac\n' > "$task_askpass"
+          chmod 700 "$task_askpass"
+          git remote add gitee https://gitee.com/wu_-ji/shanji.git
+          GIT_ASKPASS="$task_askpass" GIT_TERMINAL_PROMPT=0 git push gitee HEAD:refs/heads/main --tags
+          task_local_tag="$(git rev-parse "$GITHUB_REF_NAME^{commit}")"
+          task_remote_tag="$(git ls-remote gitee "refs/tags/$GITHUB_REF_NAME^{}" | cut -f1)"
+          if [ -z "$task_remote_tag" ]; then
+            task_remote_tag="$(git ls-remote gitee "refs/tags/$GITHUB_REF_NAME" | cut -f1)"
+          fi
+          test "$task_remote_tag" = "$task_local_tag"
+
+      - name: 创建或更新 Gitee 预发布
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          task_version="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json', 'utf8')).version")"
+          node scripts/publish-gitee-release.mjs \
+            --owner wu_-ji \
+            --repo shanji \
+            --tag "$GITHUB_REF_NAME" \
+            --assets release-assets-gitee \
+            --notes "src/release-notes/v$task_version.md" \
+            --prerelease true

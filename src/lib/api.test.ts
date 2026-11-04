@@ -13,6 +13,7 @@ import type { Settings } from './types';
 const settings: Settings = {
   importantDefaultReminderPlan: 'EMPHASIS',
   repeatDetailedNotificationsEnabled: false,
+  showItemCounts: true,
   defaultDueTime: '18:00',
   repeatDefaultTimes: ['10:00', '17:00'],
   workdays: [1, 2, 3, 4, 5],

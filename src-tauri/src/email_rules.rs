@@ -561,7 +561,9 @@ fn digest_notifications(
 ) -> AppResult<Vec<DueNotification>> {
     let mut statement = connection.prepare(
         "SELECT MIN(q.reminder_event_id), i.id, i.title, i.due_local_date,
-                i.due_local_time, i.completion_policy, i.event_kind, i.reminder_plan
+                i.due_local_time, i.completion_policy, i.event_kind, i.reminder_plan,
+                COALESCE(i.repeat_interval_minutes,
+                  (SELECT overtime_interval_minutes FROM app_settings WHERE id = 1))
          FROM email_digest_queue q JOIN items i ON i.id = q.item_id
          WHERE q.recipient = ?1 AND q.local_date = ?2
          GROUP BY i.id, i.title, i.due_local_date, i.due_local_time,
@@ -579,6 +581,7 @@ fn digest_notifications(
                 completion_policy: row.get(5)?,
                 event_kind: row.get(6)?,
                 reminder_plan: row.get(7)?,
+                snooze_minutes: row.get(8)?,
                 tag_ids: Vec::new(),
                 detail_lines: Vec::new(),
             })
@@ -614,6 +617,7 @@ mod tests {
             completion_policy: "NORMAL".into(),
             event_kind: Some("ORDINARY".into()),
             reminder_plan: "REPEAT".into(),
+            snooze_minutes: 30,
             tag_ids: Vec::new(),
             detail_lines: Vec::new(),
         }

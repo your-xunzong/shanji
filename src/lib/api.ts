@@ -5,6 +5,7 @@ import type {
   AutostartStatus,
   Item,
   ItemFilter,
+  ItemCounts,
   NotificationStatus,
   SmtpStatus,
   OnboardingStatus,
@@ -74,7 +75,7 @@ function readPreviewUpdateState(): UpdateState {
     snoozedVersion: null,
     snoozedUntil: null,
     lastNotifiedVersion: null,
-    releaseNotesSeenVersion: '0.13.3',
+    releaseNotesSeenVersion: '0.14.0',
   };
   const saved = localStorage.getItem(UPDATE_STATE_KEY);
   const state = saved ? { ...defaults, ...JSON.parse(saved) } : defaults;
@@ -84,7 +85,7 @@ function readPreviewUpdateState(): UpdateState {
   return {
     ...state,
     shouldAutoCheck,
-    showCurrentReleaseNotes: state.releaseNotesSeenVersion !== '0.13.3',
+    showCurrentReleaseNotes: state.releaseNotesSeenVersion !== '0.14.0',
   };
 }
 
@@ -127,6 +128,7 @@ const defaultSettings: Settings = {
   smtpRepeatMustComplete: false,
   importantDefaultReminderPlan: 'EMPHASIS',
   repeatDetailedNotificationsEnabled: false,
+  showItemCounts: true,
   eventKindDefaults: [
     { eventKind: 'ORDINARY', reminderPlan: 'REPEAT' },
     { eventKind: 'ONE_TIME', reminderPlan: 'ONCE' },
@@ -514,7 +516,7 @@ export const api = {
     if (isTauri()) return call<AppInfo>('get_app_info');
     return {
       name: '闪记',
-      version: '0.13.3',
+      version: '0.14.0',
       copyright: '© 2026 闪记',
       portable: false,
       updateInstallMode: 'AUTOMATIC',
@@ -577,13 +579,16 @@ export const api = {
     return writePreviewUpdateState({ ...readPreviewUpdateState(), lastNotifiedVersion: version });
   },
 
-  async openReleasePage(version: string | null = null): Promise<void> {
+  async openReleasePage(version: string | null = null, source: 'GITHUB' | 'GITEE' = 'GITHUB'): Promise<void> {
     if (isTauri()) {
-      await call<void>('open_release_page', { version });
+      await call<void>('open_release_page', { version, source });
       return;
     }
     const suffix = version ? `/tag/v${encodeURIComponent(version)}` : '';
-    window.open(`https://github.com/your-xunzong/shanji/releases${suffix}`, '_blank', 'noopener,noreferrer');
+    const root = source === 'GITEE'
+      ? 'https://gitee.com/wu_-ji/shanji/releases'
+      : 'https://github.com/your-xunzong/shanji/releases';
+    window.open(`${root}${suffix}`, '_blank', 'noopener,noreferrer');
   },
 
   async setTrayUpdate(version: string | null): Promise<void> {
@@ -595,6 +600,19 @@ export const api = {
     return previewFilter(readPreviewItems(), filter).sort(
       (left, right) => new Date(left.dueAt).getTime() - new Date(right.dueAt).getTime(),
     );
+  },
+
+  async getItemCounts(): Promise<ItemCounts> {
+    if (isTauri()) return call<ItemCounts>('get_item_counts');
+    const items = readPreviewItems();
+    return {
+      open: previewFilter(items, 'open').length,
+      today: previewFilter(items, 'today').length,
+      overdue: previewFilter(items, 'overdue').length,
+      done: previewFilter(items, 'done').length,
+      deleted: previewFilter(items, 'deleted').length,
+      all: previewFilter(items, 'all').length,
+    };
   },
 
   async createItem(input: CreateItemInput): Promise<Item> {

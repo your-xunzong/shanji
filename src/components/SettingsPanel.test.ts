@@ -28,6 +28,7 @@ const settings: Settings = {
   smtpRepeatMustComplete: false,
   importantDefaultReminderPlan: 'EMPHASIS',
   repeatDetailedNotificationsEnabled: false,
+  showItemCounts: true,
   eventKindDefaults: [
     { eventKind: 'ORDINARY', reminderPlan: 'REPEAT' },
     { eventKind: 'ONE_TIME', reminderPlan: 'ONCE' },
@@ -115,6 +116,7 @@ describe('SettingsPanel', () => {
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
       importantDefaultReminderPlan: 'EMPHASIS',
       repeatDetailedNotificationsEnabled: false,
+      showItemCounts: true,
       eventKindDefaults: expect.arrayContaining([
         { eventKind: 'TODAY_MUST', reminderPlan: 'FORCE' },
       ]),

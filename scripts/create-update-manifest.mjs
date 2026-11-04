@@ -29,11 +29,13 @@ function signature(path) {
   return value;
 }
 
-function assetUrl(repository, tag, path) {
-  return `https://github.com/${repository}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(basename(path))}`;
+function assetUrl(provider, repository, tag, path) {
+  const root = provider === 'gitee' ? 'https://gitee.com' : 'https://github.com';
+  return `${root}/${repository}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(basename(path))}`;
 }
 
-export function createManifest({ assetsDirectory, version, repository, notesPath, publishedAt }) {
+export function createManifest({ assetsDirectory, version, repository, notesPath, publishedAt, provider = 'github' }) {
+  if (!['github', 'gitee'].includes(provider)) throw new Error(`Unsupported release provider: ${provider}`);
   const checkedVersion = safeVersion(version);
   const checkedRepository = safeRepository(repository);
   const tag = `v${checkedVersion}`;
@@ -46,7 +48,7 @@ export function createManifest({ assetsDirectory, version, repository, notesPath
 
   const platform = (path) => ({
     signature: signature(`${path}.sig`),
-    url: assetUrl(checkedRepository, tag, path),
+    url: assetUrl(provider, checkedRepository, tag, path),
   });
   const macosPlatform = platform(macos);
   return {
@@ -72,6 +74,7 @@ function main() {
     repository: args.get('repo'),
     notesPath: resolve(args.get('notes')),
     publishedAt: args.get('published-at') ?? new Date().toISOString(),
+    provider: args.get('provider') ?? 'github',
   });
   mkdirSync(dirname(output), { recursive: true });
   writeFileSync(output, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');

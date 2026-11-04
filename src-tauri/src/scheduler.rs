@@ -377,6 +377,7 @@ mod tests {
             smtp_repeat_must_complete: false,
             important_default_reminder_plan: "EMPHASIS".into(),
             repeat_detailed_notifications_enabled: false,
+            show_item_counts: true,
             event_kind_defaults: crate::domain::default_event_kind_defaults(),
         }
     }
@@ -395,6 +396,7 @@ mod tests {
             } else {
                 "ONCE".into()
             },
+            snooze_minutes: 30,
             tag_ids: Vec::new(),
             detail_lines: Vec::new(),
         }

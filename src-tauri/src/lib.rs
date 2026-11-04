@@ -1,3 +1,4 @@
+mod app_update;
 mod commands;
 mod db;
 mod domain;
@@ -50,6 +51,7 @@ pub struct AppState {
 
 pub fn run() {
     let builder = tauri::Builder::default()
+        .manage(app_update::AppUpdateManager::default())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let _ = show_main_window(app);
         }))
@@ -226,7 +228,13 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            app_update::check_app_update,
+            app_update::download_app_update,
+            app_update::cancel_app_update,
+            app_update::install_app_update,
+            app_update::clear_pending_app_update,
             commands::list_items,
+            commands::get_item_counts,
             commands::get_app_info,
             commands::create_item,
             commands::set_item_completed,

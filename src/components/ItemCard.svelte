@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import {
     EVENT_KIND_OPTIONS,
     REMINDER_PLAN_OPTIONS,
@@ -20,6 +21,7 @@
   export let repeatDefaultTimes: string[] = ['10:00', '17:00'];
   export let eventKindDefaults: EventKindDefault[] = [];
   export let importantDefaultReminderPlan: ReminderPlan = 'EMPHASIS';
+  export let forceDefaultIntervalMinutes = 30;
   export let onUpdate: (item: Item, input: UpdateItemInput) => Promise<void>;
   export let onDelete: (item: Item, deleted: boolean) => Promise<void>;
   export let onPermanentDelete: (item: Item) => Promise<void>;
@@ -51,6 +53,8 @@
   let repeatSpecifiedTimeDraft = '10:00';
   let repeatTimesDraft: string[] = ['10:00', '17:00'];
   let openedFromParent = false;
+  let titleInput: HTMLInputElement;
+  let cardElement: HTMLElement;
 
   $: timing = itemTiming(item);
   $: reminder = nextReminderLabel(item);
@@ -85,13 +89,13 @@
     }
   }
 
-  function beginEdit(): void {
+  async function beginEdit(): Promise<void> {
     titleDraft = item.title;
     notesDraft = item.notes;
     categoryDraft = item.categoryId;
     tagDrafts = item.tags.map((tag) => tag.id);
     dueDraft = toLocalDateTimeInput(item.dueAt);
-    repeatDraft = item.repeatIntervalMinutes ?? 30;
+    repeatDraft = item.repeatIntervalMinutes ?? forceDefaultIntervalMinutes;
     eventKindDraft = item.eventKind ?? '';
     reminderPlanDraft = item.reminderPlan;
     reminderPlanSourceDraft = item.reminderPlanSource;
@@ -110,6 +114,9 @@
     editError = '';
     editingItem = true;
     editingTime = false;
+    await tick();
+    titleInput?.focus();
+    titleInput?.select();
   }
 
   function toggleTag(id: string): void {
@@ -136,6 +143,7 @@
       repeatTimeModeDraft = 'DEFAULT';
       repeatTimesDraft = [...repeatDefaultTimes];
     }
+    if (reminderPlanDraft === 'FORCE') repeatDraft = forceDefaultIntervalMinutes;
   }
 
   function changeEventKind(value: string): void {
@@ -154,6 +162,29 @@
   function changeReminderPlan(value: string): void {
     reminderPlanDraft = value as ReminderPlan;
     reminderPlanSourceDraft = 'ITEM_OVERRIDE';
+    if (reminderPlanDraft === 'FORCE') repeatDraft = forceDefaultIntervalMinutes;
+  }
+
+  function handleDoubleClick(event: MouseEvent): void {
+    const target = event.target as HTMLElement;
+    if (busy || item.status === 'DELETED' || editingItem || target.closest('button, input, textarea, select, a, label')) return;
+    void beginEdit();
+  }
+
+  function handleEditorKeydown(event: KeyboardEvent): void {
+    const target = event.target as HTMLElement;
+    if (!editingItem || !target.closest('[data-item-editor]')) return;
+    if (event.isComposing) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      editingItem = false;
+      cardElement?.focus();
+      return;
+    }
+    if (event.key !== 'Enter' || event.shiftKey) return;
+    if (target.tagName === 'SELECT' || target.tagName === 'BUTTON' || (target.tagName === 'TEXTAREA' && event.shiftKey)) return;
+    event.preventDefault();
+    void saveItem();
   }
 
   function reminderSourceLabel(source: ReminderPlanSource, kind: EventKind | ''): string {
@@ -220,17 +251,24 @@
         },
       });
       editingItem = false;
+      await tick();
+      cardElement?.focus();
     } catch {
       editError = '修改没有保存，事项仍保持原样';
     }
   }
 </script>
 
+<svelte:window on:keydown={handleEditorKeydown} />
+
 <article
+  bind:this={cardElement}
   class="item-card"
   class:done={item.status === 'DONE'}
   class:urgent={item.completionPolicy === 'MUST_COMPLETE_TODAY'}
   data-item-id={item.id}
+  tabindex="-1"
+  on:dblclick={handleDoubleClick}
 >
   <div class="time-rail" data-tone={timing.tone} aria-hidden="true">
     {#if item.nextReminderAt && !item.reminderPaused}<span class="rail-tick"></span>{/if}
@@ -276,8 +314,8 @@
       </div>
     {/if}
     {#if editingItem}
-      <div class="item-editor">
-        <label class="editor-wide"><span>事项内容</span><input type="text" maxlength="4000" bind:value={titleDraft} /></label>
+      <form class="item-editor" data-item-editor on:submit|preventDefault={saveItem}>
+        <label class="editor-wide"><span>事项内容</span><input bind:this={titleInput} type="text" maxlength="4000" bind:value={titleDraft} /></label>
         <label class="editor-wide"><span>备注</span><textarea rows="2" bind:value={notesDraft}></textarea></label>
         <label><span>事件类型</span><select value={eventKindDraft} on:change={(event) => changeEventKind(event.currentTarget.value)}><option value="">稍后选择事件类型</option>{#each EVENT_KIND_OPTIONS as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
         <label><span>类型</span><select bind:value={categoryDraft}><option value={null}>未分类</option>{#each categories as category}<option value={category.id}>{category.name}</option>{/each}</select></label>
@@ -286,7 +324,7 @@
         <label><span>提醒时间</span><input type="datetime-local" bind:value={dueDraft} /></label>
         <div class="editor-wide tag-picker"><span>标签</span><div>{#each tags as tag}<button type="button" class:active={tagDrafts.includes(tag.id)} style={`--tag-color:${tag.color}`} on:click={() => toggleTag(tag.id)}>{tag.name}</button>{/each}{#if tags.length === 0}<small>可在“整理方式”中添加</small>{/if}</div></div>
         <label class="editor-check editor-wide"><input type="checkbox" checked={importantDraft} on:change={(event) => changeImportant(event.currentTarget.checked)} /><span>标记为重要</span></label>
-        {#if reminderPlanDraft === 'EMPHASIS' || reminderPlanDraft === 'FORCE'}<label><span>再次提醒间隔</span><select bind:value={repeatDraft}><option value={15}>15 分钟</option><option value={30}>30 分钟</option><option value={60}>60 分钟</option><option value={120}>2 小时</option></select></label>{/if}
+        {#if reminderPlanDraft === 'EMPHASIS' || reminderPlanDraft === 'FORCE'}<label><span>再次提醒间隔</span><input type="number" min="5" max="240" step="1" bind:value={repeatDraft} /></label>{/if}
         {#if reminderPlanDraft === 'REPEAT'}
           <div class="editor-wide repeat-plan-editor">
             <span>每天提醒时间</span>
@@ -314,9 +352,9 @@
           <label><span>每隔</span><input type="number" min="1" max="999" bind:value={cadenceValueDraft} /></label>
           <label><span>周期单位</span><select bind:value={cadenceUnitDraft}><option value="DAY">天</option><option value="WEEK">周</option><option value="MONTH">月</option><option value="YEAR">年</option></select></label>
         {/if}
-        <div class="editor-actions editor-wide"><button class="primary-mini" disabled={busy} on:click={saveItem}>保存修改</button><button class="text-mini" disabled={busy} on:click={() => (editingItem = false)}>取消</button></div>
+        <div class="editor-actions editor-wide"><button class="primary-mini" type="submit" disabled={busy}>保存修改</button><button class="text-mini" type="button" disabled={busy} on:click={() => (editingItem = false)}>取消</button></div>
         {#if editError}<span class="editor-wide" role="alert">{editError}</span>{/if}
-      </div>
+      </form>
     {/if}
   </div>
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import type { AppUpdate, UpdateDownloadProgress, UpdatePhase } from '../lib/updater';
+  import type { AppUpdate, UpdateDownloadProgress, UpdatePhase } from '../lib/dual-updater';
 
   export let phase: UpdatePhase;
   export let update: AppUpdate | null = null;
@@ -37,9 +37,9 @@
   }
 
   function releaseDate(value: string | null | undefined): string {
-    if (!value) return '发布日期以 GitHub Release 为准';
+    if (!value) return '发布日期以正式发布页为准';
     const parsed = new Date(value);
-    if (!Number.isFinite(parsed.getTime())) return '发布日期以 GitHub Release 为准';
+    if (!Number.isFinite(parsed.getTime())) return '发布日期以正式发布页为准';
     return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' }).format(parsed);
   }
 
@@ -85,7 +85,7 @@
     {#if phase === 'checking'}
       <div class="update-state" role="status">
         <span class="update-spinner" aria-hidden="true"></span>
-        <strong>正在连接 GitHub 检查新版本…</strong>
+        <strong>正在连接 GitHub 与 Gitee 检查新版本…</strong>
         <p>这不会上传事项、备注或本地路径。</p>
       </div>
     {:else if phase === 'upToDate'}
@@ -118,7 +118,7 @@
       {/if}
 
       {#if update && phase !== 'current'}
-        <p class="release-date">{releaseDate(update.date)}</p>
+        <p class="release-date">{releaseDate(update.date)} · 已选择{update.source === 'GITEE' ? ' Gitee' : ' GitHub'} 更新源{update.fallbackAvailable ? '，另一来源可在失败时接替' : update.mirrorStatus === 'OUT_OF_SYNC' ? '；镜像仍在同步，本次使用 GitHub' : '；当前仅一个来源可用'}</p>
       {/if}
 
       <section class="release-notes" aria-labelledby="release-notes-title">

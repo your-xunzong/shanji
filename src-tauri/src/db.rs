@@ -33,7 +33,8 @@ const MIGRATION_0009: &str = include_str!("../migrations/0009_email_delivery_rul
 const MIGRATION_0010: &str = include_str!("../migrations/0010_time_canvas.sql");
 const MIGRATION_0011: &str = include_str!("../migrations/0011_update_state.sql");
 const MIGRATION_0012: &str = include_str!("../migrations/0012_reminder_summary_conflicts.sql");
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 12;
+const MIGRATION_0013: &str = include_str!("../migrations/0013_item_counts_dual_update_consent.sql");
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 13;
 
 pub struct Database {
     pub(crate) connection: Mutex<Connection>,
@@ -76,6 +77,17 @@ pub struct UpdateState {
     pub show_current_release_notes: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemCounts {
+    pub open: u64,
+    pub today: u64,
+    pub overdue: u64,
+    pub done: u64,
+    pub deleted: u64,
+    pub all: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DueNotification {
@@ -87,6 +99,7 @@ pub struct DueNotification {
     pub completion_policy: String,
     pub event_kind: Option<String>,
     pub reminder_plan: String,
+    pub snooze_minutes: u32,
     pub tag_ids: Vec<String>,
     pub detail_lines: Vec<String>,
 }
@@ -239,6 +252,7 @@ impl Database {
         transaction.execute_batch(MIGRATION_0010)?;
         transaction.execute_batch(MIGRATION_0011)?;
         transaction.execute_batch(MIGRATION_0012)?;
+        transaction.execute_batch(MIGRATION_0013)?;
         transaction.commit()?;
         ensure_instance_id(&connection)?;
         Ok(Self {
@@ -351,7 +365,8 @@ impl Database {
         let connection = self.connection.lock().expect("database mutex poisoned");
         connection.execute(
             "UPDATE update_state
-             SET auto_check_enabled = ?1, permission_prompted = 1, updated_at = ?2
+             SET auto_check_enabled = ?1, permission_prompted = 1,
+                 permission_scope_version = 2, updated_at = ?2
              WHERE id = 1",
             params![bool_to_int(enabled), now.to_rfc3339()],
         )?;
@@ -365,7 +380,10 @@ impl Database {
     ) -> AppResult<UpdateState> {
         let connection = self.connection.lock().expect("database mutex poisoned");
         connection.execute(
-            "UPDATE update_state SET permission_prompted = 1, updated_at = ?1 WHERE id = 1",
+            "UPDATE update_state
+             SET auto_check_enabled = 0, permission_prompted = 1,
+                 permission_scope_version = 2, updated_at = ?1
+             WHERE id = 1",
             [now.to_rfc3339()],
         )?;
         read_update_state(&connection, now, current_version)
@@ -483,7 +501,8 @@ impl Database {
                 repeat_default_time_first = ?22,
                 repeat_default_time_second = ?23,
                 important_default_reminder_plan = ?24,
-                repeat_detailed_notifications_enabled = ?25
+                repeat_detailed_notifications_enabled = ?25,
+                show_item_counts = ?26
              WHERE id = 1",
             params![
                 settings.default_due_time,
@@ -511,6 +530,7 @@ impl Database {
                 settings.repeat_default_times[1],
                 settings.important_default_reminder_plan,
                 bool_to_int(settings.repeat_detailed_notifications_enabled),
+                bool_to_int(settings.show_item_counts),
             ],
         )?;
 
@@ -682,6 +702,39 @@ impl Database {
             item.tags = tags_by_item.remove(&item.id).unwrap_or_default();
         }
         Ok(items)
+    }
+
+    pub fn item_counts(&self, now: DateTime<Utc>) -> AppResult<ItemCounts> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let local_today = now
+            .with_timezone(&Local)
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let now_text = now.to_rfc3339();
+        connection
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'OPEN' AND due_local_date = ?1 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'OPEN' AND due_at < ?2 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'DONE' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'DELETED' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status != 'DELETED' THEN 1 ELSE 0 END)
+                 FROM items",
+                params![local_today, now_text],
+                |row| {
+                    Ok(ItemCounts {
+                        open: row.get::<_, Option<u64>>(0)?.unwrap_or(0),
+                        today: row.get::<_, Option<u64>>(1)?.unwrap_or(0),
+                        overdue: row.get::<_, Option<u64>>(2)?.unwrap_or(0),
+                        done: row.get::<_, Option<u64>>(3)?.unwrap_or(0),
+                        deleted: row.get::<_, Option<u64>>(4)?.unwrap_or(0),
+                        all: row.get::<_, Option<u64>>(5)?.unwrap_or(0),
+                    })
+                },
+            )
+            .map_err(AppError::from)
     }
 
     pub fn get_item(&self, id: &str) -> AppResult<Item> {
@@ -1477,7 +1530,9 @@ impl Database {
             let mut statement = transaction.prepare(
                 "SELECT d.id, COALESCE(d.recipient, (SELECT smtp_to FROM app_settings WHERE id = 1)),
                         d.reminder_event_id, i.id, i.title, i.due_local_date,
-                        i.due_local_time, i.completion_policy, i.event_kind, i.reminder_plan
+                        i.due_local_time, i.completion_policy, i.event_kind, i.reminder_plan,
+                        COALESCE(i.repeat_interval_minutes,
+                          (SELECT overtime_interval_minutes FROM app_settings WHERE id = 1))
                  FROM channel_deliveries d
                  JOIN items i ON i.id = d.item_id
                  WHERE d.channel = 'email' AND d.result = 'FAILED'
@@ -1510,6 +1565,7 @@ impl Database {
                             completion_policy: row.get(7)?,
                             event_kind: row.get(8)?,
                             reminder_plan: row.get(9)?,
+                            snooze_minutes: row.get(10)?,
                             tag_ids: Vec::new(),
                             detail_lines: Vec::new(),
                         },
@@ -1629,7 +1685,9 @@ impl Database {
         let stale_claims = {
             let mut statement = transaction.prepare(
                 "SELECT e.id, e.item_id, i.title, i.due_local_date, i.due_local_time,
-                        i.completion_policy, i.event_kind, i.reminder_plan
+                        i.completion_policy, i.event_kind, i.reminder_plan,
+                        COALESCE(i.repeat_interval_minutes,
+                          (SELECT overtime_interval_minutes FROM app_settings WHERE id = 1))
                  FROM reminder_events e
                  JOIN items i ON i.id = e.item_id
                  WHERE e.result = 'CLAIMED' AND e.sent_at <= ?1 AND i.status = 'OPEN'
@@ -1645,6 +1703,7 @@ impl Database {
                     completion_policy: row.get(5)?,
                     event_kind: row.get(6)?,
                     reminder_plan: row.get(7)?,
+                    snooze_minutes: row.get(8)?,
                     tag_ids: Vec::new(),
                     detail_lines: Vec::new(),
                 })
@@ -1813,6 +1872,9 @@ impl Database {
                     completion_policy: row.completion_policy,
                     event_kind: row.event_kind,
                     reminder_plan: row.reminder_plan,
+                    snooze_minutes: row
+                        .repeat_interval_minutes
+                        .unwrap_or(settings.overtime_interval_minutes),
                     tag_ids,
                     detail_lines: Vec::new(),
                 });
@@ -2110,7 +2172,8 @@ fn read_settings(connection: &Connection) -> AppResult<Settings> {
                     smtp_enabled, smtp_host, smtp_port, smtp_security,
                     smtp_from, smtp_to, smtp_username, smtp_repeat_must_complete,
                     repeat_default_time_first, repeat_default_time_second,
-                    important_default_reminder_plan, repeat_detailed_notifications_enabled
+                    important_default_reminder_plan, repeat_detailed_notifications_enabled,
+                    show_item_counts
              FROM app_settings WHERE id = 1",
             [],
             |row| {
@@ -2147,6 +2210,7 @@ fn read_settings(connection: &Connection) -> AppResult<Settings> {
                     smtp_repeat_must_complete: row.get::<_, i64>(20)? != 0,
                     important_default_reminder_plan: row.get(23)?,
                     repeat_detailed_notifications_enabled: row.get::<_, i64>(24)? != 0,
+                    show_item_counts: row.get::<_, i64>(25)? != 0,
                     event_kind_defaults: Vec::new(),
                 })
             },
@@ -3053,10 +3117,12 @@ fn read_update_state(
         snoozed_until,
         last_notified_version,
         release_notes_seen_version,
+        permission_scope_version,
     ) = connection.query_row(
         "SELECT auto_check_enabled, permission_prompted, last_checked_at,
                 last_check_result, snoozed_version, snoozed_until,
-                last_notified_version, release_notes_seen_version
+                last_notified_version, release_notes_seen_version,
+                permission_scope_version
          FROM update_state WHERE id = 1",
         [],
         |row| {
@@ -3069,6 +3135,7 @@ fn read_update_state(
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         },
     )?;
@@ -3080,14 +3147,16 @@ fn read_update_state(
     if let Some(value) = snoozed_until.as_deref() {
         parse_update_timestamp(value)?;
     }
+    let dual_source_permission = permission_prompted && permission_scope_version >= 2;
     let should_auto_check = auto_check_enabled
+        && dual_source_permission
         && last_checked
             .map(|checked| now >= checked + Duration::hours(24))
             .unwrap_or(true);
 
     Ok(UpdateState {
-        auto_check_enabled,
-        permission_prompted,
+        auto_check_enabled: auto_check_enabled && dual_source_permission,
+        permission_prompted: dual_source_permission,
         last_checked_at,
         last_check_result,
         snoozed_version,
@@ -3132,6 +3201,7 @@ fn run_migrations(connection: &mut Connection, version: i64) -> AppResult<()> {
         (10, MIGRATION_0010),
         (11, MIGRATION_0011),
         (12, MIGRATION_0012),
+        (13, MIGRATION_0013),
     ];
     for (migration_version, sql) in migrations {
         if version < migration_version {
@@ -3569,6 +3639,79 @@ mod tests {
     }
 
     #[test]
+    fn item_counts_match_each_sidebar_filter_in_one_snapshot() {
+        let database = Database::in_memory().unwrap();
+        let now = at_local(2026, 11, 4, 12, 0);
+        create_configured_item(
+            &database,
+            "昨天逾期",
+            at_local(2026, 11, 3, 18, 0),
+            event("ORDINARY", "ONCE"),
+            now,
+        );
+        create_configured_item(
+            &database,
+            "今天稍后",
+            at_local(2026, 11, 4, 18, 0),
+            event("ORDINARY", "ONCE"),
+            now,
+        );
+        let done = create_configured_item(
+            &database,
+            "已完成",
+            at_local(2026, 11, 5, 18, 0),
+            event("ORDINARY", "ONCE"),
+            now,
+        );
+        database.set_item_completed(&done.id, true, now).unwrap();
+        let deleted = create_configured_item(
+            &database,
+            "已删除",
+            at_local(2026, 11, 5, 19, 0),
+            event("ORDINARY", "ONCE"),
+            now,
+        );
+        database.set_item_deleted(&deleted.id, true, now).unwrap();
+
+        assert_eq!(
+            database.item_counts(now).unwrap(),
+            ItemCounts {
+                open: 2,
+                today: 1,
+                overdue: 1,
+                done: 1,
+                deleted: 1,
+                all: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn force_notification_exposes_the_saved_snooze_interval() {
+        let database = Database::in_memory().unwrap();
+        let due = at_local(2026, 11, 4, 9, 0);
+        database
+            .create_item(
+                &CreateItemInput {
+                    title: "按自定义间隔提醒".into(),
+                    notes: String::new(),
+                    category_id: None,
+                    due_at: Some(due.to_rfc3339()),
+                    must_complete_today: false,
+                    repeat_interval_minutes: Some(45),
+                    tag_ids: Vec::new(),
+                    event: Some(event("ORDINARY", "FORCE")),
+                },
+                due - chrono::Duration::hours(1),
+            )
+            .unwrap();
+        let result = database
+            .process_due(due + chrono::Duration::seconds(1))
+            .unwrap();
+        assert_eq!(result.notifications[0].snooze_minutes, 45);
+    }
+
+    #[test]
     fn v5_upgrade_keeps_type_and_tag_as_separate_dimensions() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("shanji.db");
@@ -3878,6 +4021,7 @@ mod tests {
                     important_default_reminder_plan: current.important_default_reminder_plan,
                     repeat_detailed_notifications_enabled: current
                         .repeat_detailed_notifications_enabled,
+                    show_item_counts: current.show_item_counts,
                     smtp_password: None,
                     event_kind_defaults: current.event_kind_defaults,
                 },
@@ -4239,6 +4383,7 @@ mod tests {
                     important_default_reminder_plan: current.important_default_reminder_plan,
                     repeat_detailed_notifications_enabled: current
                         .repeat_detailed_notifications_enabled,
+                    show_item_counts: current.show_item_counts,
                     smtp_password: None,
                     event_kind_defaults: current.event_kind_defaults,
                 },
@@ -5321,6 +5466,34 @@ mod tests {
                 .unwrap()
                 .should_auto_check
         );
+    }
+
+    #[test]
+    fn legacy_single_source_permission_requires_dual_source_confirmation() {
+        let database = Database::in_memory().unwrap();
+        let now = at_local(2026, 11, 4, 10, 0);
+        database
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE update_state SET auto_check_enabled = 1, permission_prompted = 1,
+                    permission_scope_version = 1 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+
+        let legacy = database.get_update_state(now, "0.14.0").unwrap();
+        assert!(!legacy.permission_prompted);
+        assert!(!legacy.auto_check_enabled);
+        assert!(!legacy.should_auto_check);
+
+        let confirmed = database
+            .set_auto_update_enabled(true, now, "0.14.0")
+            .unwrap();
+        assert!(confirmed.permission_prompted);
+        assert!(confirmed.auto_check_enabled);
+        assert!(confirmed.should_auto_check);
     }
 
     #[test]

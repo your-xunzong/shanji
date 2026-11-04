@@ -20,6 +20,24 @@ const item: Item = {
 };
 
 describe('ItemCard', () => {
+  it('opens on card double click and saves text with Enter without intercepting IME composition', async () => {
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    render(ItemCard, { props: {
+      item,
+      categories: [], tags: [],
+      onComplete: vi.fn(), onPause: vi.fn(), onReschedule: vi.fn(),
+      onUpdate, onDelete: vi.fn(), onPermanentDelete: vi.fn(),
+    } });
+    await fireEvent.dblClick(screen.getByRole('heading', { name: '整理需求' }));
+    const title = screen.getByLabelText('事项内容');
+    expect(title).toHaveFocus();
+    await fireEvent.input(title, { target: { value: '整理最终需求' } });
+    await fireEvent.keyDown(title, { key: 'Enter', isComposing: true });
+    expect(onUpdate).not.toHaveBeenCalled();
+    await fireEvent.keyDown(title, { key: 'Enter', isComposing: false });
+    expect(onUpdate).toHaveBeenCalledWith(item, expect.objectContaining({ title: '整理最终需求' }));
+  });
+
   it('opens a complete item editor with type and tag choices', async () => {
     render(ItemCard, { props: {
       item,
@@ -96,6 +114,27 @@ describe('ItemCard', () => {
     expect(onUpdate).toHaveBeenCalledWith(item, expect.objectContaining({
       event: expect.objectContaining({ reminderPlan: 'REPEAT', reminderPlanSource: 'ITEM_OVERRIDE' }),
     }));
+  });
+
+  it('uses the current force default when switching to a force reminder', async () => {
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    render(ItemCard, { props: {
+      item,
+      forceDefaultIntervalMinutes: 45,
+      eventKindDefaults: [
+        { eventKind: 'ORDINARY', reminderPlan: 'FORCE' },
+        { eventKind: 'ONE_TIME', reminderPlan: 'ONCE' },
+      ],
+      categories: [], tags: [],
+      onComplete: vi.fn(), onPause: vi.fn(), onReschedule: vi.fn(),
+      onUpdate, onDelete: vi.fn(), onPermanentDelete: vi.fn(),
+    } });
+    await fireEvent.click(screen.getByRole('button', { name: '编辑' }));
+    await fireEvent.change(screen.getByLabelText('事件类型'), { target: { value: 'ONE_TIME' } });
+    await fireEvent.change(screen.getByLabelText('事件类型'), { target: { value: 'ORDINARY' } });
+    expect(screen.getByLabelText('再次提醒间隔')).toHaveValue(45);
+    await fireEvent.click(screen.getByRole('button', { name: '保存修改' }));
+    expect(onUpdate).toHaveBeenCalledWith(item, expect.objectContaining({ repeatIntervalMinutes: 45 }));
   });
 
   it('shows an explicit restore action for completed items', async () => {

@@ -33,6 +33,7 @@
         completionPolicy: 'MUST_COMPLETE_TODAY',
         eventKind: 'TODAY_MUST',
         reminderPlan: 'FORCE',
+        snoozeMinutes: 30,
         tagIds: [],
       }];
     }
@@ -48,7 +49,7 @@
     error = '';
     try {
       if (action === 'complete') await api.setItemCompleted(current.itemId, true);
-      if (action === 'snooze') await api.snoozeItem(current.itemId, 15);
+      if (action === 'snooze') await api.snoozeItem(current.itemId, current.snoozeMinutes);
       if (action === 'open') await api.showMain();
       queue = queue.slice(1);
       if (queue.length === 0) await api.hideReminder();
@@ -101,7 +102,7 @@
     </div>
     <div class="reminder-actions">
       <button class="primary-button" disabled={busy} on:click={() => finish('complete')}>完成</button>
-      <button class="secondary-button" disabled={busy} on:click={() => finish('snooze')}>15 分钟后提醒</button>
+      <button class="secondary-button" disabled={busy} on:click={() => finish('snooze')}>{current.snoozeMinutes} 分钟后提醒</button>
       <button class="text-mini" disabled={busy} on:click={() => finish('open')}>打开闪记</button>
     </div>
   {:else}

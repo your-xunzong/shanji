@@ -367,6 +367,7 @@ mod tests {
             completion_policy: "NORMAL".into(),
             event_kind: Some("ORDINARY".into()),
             reminder_plan: "ONCE".into(),
+            snooze_minutes: 30,
             tag_ids: Vec::new(),
             detail_lines: Vec::new(),
         }];

@@ -13,7 +13,7 @@
   import UpdatePanel from '../components/UpdatePanel.svelte';
   import '../workbench.css';
   import { api } from '../lib/api';
-  import currentReleaseNotesRaw from '../release-notes/v0.13.3.md?raw';
+  import currentReleaseNotesRaw from '../release-notes/v0.14.0.md?raw';
   import {
     cancelAppUpdateDownload,
     checkForAppUpdate,
@@ -24,7 +24,7 @@
     type AppUpdate,
     type UpdateDownloadProgress,
     type UpdatePhase,
-  } from '../lib/updater';
+  } from '../lib/dual-updater';
   import type {
     Item,
     ItemFilter,
@@ -44,6 +44,7 @@
     SummaryRequest,
     AppInfo,
     UpdateState,
+    ItemCounts,
   } from '../lib/types';
 
   let items: Item[] = [];
@@ -90,6 +91,7 @@
   let updateCheckTimer: ReturnType<typeof setTimeout> | undefined;
   let unlistenOpenUpdate: (() => void) | undefined;
   let cancellingUpdateDownload = false;
+  let itemCounts: ItemCounts | null = null;
 
   const currentReleaseNotes = parseUserFacingNotes(currentReleaseNotesRaw);
 
@@ -346,7 +348,10 @@
   }
 
   async function openReleasePage(): Promise<void> {
-    await api.openReleasePage(availableUpdate?.version ?? appInfo?.version ?? null);
+    await api.openReleasePage(
+      availableUpdate?.version ?? appInfo?.version ?? null,
+      availableUpdate?.source ?? 'GITHUB',
+    );
   }
 
   async function closeUpdatePanel(): Promise<void> {
@@ -370,8 +375,12 @@
   }
 
   async function loadItems(): Promise<void> {
+    const countsPromise = settings?.showItemCounts === false
+      ? Promise.resolve(null)
+      : api.getItemCounts().catch(() => null);
     const loaded = await api.listItems(filter);
     items = loaded;
+    itemCounts = await countsPromise;
     const openItems = filter === 'open' ? loaded : await api.listItems('open');
     pendingTypeCount = openItems.filter((item) => !item.eventKind).length;
   }
@@ -899,13 +908,13 @@
           class="nav-item"
           class:active={viewMode === 'items' && filter === navItem.id}
           aria-current={viewMode === 'items' && filter === navItem.id ? 'page' : undefined}
-          aria-label={navItem.label}
+          aria-label={settings?.showItemCounts && itemCounts ? `${navItem.label}，${itemCounts[navItem.id]} 条` : navItem.label}
           title={navItem.label}
           on:click={() => selectFilter(navItem.id)}
         >
           <span class="nav-marker">{navItem.marker}</span>
           <span>{navItem.label}</span>
-          {#if navItem.id === 'open' && items.length > 0}<span class="nav-count">{items.length}</span>{/if}
+          {#if settings?.showItemCounts && itemCounts}<span class="nav-count">{itemCounts[navItem.id]}</span>{/if}
         </button>
       {/each}
       <button class="nav-item" class:active={viewMode === 'timeline'} aria-current={viewMode === 'timeline' ? 'page' : undefined} aria-label="事项甘特图" title="事项甘特图" on:click={() => (viewMode = 'timeline')}>
@@ -965,7 +974,7 @@
         <span class="update-banner-mark" aria-hidden="true">↗</span>
         <span>
           <strong id="update-permission-title">获取新版本提醒</strong>
-          <small>允许闪记每天最多连接 GitHub 一次；不会上传事项、备注或本地路径。</small>
+          <small>允许闪记每天最多并行连接 GitHub 与 Gitee 一次；不会上传事项、备注或本地路径。</small>
         </span>
         <button class="text-button" on:click={keepUpdatesOffline}>保持离线</button>
         <button class="secondary-button" on:click={enableAutomaticUpdates}>启用并检查</button>
@@ -1024,6 +1033,7 @@
             repeatDefaultTimes={settings?.repeatDefaultTimes ?? ['10:00', '17:00']}
             eventKindDefaults={settings?.eventKindDefaults ?? []}
             importantDefaultReminderPlan={settings?.importantDefaultReminderPlan ?? 'EMPHASIS'}
+            forceDefaultIntervalMinutes={settings?.overtimeIntervalMinutes ?? 30}
             onUpdate={updateItem}
             onDelete={deleteItem}
             onPermanentDelete={permanentlyDeleteItem}
@@ -1137,6 +1147,7 @@
       onSnooze={snoozePendingReminder}
       onAcknowledge={acknowledgePendingReminder}
       onOpen={openPendingReminder}
+      defaultSnoozeMinutes={settings?.overtimeIntervalMinutes ?? 30}
     />
   {/if}
 

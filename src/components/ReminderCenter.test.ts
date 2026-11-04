@@ -32,8 +32,8 @@ describe('ReminderCenter', () => {
     });
 
     expect(screen.getByText('确认发布内容')).toBeInTheDocument();
-    await fireEvent.click(screen.getByRole('button', { name: '15 分钟后提醒' }));
-    expect(onSnooze).toHaveBeenCalledWith(item, 15);
+    await fireEvent.click(screen.getByRole('button', { name: '30 分钟后提醒' }));
+    expect(onSnooze).toHaveBeenCalledWith(item, 30);
     await fireEvent.click(screen.getByRole('button', { name: '确认已看到' }));
     expect(onAcknowledge).toHaveBeenCalledWith(item);
     await fireEvent.click(screen.getByRole('button', { name: '完成' }));

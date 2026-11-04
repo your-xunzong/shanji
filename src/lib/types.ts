@@ -95,7 +95,17 @@ export interface Settings {
   smtpRepeatMustComplete: boolean;
   importantDefaultReminderPlan: ReminderPlan;
   repeatDetailedNotificationsEnabled: boolean;
+  showItemCounts: boolean;
   eventKindDefaults: EventKindDefault[];
+}
+
+export interface ItemCounts {
+  open: number;
+  today: number;
+  overdue: number;
+  done: number;
+  deleted: number;
+  all: number;
 }
 
 export interface CreateItemInput {
@@ -135,6 +145,7 @@ export interface DueNotification {
   eventKind: EventKind | null;
   reminderPlan: ReminderPlan;
   tagIds: string[];
+  snoozeMinutes: number;
 }
 
 export interface AppInfo {

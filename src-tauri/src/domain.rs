@@ -48,6 +48,7 @@ pub struct Settings {
     pub smtp_repeat_must_complete: bool,
     pub important_default_reminder_plan: String,
     pub repeat_detailed_notifications_enabled: bool,
+    pub show_item_counts: bool,
     pub event_kind_defaults: Vec<EventKindDefault>,
 }
 
@@ -124,6 +125,7 @@ pub struct UpdateSettingsInput {
     pub smtp_repeat_must_complete: bool,
     pub important_default_reminder_plan: String,
     pub repeat_detailed_notifications_enabled: bool,
+    pub show_item_counts: bool,
     pub smtp_password: Option<String>,
     pub event_kind_defaults: Vec<EventKindDefault>,
 }
@@ -198,6 +200,7 @@ impl UpdateSettingsInput {
             smtp_repeat_must_complete: self.smtp_repeat_must_complete,
             important_default_reminder_plan: self.important_default_reminder_plan.clone(),
             repeat_detailed_notifications_enabled: self.repeat_detailed_notifications_enabled,
+            show_item_counts: self.show_item_counts,
             event_kind_defaults: self.event_kind_defaults.clone(),
         }
     }
@@ -800,6 +803,7 @@ mod tests {
             smtp_repeat_must_complete: false,
             important_default_reminder_plan: "EMPHASIS".into(),
             repeat_detailed_notifications_enabled: false,
+            show_item_counts: true,
             event_kind_defaults: default_event_kind_defaults(),
         }
     }

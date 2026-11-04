@@ -62,10 +62,13 @@ const updaterConfig = tauriConfig.plugins?.updater;
 if (tauriConfig.bundle?.createUpdaterArtifacts !== true) {
   throw new Error("Tauri updater artifacts are not enabled.");
 }
+const expectedEndpoints = [
+  "https://github.com/your-xunzong/shanji/releases/latest/download/latest.json",
+  "https://gitee.com/wu_-ji/shanji/raw/update/latest.json",
+];
 if (!updaterConfig?.pubkey || !Array.isArray(updaterConfig.endpoints)
-  || updaterConfig.endpoints.length !== 1
-  || updaterConfig.endpoints[0] !== "https://github.com/your-xunzong/shanji/releases/latest/download/latest.json") {
-  throw new Error("Tauri updater must use the signed official GitHub release endpoint.");
+  || JSON.stringify(updaterConfig.endpoints) !== JSON.stringify(expectedEndpoints)) {
+  throw new Error("Tauri updater must declare both signed official release endpoints.");
 }
 if (process.env.GITHUB_REF_TYPE === "tag") {
   const expectedTag = `v${version}`;

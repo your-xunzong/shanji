@@ -8,6 +8,7 @@
   export let onSnooze: (item: Item, minutes: number) => Promise<void>;
   export let onAcknowledge: (item: Item) => Promise<void>;
   export let onOpen: (item: Item) => Promise<void>;
+  export let defaultSnoozeMinutes = 30;
 
   let error = '';
 
@@ -40,7 +41,7 @@
             <div><span>{item.completionPolicy === 'MUST_COMPLETE_TODAY' ? '今日必做' : '已到期'} · {item.dueLocalDate} {item.dueLocalTime}</span><h3>{item.title}</h3></div>
             <div class="reminder-center-actions">
               <button class="primary-mini" disabled={busyItemId === item.id} on:click={() => run(() => onComplete(item))}>完成</button>
-              <button class="secondary-mini" disabled={busyItemId === item.id} on:click={() => run(() => onSnooze(item, 15))}>15 分钟后提醒</button>
+              <button class="secondary-mini" disabled={busyItemId === item.id} on:click={() => run(() => onSnooze(item, item.repeatIntervalMinutes ?? defaultSnoozeMinutes))}>{item.repeatIntervalMinutes ?? defaultSnoozeMinutes} 分钟后提醒</button>
               <button class="text-mini" disabled={busyItemId === item.id} on:click={() => run(() => onAcknowledge(item))}>确认已看到</button>
               <button class="text-mini" disabled={busyItemId === item.id} on:click={() => run(() => onOpen(item))}>打开</button>
             </div>

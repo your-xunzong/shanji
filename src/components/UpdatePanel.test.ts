@@ -13,6 +13,10 @@ const update = {
   date: '2026-09-09T08:00:00Z',
   body: '- 修复提醒',
   notes: ['修复提醒', '改进字体'],
+  source: 'GITHUB' as const,
+  latencyMs: 120,
+  fallbackAvailable: true,
+  mirrorStatus: 'READY' as const,
 };
 
 describe('UpdatePanel', () => {

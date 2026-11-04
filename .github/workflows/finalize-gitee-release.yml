@@ -1,0 +1,78 @@
+name: 正式发布同步到 Gitee
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  synchronize:
+    if: startsWith(github.event.release.tag_name, 'v') && github.event.release.prerelease == false
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 获取正式版源码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: 下载 GitHub 正式版附件
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir release-assets
+          gh release download "${{ github.event.release.tag_name }}" --dir release-assets
+          rm -f release-assets/latest.json release-assets/SHA256SUMS.txt
+
+      - name: 生成 Gitee 更新清单与校验文件
+        run: |
+          task_version="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json', 'utf8')).version")"
+          node scripts/create-update-manifest.mjs \
+            --assets release-assets \
+            --version "$task_version" \
+            --repo "wu_-ji/shanji" \
+            --provider gitee \
+            --notes "src/release-notes/v$task_version.md" \
+            --published-at "${{ github.event.release.published_at }}" \
+            --output release-assets/latest.json
+          cd release-assets
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS.txt
+
+      - name: 正式发布 Gitee 镜像
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          task_version="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json', 'utf8')).version")"
+          node scripts/publish-gitee-release.mjs \
+            --owner wu_-ji \
+            --repo shanji \
+            --tag "${{ github.event.release.tag_name }}" \
+            --assets release-assets \
+            --notes "src/release-notes/v$task_version.md" \
+            --prerelease false \
+            --keep 5
+
+      - name: 正式版就绪后更新 Gitee 稳定清单
+        shell: bash
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_USERNAME: ${{ secrets.GITEE_USERNAME }}
+        run: |
+          test -n "$GITEE_TOKEN" && test -n "$GITEE_USERNAME"
+          task_askpass="$RUNNER_TEMP/gitee-askpass.sh"
+          printf '#!/usr/bin/env bash\ncase "$1" in *Username*) printf "%%s" "$GITEE_USERNAME" ;; *) printf "%%s" "$GITEE_TOKEN" ;; esac\n' > "$task_askpass"
+          chmod 700 "$task_askpass"
+          task_manifest_repo="$RUNNER_TEMP/shanji-update-manifest"
+          mkdir "$task_manifest_repo"
+          cd "$task_manifest_repo"
+          git init
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          cp "$GITHUB_WORKSPACE/release-assets/latest.json" latest.json
+          git add latest.json
+          git commit -m "Update stable manifest for ${{ github.event.release.tag_name }}"
+          git remote add gitee https://gitee.com/wu_-ji/shanji.git
+          GIT_ASKPASS="$task_askpass" GIT_TERMINAL_PROMPT=0 git push --force gitee HEAD:refs/heads/update

@@ -24,6 +24,13 @@ describe('updater metadata', () => {
       },
     })).toBe(true);
     expect(isTrustedReleaseJson({
+      platforms: {
+        'windows-x86_64': {
+          url: 'https://gitee.com/wu_-ji/shanji/releases/download/v0.14.0/shanji.exe',
+        },
+      },
+    })).toBe(true);
+    expect(isTrustedReleaseJson({
       platforms: { 'windows-x86_64': { url: 'https://downloads.example.com/shanji.exe' } },
     })).toBe(false);
     expect(isTrustedReleaseJson({ version: '0.12.1' })).toBe(false);

@@ -74,6 +74,11 @@
   let updateActionStatus = '';
 
   $: repeatTimesError = validateRepeatTimes(form.repeatDefaultTimes);
+  $: forceIntervalError = Number.isInteger(form.overtimeIntervalMinutes)
+    && form.overtimeIntervalMinutes >= 5
+    && form.overtimeIntervalMinutes <= 240
+      ? ''
+      : '强制提醒间隔需为 5 至 240 分钟的整数。';
 
   const weekdays = [
     { value: 1, label: '一' },
@@ -140,7 +145,7 @@
   }
 
   async function save(): Promise<void> {
-    if (saving || repeatTimesError) return;
+    if (saving || repeatTimesError || forceIntervalError) return;
     saveError = '';
     try {
       await onSave({
@@ -370,17 +375,22 @@
 
     <section class="settings-section">
       <div class="section-heading">
-        <h3>今日必做</h3>
-        <p>到期后按此间隔继续提醒，直到完成或暂停。</p>
+        <h3>强制提醒</h3>
+        <p>强制提醒和今日必做事项到期后按此间隔继续提醒，直到完成或暂停。</p>
       </div>
       <label class="form-field">
         <span>默认提醒间隔</span>
-        <select bind:value={form.overtimeIntervalMinutes}>
-          <option value={15}>15 分钟</option>
-          <option value={30}>30 分钟</option>
-          <option value={60}>60 分钟</option>
-          <option value={120}>2 小时</option>
-        </select>
+        <input type="number" min="5" max="240" step="1" list="force-interval-presets" bind:value={form.overtimeIntervalMinutes} aria-invalid={!!forceIntervalError} />
+        <datalist id="force-interval-presets"><option value="15"></option><option value="30"></option><option value="60"></option><option value="120"></option></datalist>
+      </label>
+      <p class="field-help">通知操作将显示“{form.overtimeIntervalMinutes || 'X'} 分钟后”。单条事项仍可单独修改。</p>
+      {#if forceIntervalError}<p class="field-error" role="alert">{forceIntervalError}</p>{/if}
+    </section>
+
+    <section class="settings-section">
+      <label class="switch-row">
+        <span><strong>显示事项数量</strong><small>在每个事项分类右侧显示各自的统计数字。</small></span>
+        <input class="switch" type="checkbox" bind:checked={form.showItemCounts} />
       </label>
     </section>
 
@@ -566,7 +576,7 @@
       {#if updateState}
         <div class="update-preference-card">
           <label>
-            <span><strong>自动检查更新</strong><small>启用后每天最多连接 GitHub 一次，不会自动下载或安装。</small></span>
+            <span><strong>自动检查更新</strong><small>启用后每天最多连接 GitHub 与 Gitee 一次，不会自动下载或安装。</small></span>
             <input
               type="checkbox"
               role="switch"
@@ -592,7 +602,7 @@
   <footer class="settings-footer">
     {#if saveError}<p class="settings-save-error" role="alert">{saveError}</p>{/if}
     <button class="secondary-button" on:click={onClose}>取消</button>
-    <button class="primary-button" disabled={saving || form.workdays.length === 0 || !!repeatTimesError} on:click={save}>
+    <button class="primary-button" disabled={saving || form.workdays.length === 0 || !!repeatTimesError || !!forceIntervalError} on:click={save}>
       {saving ? '正在保存…' : '保存设置'}
     </button>
   </footer>
