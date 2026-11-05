@@ -3,27 +3,36 @@ name: 正式发布同步到 Gitee
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 已公开并需要同步到 Gitee 的版本标签
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   synchronize:
-    if: startsWith(github.event.release.tag_name, 'v') && github.event.release.prerelease == false
+    if: startsWith(github.event.release.tag_name || inputs.tag, 'v') && (github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false)
     runs-on: ubuntu-22.04
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
       - name: 获取正式版源码
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.release.tag_name }}
 
       - name: 下载 GitHub 正式版附件
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir release-assets
-          gh release download "${{ github.event.release.tag_name }}" --dir release-assets
+          gh release download "$RELEASE_TAG" --dir release-assets
           rm -f release-assets/latest.json release-assets/SHA256SUMS.txt
+          task_published_at="$(gh release view "$RELEASE_TAG" --json publishedAt --jq .publishedAt)"
+          test -n "$task_published_at"
+          echo "RELEASE_PUBLISHED_AT=$task_published_at" >> "$GITHUB_ENV"
 
       - name: 生成 Gitee 更新清单与校验文件
         run: |
@@ -34,7 +43,7 @@ jobs:
             --repo "wu_-ji/shanji" \
             --provider gitee \
             --notes "src/release-notes/v$task_version.md" \
-            --published-at "${{ github.event.release.published_at }}" \
+            --published-at "$RELEASE_PUBLISHED_AT" \
             --output release-assets/latest.json
           cd release-assets
           find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 \
@@ -49,7 +58,7 @@ jobs:
           node scripts/publish-gitee-release.mjs \
             --owner wu_-ji \
             --repo shanji \
-            --tag "${{ github.event.release.tag_name }}" \
+            --tag "$RELEASE_TAG" \
             --assets release-assets \
             --notes "src/release-notes/v$task_version.md" \
             --prerelease false \
@@ -73,6 +82,6 @@ jobs:
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           cp "$GITHUB_WORKSPACE/release-assets/latest.json" latest.json
           git add latest.json
-          git commit -m "Update stable manifest for ${{ github.event.release.tag_name }}"
+          git commit -m "Update stable manifest for $RELEASE_TAG"
           git remote add gitee https://gitee.com/wu_-ji/shanji.git
           GIT_ASKPASS="$task_askpass" GIT_TERMINAL_PROMPT=0 git push --force gitee HEAD:refs/heads/update
