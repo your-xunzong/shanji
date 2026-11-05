@@ -39,4 +39,12 @@ describe('Gitee release publisher contract', () => {
     expect(source).toContain('Reusing Gitee release asset');
     expect(source).toContain('if (matching.length !== 1)');
   });
+
+  it('uploads at bounded concurrency and validates each upload response', () => {
+    expect(source).toContain('const UPLOAD_CONCURRENCY = 3');
+    expect(source).toContain('function uploadAsset');
+    expect(source).toContain('async function forEachConcurrent');
+    expect(source).toContain('await Promise.all(workers)');
+    expect(source).toContain('uploaded.name !== name');
+  });
 });
