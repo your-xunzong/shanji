@@ -86,9 +86,15 @@ async function replaceAsset(owner, repo, token, release, path) {
   const size = statSync(path).size;
   if (size > MAX_ASSET_BYTES) throw new Error(`Gitee asset exceeds 100 MB: ${name}`);
   const prior = (await listReleaseAssets(owner, repo, token, release.id)).filter((asset) => asset.name === name);
+  const reusable = prior.find((asset) => Number(asset.size) === size);
   for (const asset of prior) {
+    if (asset.id === reusable?.id) continue;
     if (!asset.id) throw new Error(`Gitee release asset is missing its deletion id: ${name}`);
     await request(`/repos/${owner}/${repo}/releases/${release.id}/attach_files/${asset.id}`, token, { method: 'DELETE' });
+  }
+  if (reusable) {
+    console.log(`Reusing Gitee release asset: ${name} (${size} bytes).`);
+    return;
   }
   const url = `${API_ROOT}/repos/${owner}/${repo}/releases/${release.id}/attach_files`;
   const config = [
@@ -138,7 +144,9 @@ async function verifyRelease(owner, repo, token, tag, prerelease, assets) {
   const attachments = await listReleaseAssets(owner, repo, token, release.id);
   for (const path of assets) {
     const name = basename(path);
-    const attachment = attachments.find((value) => value.name === name);
+    const matching = attachments.filter((value) => value.name === name);
+    if (matching.length !== 1) throw new Error(`Gitee release asset count mismatch: ${name}`);
+    const [attachment] = matching;
     if (!attachment) throw new Error(`Gitee release is missing asset: ${name}`);
     if (attachment.size !== undefined && Number(attachment.size) !== statSync(path).size) {
       throw new Error(`Gitee release asset size mismatch: ${name}`);
