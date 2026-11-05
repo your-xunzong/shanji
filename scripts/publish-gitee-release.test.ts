@@ -32,4 +32,11 @@ describe('Gitee release publisher contract', () => {
     expect(source).toContain('[408, 429, 500, 502, 503, 504]');
     expect(source).not.toContain("'retry-all-errors'");
   });
+
+  it('reuses a complete attachment so a failed release can resume', () => {
+    expect(source).toContain('const reusable = prior.find((asset) => Number(asset.size) === size)');
+    expect(source).toContain('if (asset.id === reusable?.id) continue');
+    expect(source).toContain('Reusing Gitee release asset');
+    expect(source).toContain('if (matching.length !== 1)');
+  });
 });
