@@ -220,7 +220,7 @@ async function main() {
   const assets = readdirSync(assetsDirectory)
     .map((name) => join(assetsDirectory, name))
     .filter((path) => statSync(path).isFile())
-    .sort((left, right) => statSync(left).size - statSync(right).size);
+    .sort((left, right) => statSync(right).size - statSync(left).size);
   await forEachConcurrent(
     assets,
     UPLOAD_CONCURRENCY,
