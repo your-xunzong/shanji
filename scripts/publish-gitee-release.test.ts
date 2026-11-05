@@ -15,7 +15,7 @@ describe('Gitee release publisher contract', () => {
     expect(source).toContain("'max-time = 1800'");
     expect(source).toContain('`form = "access_token=${token}"`');
     expect(source).toContain("['--config', '-', '--request', 'POST'");
-    expect(source).toContain('.sort((left, right) => statSync(left).size - statSync(right).size)');
+    expect(source).toContain('.sort((left, right) => statSync(right).size - statSync(left).size)');
   });
 
   it('uses the dedicated attachment endpoint for idempotent replacement and verification', () => {
@@ -46,5 +46,6 @@ describe('Gitee release publisher contract', () => {
     expect(source).toContain('async function forEachConcurrent');
     expect(source).toContain('await Promise.all(workers)');
     expect(source).toContain('uploaded.name !== name');
+    expect(source).toContain('statSync(right).size - statSync(left).size');
   });
 });
