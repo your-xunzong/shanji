@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 
@@ -58,13 +59,30 @@ async function replaceAsset(owner, repo, token, release, path) {
   if (!/^[0-9A-Za-z._-]+$/.test(name)) throw new Error(`Release asset name is not portable: ${name}`);
   const size = statSync(path).size;
   if (size > MAX_ASSET_BYTES) throw new Error(`Gitee asset exceeds 100 MB: ${name}`);
-  const prior = (release.attach_files ?? []).find((asset) => asset.name === name);
+  const current = await request(`/repos/${owner}/${repo}/releases/${release.id}`, token);
+  const prior = (current.attach_files ?? []).find((asset) => asset.name === name);
   if (prior) {
     await request(`/repos/${owner}/${repo}/releases/${release.id}/attach_files/${prior.id}`, token, { method: 'DELETE' });
   }
-  const form = new FormData();
-  form.set('file', new Blob([readFileSync(path)]), name);
-  await request(`/repos/${owner}/${repo}/releases/${release.id}/attach_files`, token, { method: 'POST', body: form });
+  const url = `${API_ROOT}/repos/${owner}/${repo}/releases/${release.id}/attach_files`;
+  const config = [
+    'silent',
+    'show-error',
+    'fail-with-body',
+    'connect-timeout = 30',
+    'max-time = 1800',
+    'header = "Accept: application/json"',
+    `header = "Authorization: token ${token}"`,
+  ].join('\n');
+  const result = spawnSync(
+    'curl',
+    ['--config', '-', '--request', 'POST', '--form', `file=@${path};filename=${name}`, '--url', url],
+    { input: config, encoding: 'utf8', maxBuffer: 1024 * 1024 },
+  );
+  if (result.status !== 0) {
+    const detail = `${result.stderr ?? ''} ${result.stdout ?? ''}`.replace(/\s+/g, ' ').trim().slice(0, 240);
+    throw new Error(`Gitee asset upload failed for ${name}${detail ? `: ${detail}` : '.'}`);
+  }
 }
 
 async function pruneOldStableAssets(owner, repo, token, keep) {
@@ -110,6 +128,7 @@ async function main() {
   const tag = safe(args.get('tag'), /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/, 'tag');
   const token = process.env.GITEE_TOKEN;
   if (!token) throw new Error('GITEE_TOKEN is required.');
+  if (!/^[0-9A-Za-z_-]+$/.test(token)) throw new Error('GITEE_TOKEN contains unsupported characters.');
   const assetsDirectory = resolve(args.get('assets') ?? 'release-assets');
   const notesPath = resolve(args.get('notes'));
   const prerelease = (args.get('prerelease') ?? 'true') === 'true';
@@ -117,7 +136,8 @@ async function main() {
   const release = await upsertRelease(owner, repo, token, tag, `闪记 ${tag}`, notes, prerelease);
   const assets = readdirSync(assetsDirectory)
     .map((name) => join(assetsDirectory, name))
-    .filter((path) => statSync(path).isFile());
+    .filter((path) => statSync(path).isFile())
+    .sort((left, right) => statSync(left).size - statSync(right).size);
   for (const path of assets) await replaceAsset(owner, repo, token, release, path);
   if (!prerelease) await pruneOldStableAssets(owner, repo, token, Number(args.get('keep') ?? '5'));
   await verifyRelease(owner, repo, token, tag, prerelease, assets);
