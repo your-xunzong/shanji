@@ -54,15 +54,21 @@ async function upsertRelease(owner, repo, token, tag, name, body, prerelease) {
   return request(`/repos/${owner}/${repo}/releases/${existing.id}`, token, { method: 'PATCH', body: form });
 }
 
+async function listReleaseAssets(owner, repo, token, releaseId) {
+  const response = await request(`/repos/${owner}/${repo}/releases/${releaseId}/attach_files`, token);
+  if (Array.isArray(response)) return response;
+  return response?.attach_files ?? response?.assets ?? [];
+}
+
 async function replaceAsset(owner, repo, token, release, path) {
   const name = basename(path);
   if (!/^[0-9A-Za-z._-]+$/.test(name)) throw new Error(`Release asset name is not portable: ${name}`);
   const size = statSync(path).size;
   if (size > MAX_ASSET_BYTES) throw new Error(`Gitee asset exceeds 100 MB: ${name}`);
-  const current = await request(`/repos/${owner}/${repo}/releases/${release.id}`, token);
-  const prior = (current.attach_files ?? []).find((asset) => asset.name === name);
-  if (prior) {
-    await request(`/repos/${owner}/${repo}/releases/${release.id}/attach_files/${prior.id}`, token, { method: 'DELETE' });
+  const prior = (await listReleaseAssets(owner, repo, token, release.id)).filter((asset) => asset.name === name);
+  for (const asset of prior) {
+    if (!asset.id) throw new Error(`Gitee release asset is missing its deletion id: ${name}`);
+    await request(`/repos/${owner}/${repo}/releases/${release.id}/attach_files/${asset.id}`, token, { method: 'DELETE' });
   }
   const url = `${API_ROOT}/repos/${owner}/${repo}/releases/${release.id}/attach_files`;
   const config = [
@@ -95,7 +101,7 @@ async function pruneOldStableAssets(owner, repo, token, keep) {
     .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
     .slice(keep);
   for (const release of old) {
-    for (const asset of release.attach_files ?? []) {
+    for (const asset of await listReleaseAssets(owner, repo, token, release.id)) {
       await request(`/repos/${owner}/${repo}/releases/${release.id}/attach_files/${asset.id}`, token, { method: 'DELETE' });
     }
   }
@@ -109,7 +115,7 @@ async function verifyRelease(owner, repo, token, tag, prerelease, assets) {
   if (Boolean(release.prerelease) !== prerelease) {
     throw new Error('Gitee release state does not match the requested state.');
   }
-  const attachments = release.attach_files ?? [];
+  const attachments = await listReleaseAssets(owner, repo, token, release.id);
   for (const path of assets) {
     const name = basename(path);
     const attachment = attachments.find((value) => value.name === name);
