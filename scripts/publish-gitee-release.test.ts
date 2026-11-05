@@ -25,4 +25,11 @@ describe('Gitee release publisher contract', () => {
     expect(source).toContain('/attach_files/${asset.id}`');
     expect(source).not.toContain('/attach_files/${prior.id}`');
   });
+
+  it('retries transient Gitee API failures without retrying the asset upload command', () => {
+    expect(source).toContain('const REQUEST_ATTEMPTS = 5');
+    expect(source).toContain('Gitee API connection failed; retrying');
+    expect(source).toContain('[408, 429, 500, 502, 503, 504]');
+    expect(source).not.toContain("'retry-all-errors'");
+  });
 });
