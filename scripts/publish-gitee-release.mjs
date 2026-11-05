@@ -1,10 +1,11 @@
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 
 const API_ROOT = 'https://gitee.com/api/v5';
 const MAX_ASSET_BYTES = 100 * 1024 * 1024;
 const REQUEST_ATTEMPTS = 5;
+const UPLOAD_CONCURRENCY = 3;
 
 function delay(milliseconds) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
@@ -80,6 +81,59 @@ async function listReleaseAssets(owner, repo, token, releaseId) {
   return response?.attach_files ?? response?.assets ?? [];
 }
 
+function uploadAsset(url, config, path, name, size) {
+  return new Promise((resolveUpload, rejectUpload) => {
+    const child = spawn(
+      'curl',
+      ['--config', '-', '--request', 'POST', '--form', `file=@${path};filename=${name}`, '--url', url],
+      { stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout = (stdout + chunk).slice(-1024 * 1024); });
+    child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-1024 * 1024); });
+    child.stdin.on('error', (error) => {
+      if (error.code !== 'EPIPE') rejectUpload(error);
+    });
+    child.on('error', rejectUpload);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        const detail = `${stderr} ${stdout}`.replace(/\s+/g, ' ').trim().slice(0, 240);
+        rejectUpload(new Error(`Gitee asset upload failed for ${name}${detail ? `: ${detail}` : '.'}`));
+        return;
+      }
+      let uploaded;
+      try {
+        uploaded = JSON.parse(stdout);
+      } catch {
+        rejectUpload(new Error(`Gitee asset upload returned an invalid response: ${name}`));
+        return;
+      }
+      if (!uploaded?.id || uploaded.name !== name || (uploaded.size !== undefined && Number(uploaded.size) !== size)) {
+        rejectUpload(new Error(`Gitee asset upload response did not confirm the requested file: ${name}`));
+        return;
+      }
+      resolveUpload();
+    });
+    child.stdin.end(config);
+  });
+}
+
+async function forEachConcurrent(values, limit, worker) {
+  let nextIndex = 0;
+  async function consume() {
+    while (nextIndex < values.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      await worker(values[currentIndex]);
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, values.length) }, () => consume());
+  await Promise.all(workers);
+}
+
 async function replaceAsset(owner, repo, token, release, path) {
   const name = basename(path);
   if (!/^[0-9A-Za-z._-]+$/.test(name)) throw new Error(`Release asset name is not portable: ${name}`);
@@ -108,15 +162,7 @@ async function replaceAsset(owner, repo, token, release, path) {
     `form = "access_token=${token}"`,
   ].join('\n');
   console.log(`Uploading Gitee release asset: ${name} (${size} bytes).`);
-  const result = spawnSync(
-    'curl',
-    ['--config', '-', '--request', 'POST', '--form', `file=@${path};filename=${name}`, '--url', url],
-    { input: config, encoding: 'utf8', maxBuffer: 1024 * 1024 },
-  );
-  if (result.status !== 0) {
-    const detail = `${result.stderr ?? ''} ${result.stdout ?? ''}`.replace(/\s+/g, ' ').trim().slice(0, 240);
-    throw new Error(`Gitee asset upload failed for ${name}${detail ? `: ${detail}` : '.'}`);
-  }
+  await uploadAsset(url, config, path, name, size);
   console.log(`Uploaded Gitee release asset: ${name}.`);
 }
 
@@ -175,7 +221,11 @@ async function main() {
     .map((name) => join(assetsDirectory, name))
     .filter((path) => statSync(path).isFile())
     .sort((left, right) => statSync(left).size - statSync(right).size);
-  for (const path of assets) await replaceAsset(owner, repo, token, release, path);
+  await forEachConcurrent(
+    assets,
+    UPLOAD_CONCURRENCY,
+    (path) => replaceAsset(owner, repo, token, release, path),
+  );
   if (!prerelease) await pruneOldStableAssets(owner, repo, token, Number(args.get('keep') ?? '5'));
   await verifyRelease(owner, repo, token, tag, prerelease, assets);
   console.log(`Gitee release ${tag} synchronized with ${assets.length} assets.`);
