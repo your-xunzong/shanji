@@ -10,4 +10,10 @@ describe('Gitee release publisher contract', () => {
     expect(source).toContain("headers.set('Authorization', `token ${token}`)");
     expect(source).not.toContain("url.searchParams.set('access_token'");
   });
+
+  it('uses a long-running curl upload with the token supplied through stdin', () => {
+    expect(source).toContain("'max-time = 1800'");
+    expect(source).toContain("['--config', '-', '--request', 'POST'");
+    expect(source).toContain('.sort((left, right) => statSync(left).size - statSync(right).size)');
+  });
 });
