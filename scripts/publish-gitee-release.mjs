@@ -4,6 +4,11 @@ import { basename, join, resolve } from 'node:path';
 
 const API_ROOT = 'https://gitee.com/api/v5';
 const MAX_ASSET_BYTES = 100 * 1024 * 1024;
+const REQUEST_ATTEMPTS = 5;
+
+function delay(milliseconds) {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+}
 
 function argsMap(values) {
   const result = new Map();
@@ -25,13 +30,28 @@ async function request(path, token, options = {}, allowNotFound = false) {
   const headers = new Headers(options.headers);
   headers.set('Accept', 'application/json');
   headers.set('Authorization', `token ${token}`);
-  const response = await fetch(`${API_ROOT}${path}`, { ...options, headers });
-  if (allowNotFound && response.status === 404) return null;
-  if (!response.ok) {
+  for (let attempt = 1; attempt <= REQUEST_ATTEMPTS; attempt += 1) {
+    let response;
+    try {
+      response = await fetch(`${API_ROOT}${path}`, { ...options, headers });
+    } catch (error) {
+      if (attempt === REQUEST_ATTEMPTS) throw error;
+      console.warn(`Gitee API connection failed; retrying (${attempt}/${REQUEST_ATTEMPTS}).`);
+      await delay(1000 * 2 ** (attempt - 1));
+      continue;
+    }
+    if (allowNotFound && response.status === 404) return null;
+    if (response.ok) return response.status === 204 ? null : response.json();
+    if ([408, 429, 500, 502, 503, 504].includes(response.status) && attempt < REQUEST_ATTEMPTS) {
+      await response.arrayBuffer();
+      console.warn(`Gitee API returned ${response.status}; retrying (${attempt}/${REQUEST_ATTEMPTS}).`);
+      await delay(1000 * 2 ** (attempt - 1));
+      continue;
+    }
     const detail = (await response.text()).replace(/\s+/g, ' ').trim().slice(0, 240);
     throw new Error(`Gitee API request failed (${response.status})${detail ? `: ${detail}` : '.'}`);
   }
-  return response.status === 204 ? null : response.json();
+  throw new Error('Gitee API request exhausted its retry budget.');
 }
 
 function releaseForm(tag, name, body, prerelease) {
