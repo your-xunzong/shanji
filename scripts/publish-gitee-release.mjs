@@ -73,7 +73,9 @@ async function replaceAsset(owner, repo, token, release, path) {
     'max-time = 1800',
     'header = "Accept: application/json"',
     `header = "Authorization: token ${token}"`,
+    `form = "access_token=${token}"`,
   ].join('\n');
+  console.log(`Uploading Gitee release asset: ${name} (${size} bytes).`);
   const result = spawnSync(
     'curl',
     ['--config', '-', '--request', 'POST', '--form', `file=@${path};filename=${name}`, '--url', url],
@@ -83,6 +85,7 @@ async function replaceAsset(owner, repo, token, release, path) {
     const detail = `${result.stderr ?? ''} ${result.stdout ?? ''}`.replace(/\s+/g, ' ').trim().slice(0, 240);
     throw new Error(`Gitee asset upload failed for ${name}${detail ? `: ${detail}` : '.'}`);
   }
+  console.log(`Uploaded Gitee release asset: ${name}.`);
 }
 
 async function pruneOldStableAssets(owner, repo, token, keep) {
