@@ -156,7 +156,7 @@ async function replaceAsset(owner, repo, token, release, path) {
     'show-error',
     'fail-with-body',
     'connect-timeout = 30',
-    'max-time = 1800',
+    'max-time = 10800',
     'header = "Accept: application/json"',
     `header = "Authorization: token ${token}"`,
     `form = "access_token=${token}"`,
