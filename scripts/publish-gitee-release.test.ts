@@ -13,6 +13,7 @@ describe('Gitee release publisher contract', () => {
 
   it('uses a long-running curl upload with the token supplied through stdin', () => {
     expect(source).toContain("'max-time = 1800'");
+    expect(source).toContain('`form = "access_token=${token}"`');
     expect(source).toContain("['--config', '-', '--request', 'POST'");
     expect(source).toContain('.sort((left, right) => statSync(left).size - statSync(right).size)');
   });
