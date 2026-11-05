@@ -17,4 +17,12 @@ describe('Gitee release publisher contract', () => {
     expect(source).toContain("['--config', '-', '--request', 'POST'");
     expect(source).toContain('.sort((left, right) => statSync(left).size - statSync(right).size)');
   });
+
+  it('uses the dedicated attachment endpoint for idempotent replacement and verification', () => {
+    expect(source).toContain('async function listReleaseAssets');
+    expect(source).toContain('/attach_files`, token');
+    expect(source).toContain('for (const asset of prior)');
+    expect(source).toContain('/attach_files/${asset.id}`');
+    expect(source).not.toContain('/attach_files/${prior.id}`');
+  });
 });
