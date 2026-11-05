@@ -21,20 +21,24 @@ function safe(value, pattern, label) {
 }
 
 async function request(path, token, options = {}, allowNotFound = false) {
-  const url = new URL(`${API_ROOT}${path}`);
-  url.searchParams.set('access_token', token);
-  const response = await fetch(url, options);
+  const headers = new Headers(options.headers);
+  headers.set('Accept', 'application/json');
+  headers.set('Authorization', `token ${token}`);
+  const response = await fetch(`${API_ROOT}${path}`, { ...options, headers });
   if (allowNotFound && response.status === 404) return null;
-  if (!response.ok) throw new Error(`Gitee API request failed (${response.status}).`);
+  if (!response.ok) {
+    const detail = (await response.text()).replace(/\s+/g, ' ').trim().slice(0, 240);
+    throw new Error(`Gitee API request failed (${response.status})${detail ? `: ${detail}` : '.'}`);
+  }
   return response.status === 204 ? null : response.json();
 }
 
-function releaseForm(token, tag, name, body, prerelease) {
+function releaseForm(tag, name, body, prerelease) {
   const form = new URLSearchParams();
-  form.set('access_token', token);
   form.set('tag_name', tag);
   form.set('name', name);
   form.set('body', body);
+  form.set('target_commitish', 'main');
   form.set('prerelease', prerelease ? 'true' : 'false');
   return form;
 }
@@ -42,7 +46,7 @@ function releaseForm(token, tag, name, body, prerelease) {
 async function upsertRelease(owner, repo, token, tag, name, body, prerelease) {
   const encodedTag = encodeURIComponent(tag);
   const existing = await request(`/repos/${owner}/${repo}/releases/tags/${encodedTag}`, token, {}, true);
-  const form = releaseForm(token, tag, name, body, prerelease);
+  const form = releaseForm(tag, name, body, prerelease);
   if (!existing) {
     return request(`/repos/${owner}/${repo}/releases`, token, { method: 'POST', body: form });
   }
@@ -59,7 +63,6 @@ async function replaceAsset(owner, repo, token, release, path) {
     await request(`/repos/${owner}/${repo}/releases/${release.id}/attach_files/${prior.id}`, token, { method: 'DELETE' });
   }
   const form = new FormData();
-  form.set('access_token', token);
   form.set('file', new Blob([readFileSync(path)]), name);
   await request(`/repos/${owner}/${repo}/releases/${release.id}/attach_files`, token, { method: 'POST', body: form });
 }
